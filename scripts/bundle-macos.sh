@@ -34,4 +34,6 @@ cat > "$contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+# Seal the bundle (the linker signature only covers the bare executable).
+codesign --force --sign - "$app"
 printf 'Installed %s\n' "$app"
