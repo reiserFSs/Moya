@@ -1,0 +1,233 @@
+use std::{io::Write, path::{Path, PathBuf}};
+use anyhow::{Context, Result, ensure};
+use eframe::egui;
+use moya_core::LayerSettings;
+use moya_io::{Picture, SampleDepth};
+use moya_project::{Project, SourceRef};
+use crate::{App, layers};
+
+#[derive(Default)]
+pub struct State {
+    path: Option<PathBuf>,
+    source: Option<SourceRef>,
+    embed_source: bool,
+    saved_embed: bool,
+    saved: Vec<(LayerSettings, (u32, u32, bool, u64))>,
+    closing: bool,
+}
+
+pub fn is_project(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("moya"))
+}
+
+/// Hide exactly one project extension, but retain source-image extensions and dirty state.
+fn title_for_path(path: Option<&Path>, dirty: bool) -> String {
+    let name = path.and_then(|path| if is_project(path) { path.file_stem() } else { path.file_name() });
+    match name {
+        Some(name) => format!("{}{} — Moya", name.to_string_lossy(), if dirty { " *" } else { "" }),
+        None => "Moya".into(),
+    }
+}
+
+/// Decode embedded originals through the same bounded, depth/ICC-preserving loader as images.
+fn load_source(source: &SourceRef) -> Result<(PathBuf, Picture)> {
+    match source {
+        SourceRef::Path(path) => Ok((path.clone(), moya_io::load(path)?)),
+        SourceRef::Embedded { file_name, bytes } => {
+            let extension = Path::new(file_name).extension().and_then(|s| s.to_str()).unwrap_or("img");
+            let mut temporary = tempfile::Builder::new().suffix(&format!(".{extension}")).tempfile()?;
+            temporary.write_all(bytes)?;
+            temporary.flush()?;
+            Ok((PathBuf::from(file_name), moya_io::load(temporary.path())?))
+        }
+    }
+}
+
+impl App {
+    fn mark_project_saved(&mut self) {
+        self.project.saved = self.layers.iter()
+            .map(|layer| (layer.settings.clone(), layer.mask.fingerprint())).collect();
+        self.project.saved_embed = self.project.embed_source;
+    }
+
+    /// Called only after a new image has been installed, not on ordinary edits.
+    pub(crate) fn reset_project(&mut self) {
+        self.project = State::default();
+        self.mark_project_saved();
+    }
+
+    pub(crate) fn project_is_dirty(&self) -> bool {
+        self.picture.is_some() && (self.project.embed_source != self.project.saved_embed
+            || self.project.saved.len() != self.layers.len()
+            || self.layers.iter().zip(&self.project.saved).any(|(layer, (settings, mask))|
+                &layer.settings != settings || layer.mask.fingerprint() != *mask))
+    }
+
+    pub(crate) fn project_title(&self) -> String {
+        title_for_path(self.project.path.as_deref().or(self.path.as_deref()), self.project_is_dirty())
+    }
+
+    pub(crate) fn save_project(&mut self, save_as: bool) -> bool {
+        if self.picture.is_none() { return false; }
+        for layer in &mut self.layers { layer.mask.end_stroke(); }
+        self.history.observe(&mut self.layers, self.selected, false);
+        let path = if !save_as && self.project.path.is_some() {
+            self.project.path.clone().unwrap()
+        } else {
+            let mut dialog = rfd::FileDialog::new().add_filter("Moya project", &["moya"]);
+            if let Some(path) = self.project.path.as_ref().or(self.path.as_ref()) {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) { dialog = dialog.set_directory(parent); }
+                // The native dialog supplies the filtered extension; suggest only the basename.
+                if let Some(name) = path.file_stem() { dialog = dialog.set_file_name(name.to_string_lossy()); }
+            }
+            let Some(mut path) = dialog.save_file() else { return false; };
+            if !is_project(&path) { path.set_extension("moya"); }
+            path
+        };
+        let result = (|| -> Result<()> {
+            let source = self.project_source()?;
+            let project = layers::to_project(&self.layers, self.selected, source);
+            moya_project::save(&path, &project)
+        })();
+        match result {
+            Ok(()) => {
+                self.project.path = Some(path.clone());
+                self.last_folder = path.parent().map(Path::to_owned);
+                self.mark_project_saved();
+                self.status = format!("Saved project {}", path.display());
+                true
+            }
+            Err(error) => { self.status = format!("Project save failed: {error:#}"); false }
+        }
+    }
+
+    fn project_source(&self) -> Result<SourceRef> {
+        if let Some(SourceRef::Embedded { file_name, bytes }) = &self.project.source {
+            ensure!(self.project.embed_source, "This source exists only inside the project; keep Embed source enabled");
+            return Ok(SourceRef::Embedded { file_name: file_name.clone(), bytes: bytes.clone() });
+        }
+        let path = match &self.project.source {
+            Some(SourceRef::Path(path)) => path,
+            _ => self.path.as_ref().context("No source image is open")?,
+        };
+        let path = std::path::absolute(path)?;
+        if self.project.embed_source {
+            Ok(SourceRef::Embedded {
+                file_name: path.file_name().context("Source has no filename")?.to_string_lossy().into_owned(),
+                bytes: std::fs::read(&path).with_context(|| format!("reading source {}", path.display()))?,
+            })
+        } else { Ok(SourceRef::Path(path)) }
+    }
+
+    pub(crate) fn open_project(&mut self, path: &Path) -> bool {
+        self.install_project(path, None)
+    }
+
+    pub(crate) fn open_project_with_source(&mut self, path: &Path, source: &Path) -> bool {
+        self.install_project(path, Some(source))
+    }
+
+    fn install_project(&mut self, path: &Path, replacement: Option<&Path>) -> bool {
+        let result = (|| -> Result<(Project, PathBuf, Picture, Vec<layers::Layer>, u64)> {
+            // A Photoshop replacement intentionally does not require the old external source.
+            let mut project = if replacement.is_some() {
+                moya_project::from_bytes(&std::fs::read(path)?)?
+            } else { moya_project::load(path)? };
+            if let Some(source) = replacement { project.source = SourceRef::Path(std::path::absolute(source)?); }
+            let (source_path, picture) = load_source(&project.source)?;
+            if let Some(session) = &self.session {
+                let depth = match picture.depth { SampleDepth::U8 => 8, SampleDepth::U16 => 16, SampleDepth::F32 => 32 };
+                ensure!(picture.width == session.document.width && picture.height == session.document.height
+                    && depth == session.document.depth, "Source TIFF dimensions/depth do not match the Photoshop document");
+            }
+            let (layers, selected) = layers::from_project(&project, picture.width, picture.height)?;
+            Ok((project, source_path, picture, layers, selected))
+        })();
+        let (project, source_path, picture, layers, selected) = match result {
+            Ok(loaded) => loaded,
+            Err(error) => { self.status = format!("Project open failed: {error:#}"); return false; }
+        };
+        if !self.finish_open(&source_path, picture) { return false; }
+        self.loading = None;
+        self.layers = layers;
+        self.selected = selected;
+        self.solo_layer = None;
+        self.history.clear(&self.layers, self.selected);
+        self.project.path = Some(path.to_owned());
+        self.project.embed_source = matches!(&project.source, SourceRef::Embedded { .. });
+        self.project.source = Some(project.source);
+        self.mark_project_saved();
+        self.last_folder = path.parent().map(Path::to_owned);
+        self.dirty = true;
+        self.force = true;
+        self.status = format!("Opened project {}", path.display());
+        true
+    }
+
+    pub(crate) fn confirm_discard(&mut self) -> bool {
+        for layer in &mut self.layers { layer.mask.end_stroke(); }
+        self.history.observe(&mut self.layers, self.selected, false);
+        if !self.project_is_dirty() { return true; }
+        match rfd::MessageDialog::new().set_title("Unsaved Moya project")
+            .set_description("Save your project before continuing? Unsaved changes will be lost.")
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom("Save".into(), "Discard".into(), "Cancel".into())).show() {
+            rfd::MessageDialogResult::Yes => self.save_project(false),
+            rfd::MessageDialogResult::No => true,
+            rfd::MessageDialogResult::Custom(label) if label == "Save" => self.save_project(false),
+            rfd::MessageDialogResult::Custom(label) if label == "Discard" => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn handle_project_close(&mut self, ctx: &egui::Context) {
+        if self.project.closing || !ctx.input(|input| input.viewport().close_requested()) { return; }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.confirm_discard() {
+            self.project.closing = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    pub(crate) fn project_controls(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.picture.is_some() && self.loading.is_none();
+        if ui.add_enabled(enabled, egui::Button::new("Save project…")).on_hover_text("Save project (Cmd+S); Save As (Cmd+Shift+S)").clicked() {
+            self.save_project(false);
+        }
+        let embedded_only = matches!(&self.project.source, Some(SourceRef::Embedded { .. }));
+        ui.add_enabled_ui(enabled && !embedded_only, |ui| {
+            ui.checkbox(&mut self.project.embed_source, "Embed source")
+                .on_hover_text("Store the original image inside the .moya file so it can move with the project");
+        }).response.on_disabled_hover_text("This project's source is stored only inside the project");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_titles_strip_only_one_project_extension() {
+        assert_eq!(title_for_path(Some(Path::new("/projects/image.moya")), false), "image — Moya");
+        assert_eq!(title_for_path(Some(Path::new("/projects/image.moya.moya")), false), "image.moya — Moya");
+        assert_eq!(title_for_path(Some(Path::new("image.MOYA")), true), "image * — Moya");
+        assert_eq!(title_for_path(Some(Path::new("image.tiff")), false), "image.tiff — Moya");
+        assert_eq!(title_for_path(None, false), "Moya");
+    }
+
+    #[test]
+    fn embedded_source_preserves_depth_and_pixels() -> Result<()> {
+        let temporary = tempfile::Builder::new().suffix(".tiff").tempfile()?;
+        let picture = Picture { width: 1, height: 1, depth: SampleDepth::F32,
+            rgba: vec![2.0, 0.25, -0.5, 0.75], icc_profile: Some(b"opaque ICC".to_vec()) };
+        moya_io::save(temporary.path(), &picture, picture.depth)?;
+        let (_, loaded) = load_source(&SourceRef::Embedded {
+            file_name: "source.tiff".into(), bytes: std::fs::read(temporary.path())?,
+        })?;
+        assert_eq!(loaded.depth, picture.depth);
+        assert_eq!(loaded.rgba, picture.rgba);
+        assert_eq!(loaded.icc_profile, picture.icc_profile);
+        assert!(is_project(Path::new("image.MOYA")));
+        Ok(())
+    }
+}

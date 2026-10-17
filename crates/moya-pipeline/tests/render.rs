@@ -1,7 +1,16 @@
 use std::sync::Arc;
-use moya_core::{CaChannels, CaType, GlareBlend, GlareRays, Highlights, Params, RenderMode, SpectrumBlend, Transition};
-use moya_gpu::{Depth, Gpu};
-use moya_pipeline::{Renderer, ViewFlags};
+use moya_core::{CaChannels, CaType, GlareBlend, GlareRays, Highlights, LayerBlend, LayerInput, LayerSettings, Params, RenderMode, SpectrumBlend, Transition};
+use moya_gpu::{BlendMode, Depth, Gpu, Image};
+use moya_pipeline::{Document, DocumentOutput, LayerInputs, RenderRequest, ViewFlags};
+
+fn request(mode: RenderMode, view: ViewFlags) -> RenderRequest {
+    RenderRequest { mode, view, selected: Some(1), solo_layer: None, want_layer_glows: true, want_xray: true }
+}
+
+fn single(document: &mut Document, params: &Params, mode: RenderMode, view: ViewFlags, mask: Option<&Image>, mask_generation: u64) -> DocumentOutput {
+    let settings = LayerSettings { params: params.clone(), ..LayerSettings::default() };
+    document.render(&[LayerInputs { settings: &settings, mask, mask_generation }], &request(mode, view))
+}
 
 #[test]
 fn real_gpu_effects_caches_and_mask() {
@@ -12,27 +21,27 @@ fn real_gpu_effects_caches_and_mask() {
         let light=if (x as i32-28).pow(2)+(y as i32-20).pow(2)<20 {1.} else {0.01};
         pixels[i..i+4].copy_from_slice(&[light,light*0.8,light*0.5,1.]);
     }}
-    let mut renderer=Renderer::new(gpu.clone(),gpu.upload_rgba32f(64,48,&pixels),Depth::Eight);
+    let mut document=Document::new(gpu.clone(),gpu.upload_rgba32f(64,48,&pixels),Depth::Eight);
     let view=ViewFlags{xray:false,solo:true,host_is_float:false};
     let mut p=Params{radius:12.,glow_iterations:4.,glare_on:true,rays_on:true,ca_on:true,tonemap:true,
         glare_length:0.1,spectrum_mix:30.,protect_core:true,..Params::default()};
-    let first=renderer.render(&p,RenderMode::Draft,&view);
-    let first=gpu.download_rgba32f(&first.glow);
+    let first=single(&mut document,&p,RenderMode::Draft,view,None,0);
+    let first=gpu.download_rgba32f(&first.layer_glows[0].1);
     assert!(first.iter().all(|v|v.is_finite()));
     assert!(first.chunks_exact(4).any(|v|v[0]>0.1));
-    let cached=renderer.render(&p,RenderMode::Draft,&view);
-    assert_eq!(first,gpu.download_rgba32f(&cached.glow));
+    let cached=single(&mut document,&p,RenderMode::Draft,view,None,0);
+    assert_eq!(first,gpu.download_rgba32f(&cached.layer_glows[0].1));
     p.threshold+=0.1;
-    assert_eq!(renderer.render(&p,RenderMode::Draft,&view).xray.width(),64);
+    assert_eq!(single(&mut document,&p,RenderMode::Draft,view,None,0).xray.unwrap().width(),64);
     p.ca_type=CaType::Center; p.ca_mix=true; p.ca_blur=1.; p.hdr32=true;
-    let out=renderer.render(&p,RenderMode::Hq,&view);
-    assert!(gpu.download_rgba32f(&out.glow).iter().all(|v|v.is_finite()));
-    renderer.set_mask(Some(gpu.fill(64,48,[0.,0.,0.,1.])));
+    let out=single(&mut document,&p,RenderMode::Hq,view,None,0);
+    assert!(gpu.download_rgba32f(&out.layer_glows[0].1).iter().all(|v|v.is_finite()));
+    let mask=gpu.fill(64,48,[0.,0.,0.,1.]);
     p.hdr32=false; p.tonemap=false; p.ca_on=false; p.glare_on=false; p.rays_on=false;
-    let out=renderer.render(&p,RenderMode::Draft,&view);
-    assert!(gpu.download_rgba32f(&out.glow).chunks_exact(4).all(|v|v[..3].iter().all(|c|*c==0.)));
+    let out=single(&mut document,&p,RenderMode::Draft,view,Some(&mask),1);
+    assert!(gpu.download_rgba32f(&out.layer_glows[0].1).chunks_exact(4).all(|v|v[..3].iter().all(|c|*c==0.)));
     let composite_view=ViewFlags{xray:false,solo:false,host_is_float:false};
-    let hq=renderer.render(&p,RenderMode::Hq,&composite_view);
+    let hq=single(&mut document,&p,RenderMode::Hq,composite_view,Some(&mask),1);
     let composite=gpu.download_rgba32f(&hq.composite);
     assert_eq!((hq.composite.width(),hq.composite.height()),(64,48));
     // Zero mask removes glow, not the original host document under the HQ element.
@@ -54,10 +63,11 @@ fn staged_cache_matches_cold_over_parameter_mask_and_view_sequences() {
     let mut next=|| { state=state.wrapping_mul(1664525).wrapping_add(1013904223); (state>>8) as f32/16777216. };
     for host_depth in [Depth::Eight,Depth::Float] {
       for initial_mode in [RenderMode::Draft,RenderMode::Hq] {
-        let mut cached=Renderer::new(gpu.clone(),gpu.upload_rgba32f(width,height,&pixels),host_depth);
+        let mut cached=Document::new(gpu.clone(),gpu.upload_rgba32f(width,height,&pixels),host_depth);
         let mut p=Params{radius:3.,glow_iterations:2.,glare_length:0.01,rays_samples:3.,
             glare_on:true,ca_on:true,spectrum_mix:20.,..Params::default()};
-        let mut mask:Option<f32>=None;
+        let mut mask=None;
+        let mut mask_generation=0;
         for step in 0..132 {
             let value=next();
             match step%64 {
@@ -81,8 +91,8 @@ fn staged_cache_matches_cold_over_parameter_mask_and_view_sequences() {
                 17=>p.unmult=!p.unmult,
                 18=>p.aspect_ratio=if value>0.5 {1.5} else {1.},
                 19=>p.spectrum_frequency=1.+value*8.,
-                20=>{mask=Some(value); cached.set_mask(Some(gpu.fill(width,height,[value,value,value,1.])));},
-                21=>{mask=None; cached.set_mask(None);},
+                20=>{mask=Some(gpu.fill(width,height,[value,value,value,1.])); mask_generation+=1;},
+                21=>{mask=None; mask_generation+=1;},
                 22=>p.ca_type=if value>0.5 {CaType::Offset} else {CaType::Center},
                 23=>p.ca_blur=value,
                 24=>p.dr_compression=value*80.,
@@ -129,19 +139,171 @@ fn staged_cache_matches_cold_over_parameter_mask_and_view_sequences() {
             }
             let mode=if step<128 {initial_mode} else if step%2==0 {RenderMode::Draft} else {RenderMode::Hq};
             let view=ViewFlags{xray:step%3==0,solo:step%5==0,host_is_float:step%7==0};
-            let mut cold=Renderer::new(gpu.clone(),gpu.upload_rgba32f(width,height,&pixels),host_depth);
-            if let Some(v)=mask {cold.set_mask(Some(gpu.fill(width,height,[v,v,v,1.])));}
-            let expected=cold.render(&p,mode,&view);
-            let actual=cached.render(&p,mode,&view);
-            for (name,a,b) in [("glow",&actual.glow,&expected.glow),("xray",&actual.xray,&expected.xray),("composite",&actual.composite,&expected.composite)] {
+            let mut cold=Document::new(gpu.clone(),gpu.upload_rgba32f(width,height,&pixels),host_depth);
+            let expected=single(&mut cold,&p,mode,view,mask.as_ref(),mask_generation);
+            let actual=single(&mut cached,&p,mode,view,mask.as_ref(),mask_generation);
+            for (name,a,b) in [("glow",&actual.layer_glows[0].1,&expected.layer_glows[0].1),("xray",actual.xray.as_ref().unwrap(),expected.xray.as_ref().unwrap()),("composite",&actual.composite,&expected.composite)] {
                 assert_eq!(bits(&gpu,a),bits(&gpu,b),"step {step}, {mode:?}, {host_depth:?}, {name}");
             }
-            assert_eq!(bits(&gpu,&cached.render_preview(&p,mode,&view)),bits(&gpu,&expected.composite),"preview step {step}");
-            let repeated=cached.render(&p,mode,&view);
-            for (name,a,b) in [("glow",&repeated.glow,&expected.glow),("xray",&repeated.xray,&expected.xray),("composite",&repeated.composite,&expected.composite)] {
+            let repeated=single(&mut cached,&p,mode,view,mask.as_ref(),mask_generation);
+            for (name,a,b) in [("glow",&repeated.layer_glows[0].1,&expected.layer_glows[0].1),("xray",repeated.xray.as_ref().unwrap(),expected.xray.as_ref().unwrap()),("composite",&repeated.composite,&expected.composite)] {
                 assert_eq!(bits(&gpu,a),bits(&gpu,b),"repeat step {step}, {name}");
             }
         }
       }
+    }
+}
+
+fn stack(document: &mut Document, layers: &[LayerSettings], request: &RenderRequest) -> DocumentOutput {
+    let inputs: Vec<_> = layers.iter().map(|settings| LayerInputs { settings, mask: None, mask_generation: 0 }).collect();
+    document.render(&inputs, request)
+}
+
+fn layers() -> [LayerSettings; 2] {
+    let params=Params { radius: 2., glow_iterations: 1., colorize: true, saturation: 100., ..Params::default() };
+    [
+        LayerSettings { id: 1, opacity: 0.35, params: Params { hue: -80., ..params.clone() }, ..LayerSettings::default() },
+        LayerSettings { id: 2, opacity: 0.7, params: Params { hue: 90., ..params }, ..LayerSettings::default() },
+    ]
+}
+
+#[test]
+fn two_layers_compose_in_order_with_every_blend_opacity_visibility_and_solo() {
+    let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let view=ViewFlags { xray: false, solo: false, host_is_float: false };
+    for depth in [Depth::Eight, Depth::Float] {
+        let source=gpu.fill(5,3,[0.2,0.4,0.7,1.]);
+        let mut document=Document::new(gpu.clone(),gpu.copy(&source),depth);
+        let mut layers=layers();
+        let mut request=request(RenderMode::Draft,view);
+        request.view.host_is_float=depth==Depth::Float;
+        let composition_depth=if depth==Depth::Float {Depth::Float} else {Depth::Eight};
+        for blend in [LayerBlend::Auto,LayerBlend::Screen,LayerBlend::LinearDodge,LayerBlend::Lighten,LayerBlend::Normal] {
+            for layer in &mut layers {layer.blend=blend;}
+            let output=stack(&mut document,&layers,&request);
+            assert_eq!(output.layer_glows.iter().map(|(id,_)|*id).collect::<Vec<_>>(),[1,2]);
+            let mode=match blend {
+                LayerBlend::Auto if depth==Depth::Float=>BlendMode::LinearDodge,
+                LayerBlend::Auto|LayerBlend::Screen=>BlendMode::Screen,
+                LayerBlend::LinearDodge=>BlendMode::LinearDodge,
+                LayerBlend::Lighten=>BlendMode::Lighten,
+                LayerBlend::Normal=>BlendMode::Normal,
+            };
+            let mut expected=gpu.copy(&source);
+            let mut expected_glow=gpu.fill(5,3,[0.,0.,0.,1.]);
+            for (layer,(_,glow)) in layers.iter().zip(&output.layer_glows) {
+                let glow=if depth==Depth::Float {gpu.convert_depth(glow,Depth::Eight,Depth::Float)} else {gpu.copy(glow)};
+                expected=gpu.blend(&expected,&glow,mode,layer.opacity,1.,composition_depth);
+                expected_glow=gpu.blend(&expected_glow,&glow,mode,layer.opacity,1.,composition_depth);
+            }
+            assert_eq!(bits(&gpu,&output.composite),bits(&gpu,&expected),"{blend:?}, {depth:?}");
+            let expected_glow=if depth==Depth::Float {gpu.convert_depth(&expected_glow,Depth::Float,Depth::Eight)} else {expected_glow};
+            assert_eq!(bits(&gpu,&output.glow_composite),bits(&gpu,&expected_glow),"stored glow {blend:?}, {depth:?}");
+        }
+        let forward=stack(&mut document,&layers,&request);
+        layers.reverse();
+        let reversed=stack(&mut document,&layers,&request);
+        assert_ne!(bits(&gpu,&forward.composite),bits(&gpu,&reversed.composite),"Normal layers must not commute");
+        layers[0].visible=false;
+        let hidden=stack(&mut document,&layers,&request);
+        let only=stack(&mut document,&layers[1..],&request);
+        assert_eq!(bits(&gpu,&hidden.composite),bits(&gpu,&only.composite));
+        layers[0].visible=true;
+        layers[0].opacity=0.;
+        let zero=stack(&mut document,&layers,&request);
+        assert_eq!(bits(&gpu,&zero.composite),bits(&gpu,&only.composite));
+        layers[0].opacity=0.7;
+        request.solo_layer=Some(layers[1].id);
+        let solo=stack(&mut document,&layers,&request);
+        assert_eq!(bits(&gpu,&solo.composite),bits(&gpu,&only.composite));
+        layers[1].visible=false;
+        let hidden_solo=stack(&mut document,&layers,&request);
+        assert_eq!(bits(&gpu,&hidden_solo.composite),bits(&gpu,&source),"solo does not reveal hidden layers");
+    }
+}
+
+#[test]
+fn below_extracts_from_actual_composite_and_keeps_dependencies_when_soloed() {
+    let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let source=gpu.fill(7,5,[0.4,0.4,0.4,1.]);
+    let mut document=Document::new(gpu.clone(),gpu.copy(&source),Depth::Eight);
+    let mut layers=layers();
+    // Soft extraction at gamma 1 preserves midtones; avoid a black-on-black oracle.
+    for layer in &mut layers {
+        layer.params=Params { radius:2.,glow_iterations:1.,threshold:1.,transition:Transition::Soft,
+            dr_compression:0.,exposure:0.,gamma:1.,main_opacity:100.,core_opacity:100.,
+            colorize:false,tonemap:false,protect_core:false,unmult:false,..Params::default() };
+    }
+    layers[1].input=LayerInput::Below;
+    let view=ViewFlags { xray: false, solo: false, host_is_float: false };
+    for mode in [RenderMode::Draft,RenderMode::Hq] {
+        let mut request=request(mode,view);
+        let below=stack(&mut document,&layers[..1],&request);
+        let mut reference=Document::new(gpu.clone(),gpu.copy(&below.composite),Depth::Eight);
+        let mut upper=layers[1].clone();
+        upper.input=LayerInput::Original;
+        let expected=stack(&mut reference,&[upper.clone()],&request);
+        let actual=stack(&mut document,&layers,&request);
+        assert_eq!(bits(&gpu,&actual.layer_glows[1].1),bits(&gpu,&expected.layer_glows[0].1),"{mode:?}");
+        assert_eq!(bits(&gpu,&actual.composite),bits(&gpu,&expected.composite),"{mode:?}");
+        let mut original=Document::new(gpu.clone(),gpu.copy(&source),Depth::Eight);
+        let independent=stack(&mut original,&[upper],&request);
+        assert_ne!(bits(&gpu,&actual.layer_glows[1].1),bits(&gpu,&independent.layer_glows[0].1),"Below must not silently use Original");
+        request.solo_layer=Some(2);
+        let solo=stack(&mut document,&layers,&request);
+        assert_eq!(bits(&gpu,&solo.layer_glows.last().unwrap().1),bits(&gpu,&expected.layer_glows[0].1),"solo retains the below dependency");
+        layers[0].visible=false;
+        let hidden=stack(&mut document,&layers,&request);
+        assert_eq!(bits(&gpu,&hidden.layer_glows.last().unwrap().1),bits(&gpu,&independent.layer_glows[0].1),"hidden layers do not contribute to Below");
+        layers[0].visible=true;
+    }
+}
+
+#[test]
+fn draft_and_hq_keep_layer_shape_and_sequential_checkpoint_structure() {
+    let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    // A one-row document crosses Draft's width cap without a large GPU fixture.
+    let mut document=Document::new(gpu.clone(),gpu.fill(1501,1,[0.2,0.4,0.7,1.]),Depth::Eight);
+    let mut layers=layers();
+    layers[1].input=LayerInput::Below;
+    let inputs:Vec<_>=layers.iter().map(|settings|LayerInputs { settings,mask:None,mask_generation:0 }).collect();
+    for (mode,width) in [(RenderMode::Draft,1500),(RenderMode::Hq,1501)] {
+        let request=request(mode,ViewFlags { xray:false,solo:false,host_is_float:false });
+        let mut stages=Vec::new();
+        let traced=document.render_with_checkpoints(&inputs,&request,|name,_,_|stages.push(name.to_owned()));
+        let sequence=["extraction","exposure_depth","merged_glow","tone","glare_composite","final_glow","ca","output"];
+        assert_eq!(stages,sequence.iter().chain(sequence.iter()).map(|name|name.to_string()).collect::<Vec<_>>(),"{mode:?}: layers run sequentially");
+        for image in [&traced.composite,&traced.glow_composite,&traced.layer_glows[0].1,&traced.layer_glows[1].1,traced.xray.as_ref().unwrap()] {
+            assert_eq!((image.width(),image.height()),(width,1),"{mode:?}");
+        }
+        let cached=document.render(&inputs,&request);
+        assert_eq!(bits(&gpu,&traced.composite),bits(&gpu,&cached.composite));
+        document.clear_stage_caches();
+        let cold=document.render(&inputs,&request);
+        assert_eq!(bits(&gpu,&cached.composite),bits(&gpu,&cold.composite));
+        document.clear_caches();
+        let rebuilt=document.render(&inputs,&request);
+        assert_eq!(bits(&gpu,&cached.composite),bits(&gpu,&rebuilt.composite));
+    }
+}
+
+#[test]
+fn xray_only_preview_matches_full_render_without_glow_checkpoints() {
+    let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let mut document=Document::new(gpu.clone(),gpu.fill(5,3,[0.2,0.4,0.7,1.]),Depth::Eight);
+    let layers=[LayerSettings { params:Params { radius:2.,glow_iterations:1.,..Params::default() },..LayerSettings::default() }];
+    let inputs=[LayerInputs { settings:&layers[0],mask:None,mask_generation:0 }];
+    for mode in [RenderMode::Draft,RenderMode::Hq] {
+        let mut request=request(mode,ViewFlags { xray:true,solo:false,host_is_float:false });
+        request.want_layer_glows=false;
+        document.clear_caches();
+        let mut stages=Vec::new();
+        let preview=document.render_with_checkpoints(&inputs,&request,|name,_,_|stages.push(name.to_owned()));
+        assert!(stages.is_empty(),"xray-only preview must not execute the glow graph");
+        assert!(preview.layer_glows.is_empty());
+        request.want_layer_glows=true;
+        let full=document.render(&inputs,&request);
+        assert_eq!(bits(&gpu,&preview.composite),bits(&gpu,&full.composite),"{mode:?}");
+        assert_eq!(bits(&gpu,preview.xray.as_ref().unwrap()),bits(&gpu,full.xray.as_ref().unwrap()),"{mode:?}");
     }
 }

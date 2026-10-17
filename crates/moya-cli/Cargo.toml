@@ -13,5 +13,7 @@ moya-core = { workspace = true }
 moya-gpu = { workspace = true }
 moya-pipeline = { workspace = true }
 moya-io = { workspace = true }
+moya-project = { workspace = true }
+tempfile = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }

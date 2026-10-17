@@ -1,123 +1,196 @@
-use moya_core::Params;
-use std::collections::VecDeque;
+use crate::layers::Layer;
+use moya_core::LayerSettings;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug, PartialEq)]
-pub enum Edit {
-    Params(Params),
-    Mask,
+#[derive(Clone, Debug, PartialEq)]
+struct State {
+    layers: Vec<(LayerSettings, bool)>,
+    selected: u64,
+}
+impl State {
+    fn capture(layers: &[Layer], selected: u64) -> Self {
+        Self { layers: layers.iter().map(|l| (l.settings.clone(), l.mask.enabled)).collect(), selected }
+    }
+    fn matches(&self, layers: &[Layer], selected: u64) -> bool {
+        self.selected == selected && self.layers.len() == layers.len()
+            && self.layers.iter().zip(layers).all(|((settings, enabled), layer)|
+                *settings == layer.settings && *enabled == layer.mask.enabled)
+    }
 }
 
+enum Edit { Stack(State), Mask(u64) }
+
+/// Settings snapshots never clone image buffers. Removed layers retain their mask engines here.
 pub(super) struct History {
     past: VecDeque<Edit>,
     future: Vec<Edit>,
-    past_params: usize,
-    current: Params,
-    pending: Option<Params>,
+    current: State,
+    pending: Option<State>,
+    removed: HashMap<u64, Layer>,
+    next_id: u64,
+    mask_limit: usize,
 }
 
 impl History {
-    pub fn new(params: &Params) -> Self {
-        Self {
-            past: VecDeque::new(),
-            future: Vec::new(),
-            past_params: 0,
-            current: params.clone(),
-            pending: None,
-        }
+    pub fn new(layers: &[Layer], selected: u64) -> Self {
+        Self { past: VecDeque::new(), future: Vec::new(), current: State::capture(layers, selected),
+            pending: None, removed: HashMap::new(), next_id: layers.iter().map(|l| l.settings.id).max().unwrap_or(0).saturating_add(1),
+            mask_limit: 256 * 1024 * 1024 }
     }
 
-    /// Pointer edits form one transaction, committed when the last button is released.
-    pub fn observe(&mut self, params: &Params, pointer_down: bool) {
-        if *params != self.current {
+    pub fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).expect("layer IDs exhausted");
+        id
+    }
+
+    fn branch(&mut self, layers: &mut [Layer]) {
+        self.future.clear();
+        for layer in layers.iter_mut().chain(self.removed.values_mut()) { layer.mask.clear_redo(); }
+    }
+
+    /// Coalesce pointer drags; selection and the complete settings stack share one timeline.
+    /// Also drains every active mask engine's new-step and eviction markers.
+    pub fn observe(&mut self, layers: &mut Vec<Layer>, selected: u64, pointer_down: bool) {
+        let changed = !self.current.matches(layers, selected);
+        self.next_id = self.next_id.max(layers.iter().map(|l| l.settings.id).max().unwrap_or(0).saturating_add(1));
+        if changed {
             self.pending.get_or_insert_with(|| self.current.clone());
-            self.current = params.clone();
-            self.future.clear();
+            self.current = State::capture(layers, selected);
+            self.branch(layers);
         }
-        if !pointer_down {
-            self.commit();
+        if !pointer_down { self.commit(); }
+        for index in 0..layers.len() {
+            let id = layers[index].settings.id;
+            let (steps, evicted) = layers[index].mask.take_history_steps();
+            let prior_steps = self.past.iter().filter(|e| matches!(e, Edit::Mask(owner) if *owner == id)).count();
+            self.drop_oldest_mask(id, evicted);
+            if steps > 0 {
+                self.commit(); self.branch(layers);
+                for _ in 0..steps.saturating_sub(evicted.saturating_sub(prior_steps)) { self.past.push_back(Edit::Mask(id)); }
+            }
         }
+        self.trim(layers);
     }
 
     fn commit(&mut self) {
         if let Some(before) = self.pending.take() {
-            if before != self.current {
-                self.push_params(before);
-            }
+            if before != self.current { self.past.push_back(Edit::Stack(before)); }
         }
     }
 
-    fn push_params(&mut self, params: Params) {
-        // Mask retention belongs to the mask engine, not the parameter history cap.
-        if self.past_params == 200 {
-            let oldest = self.past.iter().position(|edit| matches!(edit, Edit::Params(_))).unwrap();
-            self.past.remove(oldest);
-        } else {
-            self.past_params += 1;
-        }
-        self.past.push_back(Edit::Params(params));
+    pub fn remove_layer(&mut self, layers: &mut Vec<Layer>, selected: &mut u64, id: u64) -> bool {
+        if layers.len() <= 1 { return false; }
+        let Some(index) = layers.iter().position(|l| l.settings.id == id) else { return false; };
+        layers[index].mask.end_stroke();
+        self.observe(layers, *selected, false);
+        let mut layer = layers.remove(index);
+        layer.mask.release_gpu();
+        self.removed.insert(id, layer);
+        if *selected == id { *selected = layers[index.min(layers.len() - 1)].settings.id; }
+        self.observe(layers, *selected, false);
+        true
     }
 
-    /// Commit parameter edits before recording a mask-engine-owned undo step.
-    pub fn mask_step(&mut self) {
-        self.commit();
-        self.past.push_back(Edit::Mask);
-        self.future.clear();
-    }
-
-    pub fn clear(&mut self, params: &Params) {
-        self.past.clear();
-        self.future.clear();
-        self.past_params = 0;
-        self.current = params.clone();
-        self.pending = None;
-    }
-
-    /// Remove applied mask steps whose diffs the mask engine has evicted.
-    pub fn drop_oldest_mask(&mut self, mut count: usize) {
+    fn drop_oldest_mask(&mut self, id: u64, mut count: usize) {
         self.past.retain(|edit| {
-            if count > 0 && matches!(edit, Edit::Mask) {
-                count -= 1;
-                false
-            } else {
-                true
-            }
+            if count > 0 && matches!(edit, Edit::Mask(layer) if *layer == id) { count -= 1; false } else { true }
         });
     }
 
-    pub fn can_undo(&self) -> bool {
-        !self.past.is_empty() || self.pending.as_ref().is_some_and(|p| *p != self.current)
+    fn trim(&mut self, layers: &mut [Layer]) {
+        while self.past.iter().filter(|e| matches!(e, Edit::Stack(_))).count() > 200 {
+            let index = self.past.iter().position(|e| matches!(e, Edit::Stack(_))).unwrap();
+            self.past.remove(index);
+        }
+        loop {
+            let bytes: usize = layers.iter().chain(self.removed.values()).map(|l| l.mask.history_bytes()).sum();
+            let count = self.past.iter().chain(&self.future).filter(|e| matches!(e, Edit::Mask(_))).count();
+            if bytes <= self.mask_limit && count <= 200 { break; }
+            if let Some(index) = self.past.iter().position(|e| matches!(e, Edit::Mask(_))) {
+                let Edit::Mask(id) = self.past.remove(index).unwrap() else { unreachable!() };
+                if let Some(layer) = layers.iter_mut().find(|l| l.settings.id == id).or_else(|| self.removed.get_mut(&id)) {
+                    layer.mask.drop_oldest_history();
+                }
+            } else if let Some(index) = self.future.iter().position(|e| matches!(e, Edit::Mask(_))) {
+                let Edit::Mask(id) = self.future.remove(index) else { unreachable!() };
+                if let Some(layer) = layers.iter_mut().find(|l| l.settings.id == id).or_else(|| self.removed.get_mut(&id)) {
+                    layer.mask.drop_farthest_redo();
+                }
+            } else { break; }
+        }
+        self.prune_removed();
+        // Deleted masks own full CPU images; retention shares the global diff budget.
+        while layers.iter().map(|l| l.mask.history_bytes()).sum::<usize>()
+            + self.removed.values().map(|l| l.mask.retained_bytes()).sum::<usize>() > self.mask_limit
+        {
+            let (edit, redo) = if let Some(edit) = self.past.pop_front() { (edit, false) }
+                else if !self.future.is_empty() { (self.future.remove(0), true) }
+                else { break; };
+            if let Edit::Mask(id) = edit {
+                if let Some(layer) = layers.iter_mut().find(|l| l.settings.id == id).or_else(|| self.removed.get_mut(&id)) {
+                    if redo { layer.mask.drop_farthest_redo(); } else { layer.mask.drop_oldest_history(); }
+                }
+            }
+            self.prune_removed();
+        }
     }
 
+    fn prune_removed(&mut self) {
+        if self.removed.is_empty() { return; }
+        let mut retained: HashSet<u64> = self.current.layers.iter().map(|(l, _)| l.id).collect();
+        for edit in self.past.iter().chain(&self.future) {
+            match edit {
+                Edit::Stack(state) => retained.extend(state.layers.iter().map(|(l, _)| l.id)),
+                Edit::Mask(id) => { retained.insert(*id); }
+            }
+        }
+        if let Some(state) = &self.pending { retained.extend(state.layers.iter().map(|(l, _)| l.id)); }
+        self.removed.retain(|id, _| retained.contains(id));
+    }
+
+    pub fn clear(&mut self, layers: &[Layer], selected: u64) {
+        *self = Self::new(layers, selected);
+    }
+    pub fn can_undo(&self) -> bool { !self.past.is_empty() || self.pending.as_ref().is_some_and(|p| *p != self.current) }
     pub fn can_redo(&self) -> bool { !self.future.is_empty() }
 
-    pub fn undo(&mut self) -> Option<Edit> {
-        self.commit();
-        match self.past.pop_back()? {
-            Edit::Params(previous) => {
-                self.past_params -= 1;
-                self.future.push(Edit::Params(std::mem::replace(&mut self.current, previous)));
-                Some(Edit::Params(self.current.clone()))
+    fn apply(&mut self, edit: Edit, layers: &mut Vec<Layer>, selected: &mut u64, redo: bool) -> Edit {
+        match edit {
+            Edit::Stack(state) => {
+                let previous = std::mem::replace(&mut self.current, state);
+                for mut layer in layers.drain(..) {
+                    if !self.current.layers.iter().any(|(settings, _)| settings.id == layer.settings.id) { layer.mask.release_gpu(); }
+                    self.removed.insert(layer.settings.id, layer);
+                }
+                for (settings, enabled) in &self.current.layers {
+                    let mut layer = self.removed.remove(&settings.id).expect("history retains removed layers");
+                    layer.settings = settings.clone(); layer.mask.enabled = *enabled;
+                    layers.push(layer);
+                }
+                *selected = self.current.selected;
+                Edit::Stack(previous)
             }
-            Edit::Mask => {
-                self.future.push(Edit::Mask);
-                Some(Edit::Mask)
+            Edit::Mask(id) => {
+                let layer = layers.iter_mut().find(|l| l.settings.id == id).or_else(|| self.removed.get_mut(&id)).expect("history retains mask owner");
+                if redo { layer.mask.redo(); } else { layer.mask.undo(); }
+                Edit::Mask(id)
             }
         }
     }
 
-    pub fn redo(&mut self) -> Option<Edit> {
-        self.commit();
-        match self.future.pop()? {
-            Edit::Params(next) => {
-                let previous = std::mem::replace(&mut self.current, next);
-                self.push_params(previous);
-                Some(Edit::Params(self.current.clone()))
-            }
-            Edit::Mask => {
-                self.past.push_back(Edit::Mask);
-                Some(Edit::Mask)
-            }
-        }
+    pub fn undo(&mut self, layers: &mut Vec<Layer>, selected: &mut u64) -> bool {
+        for layer in layers.iter_mut() { layer.mask.end_stroke(); }
+        self.observe(layers, *selected, false);
+        let Some(edit) = self.past.pop_back() else { return false; };
+        let inverse = self.apply(edit, layers, selected, false);
+        self.future.push(inverse); true
+    }
+    pub fn redo(&mut self, layers: &mut Vec<Layer>, selected: &mut u64) -> bool {
+        self.observe(layers, *selected, false);
+        let Some(edit) = self.future.pop() else { return false; };
+        let inverse = self.apply(edit, layers, selected, true);
+        self.past.push_back(inverse); true
     }
 }
 
@@ -126,120 +199,101 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drag_coalesces_and_new_edit_discards_redo() {
-        let mut params = Params::default();
-        let initial = params.clone();
-        let mut history = History::new(&params);
-        for value in [1.0, 2.0, 3.0] {
-            params.exposure = value;
-            history.observe(&params, true);
+    fn layer_operations_and_selection_undo_as_one_stack() {
+        let mut layers = vec![Layer::new(1, "First")];
+        let mut selected = 1;
+        let mut history = History::new(&layers, selected);
+        let added = history.next_id();
+        layers.push(Layer::new(added, "Added")); selected = added;
+        history.observe(&mut layers, selected, false);
+        let duplicated = history.next_id();
+        layers.push(layers[1].duplicate(duplicated)); selected = duplicated;
+        history.observe(&mut layers, selected, false);
+        layers.swap(0, 2);
+        layers[0].settings.name = "Renamed".into();
+        layers[0].settings.opacity = 0.4;
+        layers[0].settings.params.exposure = 3.0;
+        history.observe(&mut layers, selected, false);
+        assert!(history.remove_layer(&mut layers, &mut selected, duplicated));
+        assert_eq!(layers.len(), 2);
+        assert_ne!(selected, duplicated);
+        assert!(history.undo(&mut layers, &mut selected));
+        assert_eq!(selected, duplicated);
+        assert_eq!(layers[0].settings.name, "Renamed");
+        assert_eq!(layers[0].settings.params.exposure, 3.0);
+        assert!(history.undo(&mut layers, &mut selected));
+        assert_eq!(layers[0].settings.id, 1);
+        assert_eq!(layers[2].settings.name, "Added copy");
+        assert!(history.undo(&mut layers, &mut selected));
+        assert_eq!(selected, added);
+        assert_eq!(layers.len(), 2);
+        assert!(history.undo(&mut layers, &mut selected));
+        assert_eq!(selected, 1);
+        assert_eq!(layers.len(), 1);
+        for _ in 0..4 { assert!(history.redo(&mut layers, &mut selected)); }
+        assert_eq!(layers.len(), 2);
+        assert!(!history.remove_layer(&mut vec![Layer::new(1, "Only")], &mut 1, 1));
+    }
+
+    #[test]
+    fn mask_timeline_owns_deleted_masks_and_trims_globally() {
+        let mut layers = vec![Layer::new(1, "One"), Layer::new(2, "Two")];
+        for layer in &mut layers { layer.mask.reset(4, 1); }
+        let mut selected = 1;
+        let mut history = History::new(&layers, selected);
+        layers[0].mask.invert(); history.observe(&mut layers, selected, false);
+        let painted = layers[0].mask.fingerprint();
+        layers[1].mask.invert(); history.observe(&mut layers, selected, false);
+        assert!(history.remove_layer(&mut layers, &mut selected, 1));
+        assert!(history.undo(&mut layers, &mut selected));
+        assert_eq!(layers[0].mask.fingerprint(), painted);
+        assert!(history.undo(&mut layers, &mut selected));
+        assert!(layers[1].mask.is_empty());
+        assert!(history.undo(&mut layers, &mut selected));
+        assert!(layers[0].mask.is_empty());
+        assert!(history.redo(&mut layers, &mut selected));
+        assert_eq!(layers[0].mask.fingerprint(), painted);
+        history.mask_limit = 0;
+        history.observe(&mut layers, selected, false);
+        assert_eq!(layers.iter().map(|l| l.mask.history_bytes()).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn drag_coalesces_and_branch_discards_mask_redo() {
+        let mut layers = vec![Layer::new(1, "One")]; layers[0].mask.reset(2, 1);
+        let mut selected = 1;
+        let mut history = History::new(&layers, selected);
+        for value in [2.0, 3.0, 4.0] {
+            layers[0].settings.params.exposure = value;
+            history.observe(&mut layers, selected, true);
         }
-        history.observe(&params, false);
-        assert_eq!(history.undo(), Some(Edit::Params(initial)));
-        assert_eq!(history.redo(), Some(Edit::Params(params.clone())));
-        history.undo();
-        params.exposure = 4.0;
-        history.observe(&params, false);
+        history.observe(&mut layers, selected, false);
+        layers[0].mask.invert(); history.observe(&mut layers, selected, false);
+        assert!(history.undo(&mut layers, &mut selected));
+        assert!(history.undo(&mut layers, &mut selected));
+        assert!(!history.can_undo());
+        assert!(history.redo(&mut layers, &mut selected));
+        layers[0].settings.name = "New branch".into();
+        history.observe(&mut layers, selected, false);
         assert!(!history.can_redo());
-        for value in 5..250 {
-            params.exposure = value as f32;
-            history.observe(&params, false);
-        }
-        assert_eq!(history.past.len(), 200);
+        assert!(!layers[0].mask.redo());
     }
 
     #[test]
-    fn mixed_timeline_commits_pending_params_and_branches() {
-        let initial = Params::default();
-        let mut params = initial.clone();
-        let mut history = History::new(&params);
-        params.exposure += 1.0;
-        history.observe(&params, true);
-        history.mask_step();
-        let first = params.clone();
-        params.exposure += 1.0;
-        history.observe(&params, false);
-        history.mask_step();
-
-        assert_eq!(history.undo(), Some(Edit::Mask));
-        assert_eq!(history.undo(), Some(Edit::Params(first.clone())));
-        assert_eq!(history.undo(), Some(Edit::Mask));
-        assert_eq!(history.undo(), Some(Edit::Params(initial)));
+    fn enabled_toggle_and_deleted_image_retention_are_bounded() {
+        let mut layers = vec![Layer::new(1, "One"), Layer::new(2, "Two")];
+        layers[0].mask.reset(16, 16);
+        let mut selected = 1;
+        let mut history = History::new(&layers, selected);
+        layers[0].mask.enabled = true;
+        history.observe(&mut layers, selected, false);
+        assert!(history.undo(&mut layers, &mut selected));
+        assert!(!layers[0].mask.enabled);
+        assert!(history.redo(&mut layers, &mut selected));
+        assert!(layers[0].mask.enabled);
+        history.mask_limit = 1;
+        assert!(history.remove_layer(&mut layers, &mut selected, 1));
+        assert!(history.removed.is_empty());
         assert!(!history.can_undo());
-        assert_eq!(history.redo(), Some(Edit::Params(first)));
-        assert_eq!(history.redo(), Some(Edit::Mask));
-        assert_eq!(history.redo(), Some(Edit::Params(params.clone())));
-        assert_eq!(history.redo(), Some(Edit::Mask));
-        assert!(!history.can_redo());
-
-        history.undo();
-        params.exposure += 1.0;
-        history.observe(&params, true);
-        assert!(history.can_undo());
-        assert!(!history.can_redo());
-        history.mask_step();
-        assert_eq!(history.undo(), Some(Edit::Mask));
-        params.exposure -= 1.0;
-        assert_eq!(history.undo(), Some(Edit::Params(params.clone())));
-        history.mask_step();
-        assert!(!history.can_redo());
-    }
-
-    #[test]
-    fn mask_eviction_preserves_params_and_clear_resets_pending() {
-        let initial = Params::default();
-        let mut params = initial.clone();
-        let mut history = History::new(&params);
-        history.mask_step();
-        params.exposure += 1.0;
-        history.observe(&params, false);
-        history.mask_step();
-        history.drop_oldest_mask(1);
-        assert_eq!(history.undo(), Some(Edit::Mask));
-        assert_eq!(history.undo(), Some(Edit::Params(initial)));
-        assert!(!history.can_undo());
-        history.redo();
-        history.redo();
-        history.drop_oldest_mask(10);
-        assert_eq!(history.undo(), Some(Edit::Params(Params::default())));
-        params.exposure += 1.0;
-        history.observe(&params, true);
-        history.clear(&params);
-        assert!(!history.can_undo());
-        assert!(!history.can_redo());
-        assert_eq!(history.undo(), None);
-        history.observe(&params, false);
-        assert!(!history.can_undo());
-    }
-
-    #[test]
-    fn parameter_limit_does_not_evict_mask_markers() {
-        let mut params = Params::default();
-        let mut history = History::new(&params);
-        history.mask_step();
-        for value in 1..250 {
-            params.exposure = value as f32;
-            history.observe(&params, false);
-        }
-        assert_eq!(history.past.len(), 201);
-        assert_eq!(history.past.front(), Some(&Edit::Mask));
-        history.drop_oldest_mask(1);
-        assert_eq!(history.past.len(), 200);
-    }
-
-    #[test]
-    fn observing_parameter_undo_preserves_mask_redo() {
-        let initial = Params::default();
-        let mut params = initial.clone();
-        let mut history = History::new(&params);
-        params.exposure += 1.0;
-        history.observe(&params, false);
-        history.mask_step();
-        assert_eq!(history.undo(), Some(Edit::Mask));
-        assert_eq!(history.undo(), Some(Edit::Params(initial.clone())));
-        history.observe(&initial, false);
-        assert!(history.can_redo());
-        assert_eq!(history.redo(), Some(Edit::Params(params)));
-        assert_eq!(history.redo(), Some(Edit::Mask));
     }
 }

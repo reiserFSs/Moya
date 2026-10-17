@@ -89,24 +89,92 @@ function findLayer(layers, id) {
 function xmlEscape(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
-function metadataPacket(params, returnMode) {
-  const json = xmlEscape(JSON.stringify({ moya: 1, params, returnMode }));
+function encodeProject(buffer) {
+  const bytes = new Uint8Array(buffer), alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const chunks = [];
+  let chunk = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+    chunk += alphabet[n >>> 18] + alphabet[(n >>> 12) & 63] + (i + 1 < bytes.length ? alphabet[(n >>> 6) & 63] : "=") + (i + 2 < bytes.length ? alphabet[n & 63] : "=");
+    if (chunk.length >= 32768) { chunks.push(chunk); chunk = ""; }
+  }
+  chunks.push(chunk);
+  return chunks.join("");
+}
+function decodeProject(project) {
+  if (typeof project !== "string" || !project.length || project.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(project)) throw new Error("Invalid Moya project metadata.");
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const bytes = new Uint8Array(project.length / 4 * 3 - (project.endsWith("==") ? 2 : project.endsWith("=") ? 1 : 0));
+  let offset = 0;
+  for (let i = 0; i < project.length; i += 4) {
+    const n = (alphabet.indexOf(project[i]) << 18) | (alphabet.indexOf(project[i + 1]) << 12) | (Math.max(0, alphabet.indexOf(project[i + 2])) << 6) | Math.max(0, alphabet.indexOf(project[i + 3]));
+    for (const shift of [16, 8, 0]) if (offset < bytes.length) bytes[offset++] = (n >>> shift) & 255;
+  }
+  if (bytes[0] !== 80 || bytes[1] !== 75 || bytes[2] !== 3 || bytes[3] !== 4) throw new Error("Invalid Moya project archive.");
+  return bytes.buffer;
+}
+function metadataPacket(project) {
+  const json = xmlEscape(JSON.stringify({ moya: 2, project }));
   return `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:moya="${namespace}"><moya:settings>${json}</moya:settings></rdf:Description></rdf:RDF></x:xmpmeta>`;
 }
 function parseMetadata(packet) {
   const match = packet && (packet.match(/<moya:settings(?:\s[^>]*)?>([\s\S]*?)<\/moya:settings>/) || packet.match(/\bmoya:settings="([^"]*)"/) || packet.match(/\bmoya:settings='([^']*)'/));
-  if (!match || !packet.includes(namespace)) throw new Error("Select a Moya layer to re-edit.");
+  if (!match || !packet.includes(namespace)) return null;
   const json = match[1].replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
   const value = JSON.parse(json);
-  if (value.moya !== 1 || !value.params || !["glow", "composite"].includes(value.returnMode)) throw new Error("Invalid Moya layer metadata.");
+  if (value.moya !== 2) throw new Error("Invalid Moya metadata.");
+  decodeProject(value.project);
   return value;
+}
+function layerAncestors(layers, id, ancestors = []) {
+  for (const layer of layers) {
+    const path = [layer, ...ancestors];
+    if (layer.id === id) return path;
+    if (layer.layers) { const found = layerAncestors(layer.layers, id, path); if (found) return found; }
+  }
+}
+async function reeditTarget(doc, layer) {
+  for (const candidate of layerAncestors(doc.layers, layer.id) || []) {
+    const stored = await layerMetadata(candidate.id, doc.id);
+    if (stored) return { layer: candidate, stored };
+  }
+  throw new Error("Select a Moya group or one of its layers to re-edit.");
+}
+function placementPlan(message, current) {
+  const stem = current.source.replace(/\.tif$/, "");
+  if (message.depth !== current.document.depth || message.returnMode !== current.returnMode || message.groupName !== "Moya" || message.projectPath !== `${stem}.moya` || !Array.isArray(message.layers)) throw new Error("Invalid result from Moya.");
+  if (message.returnMode === "composite") {
+    if (message.composite !== `${stem}.moya.tif` || message.layers.length) throw new Error("Invalid Moya composite result.");
+    return [{ path: message.composite, name: "Moya", blend: "normal", opacity: 100, visible: true }];
+  }
+  if (message.returnMode !== "layers" || message.composite !== null) throw new Error("Invalid Moya layers result.");
+  const paths = new Set();
+  for (let i = 0; i < message.layers.length; i++) {
+    const layer = message.layers[i];
+    if (layer.path !== `${stem}.moya-layer-${i + 1}.tif` || paths.has(layer.path) || typeof layer.name !== "string" || !["screen", "linearDodge", "lighten", "normal"].includes(layer.blend) || !Number.isFinite(layer.opacity) || layer.opacity < 0 || layer.opacity > 100 || typeof layer.visible !== "boolean") throw new Error("Invalid Moya layer result.");
+    paths.add(layer.path);
+  }
+  return message.layers;
+}
+async function placePixelInGroup(pixel, group) {
+  await pixel.move(group, constants.ElementPlacement.PLACEINSIDE);
+  const top = group.layers[0];
+  if (top.id !== pixel.id) await pixel.move(top, constants.ElementPlacement.PLACEBEFORE);
+}
+async function deleteMoyaTarget(layerId, documentId) {
+  await batch([{ _obj: "delete", _target: [{ _ref: "layer", _id: layerId }, { _ref: "document", _id: documentId }], deleteContained: true }]);
+}
+function preserveAppearance(old, placed, wasVisible) {
+  if (old.kind === placed.kind) placed.blendMode = old.blendMode;
+  placed.opacity = old.opacity;
+  placed.visible = wasVisible;
 }
 async function layerMetadata(layerId, documentId) {
   const [value] = await batch([{ _obj: "get", _target: [{ _property: "XMPMetadataAsUTF8" }, { _ref: "layer", _id: layerId }, { _ref: "document", _id: documentId }] }]);
   return parseMetadata(value.XMPMetadataAsUTF8);
 }
 async function cleanFiles(current) {
-  for (const path of [current.source, current.source.replace(/\.tif$/, ".moya.tif")]) {
+  for (const path of new Set([current.source, current.projectPath, current.source.replace(/\.tif$/, ".moya"), current.source.replace(/\.tif$/, ".moya.tif"), ...(current.resultPaths || [])].filter(Boolean))) {
     try { await (await fileAt(path)).delete(); } catch (error) { console.log("Moya temporary file cleanup:", String(error)); }
   }
 }
@@ -120,9 +188,8 @@ async function restoreLayer(current) {
   }, { commandName: "Cancel Moya" });
 }
 async function cancel(current) {
-  await restoreLayer(current);
-  await cleanFiles(current);
-  if (session === current) session = null;
+  try { await restoreLayer(current); }
+  finally { await cleanFiles(current); if (session === current) session = null; }
 }
 async function receive(message) {
   const current = session;
@@ -135,43 +202,51 @@ async function receive(message) {
     return;
   }
   if (message.type !== "result") return;
-  status("Placing layer…", "busy");
+  status("Placing Moya…", "busy");
   try {
-    const expected = current.source.replace(/\.tif$/, ".moya.tif");
-    if (message.path !== expected || message.depth !== current.document.depth || !["screen", "linearDodge", "normal"].includes(message.blend) || !["glow", "composite"].includes(message.returnMode) || !message.params) throw new Error("Invalid result from Moya.");
+    const layers = placementPlan(message, current);
+    current.resultPaths = layers.map(layer => layer.path);
+    const project = encodeProject(await (await fileAt(message.projectPath)).read({ format: storage.formats.binary }));
+    decodeProject(project);
     const target = app.documents.find(doc => doc.id === current.document.id);
     if (!target) throw new Error("The original Photoshop document was closed.");
     await core.executeAsModal(async context => {
       const history = await context.hostControl.suspendHistory({ documentID: target.id, name: "Moya" });
-      let resultDoc, placed;
+      let resultDoc;
       try {
         await selectDocument(target.id);
         const old = current.layerId ? findLayer(target.layers, current.layerId) : null;
-        if (current.layerId && !old) throw new Error("The Moya layer was deleted while editing.");
-        resultDoc = await app.open(await fileAt(message.path));
-        await context.hostControl.registerAutoCloseDocument(resultDoc.id);
-        if (resultDoc.width !== target.width || resultDoc.height !== target.height) throw new Error("Moya returned different image dimensions.");
-        placed = await resultDoc.layers[0].duplicate(target);
-        await resultDoc.closeWithoutSaving();
-        resultDoc = null;
-        await selectDocument(target.id);
+        if (current.layerId && !old) throw new Error("The Moya group was deleted while editing.");
+        let placed = message.returnMode === "layers" ? await target.createLayerGroup({ name: "Moya" }) : null;
+        for (const spec of layers) {
+          resultDoc = await app.open(await fileAt(spec.path));
+          await context.hostControl.registerAutoCloseDocument(resultDoc.id);
+          if (resultDoc.width !== target.width || resultDoc.height !== target.height || resultDoc.bitsPerChannel !== target.bitsPerChannel) throw new Error("Moya returned different image dimensions or depth.");
+          const pixel = await resultDoc.layers[0].duplicate(target);
+          await resultDoc.closeWithoutSaving();
+          resultDoc = null;
+          await selectDocument(target.id);
+          pixel.name = spec.name;
+          pixel.blendMode = { screen: constants.BlendMode.SCREEN, linearDodge: constants.BlendMode.LINEARDODGE, lighten: constants.BlendMode.LIGHTEN, normal: constants.BlendMode.NORMAL }[spec.blend];
+          pixel.opacity = spec.opacity;
+          pixel.visible = spec.visible;
+          if (placed) await placePixelInGroup(pixel, placed);
+          else placed = pixel;
+        }
         if (old) {
           await placed.move(old, constants.ElementPlacement.PLACEBEFORE);
-          placed.name = old.name;
-          placed.blendMode = old.blendMode;
-          placed.opacity = old.opacity;
-          placed.visible = current.wasVisible;
-        } else {
-          if (target.layers[0].id !== placed.id) await placed.move(target.layers[0], constants.ElementPlacement.PLACEBEFORE);
-          placed.name = message.layerName || "Moya Glow";
-          placed.blendMode = { screen: constants.BlendMode.SCREEN, linearDodge: constants.BlendMode.LINEARDODGE, normal: constants.BlendMode.NORMAL }[message.blend];
+          preserveAppearance(old, placed, current.wasVisible);
+        } else if (target.layers[0].id !== placed.id) {
+          await placed.move(target.layers[0], constants.ElementPlacement.PLACEBEFORE);
         }
-        await batch([{ _obj: "set", _target: [{ _ref: "property", _property: "XMPMetadataAsUTF8" }, { _ref: "layer", _id: placed.id }, { _ref: "document", _id: target.id }], to: { _obj: "layer", XMPMetadataAsUTF8: metadataPacket(message.params, message.returnMode) } }]);
-        if (old) await old.delete();
+        placed.name = "Moya";
+        if (message.returnMode === "composite") placed.blendMode = constants.BlendMode.NORMAL;
+        await batch([{ _obj: "set", _target: [{ _ref: "property", _property: "XMPMetadataAsUTF8" }, { _ref: "layer", _id: placed.id }, { _ref: "document", _id: target.id }], to: { _obj: "layer", XMPMetadataAsUTF8: metadataPacket(project) } }]);
+        if (old) await deleteMoyaTarget(old.id, target.id);
         await context.hostControl.resumeHistory(history);
       } catch (error) {
-        if (resultDoc) await resultDoc.closeWithoutSaving();
-        await context.hostControl.resumeHistory(history, false);
+        try { if (resultDoc) await resultDoc.closeWithoutSaving(); }
+        finally { await context.hostControl.resumeHistory(history, false); }
         throw error;
       }
     }, { commandName: "Moya" });
@@ -180,14 +255,16 @@ async function receive(message) {
     send({ type: "placed", id: current.id });
     status("Placed in Photoshop", "ok");
   } catch (error) {
-    await restoreLayer(current);
+    try { await restoreLayer(current); }
+    catch (restoreError) { console.log("Moya visibility restore:", errorText(restoreError)); }
+    await cleanFiles(current);
     status(errorText(error), "error");
     send({ type: "error", id: current.id, message: errorText(error) });
   }
 }
 async function connectOnce() {
   const info = JSON.parse(await (await fileAt(`${home}/Library/Application Support/Moya/bridge.json`)).read());
-  if (info.version !== 1 || info.port !== 47811 || !/^[a-fA-F0-9]{32}$/.test(info.token)) throw new Error("Invalid Moya bridge discovery file.");
+  if (info.version !== 2 || info.port !== 47811 || !/^[a-fA-F0-9]{32}$/.test(info.token)) throw new Error("Invalid Moya bridge discovery file.");
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, "0")).join("");
   const proof = sha256(info.token + nonce);
   return new Promise((resolve, reject) => {
@@ -196,13 +273,13 @@ async function connectOnce() {
     let ready = false, failed = false;
     const fail = error => { failed = true; clearTimeout(timeout); ws.close(); reject(error); };
     const timeout = setTimeout(() => fail(new Error("Moya handshake timed out.")), 1200);
-    ws.onopen = () => { if (!failed) ws.send(JSON.stringify({ type: "hello", version: 1, token: info.token, nonce, client: "moya-bridge" })); };
+    ws.onopen = () => { if (!failed) ws.send(JSON.stringify({ type: "hello", version: 2, token: info.token, nonce, client: "moya-bridge" })); };
     ws.onmessage = event => {
       if (failed) return;
       try {
         const message = JSON.parse(event.data);
         if (!ready) {
-          if (message.type !== "hello" || message.version !== 1 || message.app !== "moya" || message.proof !== proof) throw new Error("Invalid Moya handshake.");
+          if (message.type !== "hello" || message.version !== 2 || message.app !== "moya" || message.proof !== proof) throw new Error("Invalid Moya handshake.");
           ready = true; clearTimeout(timeout); socket = ws; resolve(ws);
         } else receive(message).catch(error => status(errorText(error), "error"));
       } catch (error) { fail(error); }
@@ -248,20 +325,21 @@ async function edit(reedit = false) {
     const id = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => { const n = Math.floor(Math.random() * 16); return (c === "x" ? n : (n & 3) | 8).toString(16); });
     const temp = await fs.getTemporaryFolder();
     const source = await temp.createFile(`${id}.tif`, { overwrite: false });
-    current = { id, source: source.nativePath, document: { id: doc.id, name: doc.name, depth, width: doc.width, height: doc.height }, params: null, returnMode: document.getElementById("composite").checked ? "composite" : "glow" };
+    current = { id, source: source.nativePath, projectPath: null, document: { id: doc.id, name: doc.name, depth, width: doc.width, height: doc.height }, returnMode: document.getElementById("composite").checked ? "composite" : "layers" };
     status("Exporting Photoshop composite…", "busy");
     await core.executeAsModal(async context => {
       let duplicate;
       try {
         await selectDocument(doc.id);
         if (reedit) {
-          const layer = doc.activeLayers[0];
-          if (!layer || doc.activeLayers.length !== 1) throw new Error("Select one Moya layer to re-edit.");
-          const stored = await layerMetadata(layer.id, doc.id);
+          const selected = doc.activeLayers[0];
+          if (!selected || doc.activeLayers.length !== 1) throw new Error("Select one Moya group or one of its layers to re-edit.");
+          const { layer, stored } = await reeditTarget(doc, selected);
           current.layerId = layer.id;
           current.wasVisible = layer.visible;
-          current.params = stored.params;
-          current.returnMode = stored.returnMode;
+          const projectFile = await temp.createFile(`${id}.input.moya`, { overwrite: false });
+          current.projectPath = projectFile.nativePath;
+          await projectFile.write(decodeProject(stored.project), { format: storage.formats.binary });
           layer.visible = false;
         }
         duplicate = await doc.duplicate(`Moya export ${id}`, true);
@@ -275,10 +353,14 @@ async function edit(reedit = false) {
     }, { commandName: "Export to Moya" });
     if (!socket || socket.readyState !== 1) throw new Error("Moya disconnected during export.");
     session = current;
-    send({ type: "edit", ...current, layerId: undefined, wasVisible: undefined });
+    send({ type: "edit", id: current.id, source: current.source, projectPath: current.projectPath, document: current.document, returnMode: current.returnMode });
     status("Waiting for Moya…", "active");
   } catch (error) {
-    if (current) { await restoreLayer(current); await cleanFiles(current); }
+    if (current) {
+      try { await restoreLayer(current); }
+      catch (restoreError) { console.log("Moya visibility restore:", errorText(restoreError)); }
+      await cleanFiles(current);
+    }
     status(errorText(error), "error");
   } finally { busy = false; }
 }

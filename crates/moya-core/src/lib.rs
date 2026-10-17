@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod layers;
 pub mod presets;
+pub use layers::{LayerBlend, LayerInput, LayerSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Transition { #[default] Soft, Precise }

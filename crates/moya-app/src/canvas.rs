@@ -11,6 +11,7 @@ pub(super) struct CanvasState {
     source: Option<Preview>,
     source_dirty: bool,
     stroke_active: bool,
+    stroke_layer: Option<u64>,
 }
 
 impl Default for CanvasState {
@@ -24,6 +25,7 @@ impl Default for CanvasState {
             source: None,
             source_dirty: true,
             stroke_active: false,
+            stroke_layer: None,
         }
     }
 }
@@ -34,6 +36,7 @@ impl CanvasState {
         self.pan = Vec2::ZERO;
         self.source_dirty = true;
         self.stroke_active = false;
+        self.stroke_layer = None;
     }
 
     fn zoom_at(&mut self, factor: f32, cursor: Pos2, center: Pos2) {
@@ -78,6 +81,14 @@ impl App {
     }
 
     pub(super) fn canvas_ui(&mut self, ui: &mut egui::Ui) {
+        let index = self.selected_index();
+        if self.canvas.stroke_layer.is_some_and(|id| id != self.selected) {
+            if let Some(layer) = self.layers.iter_mut().find(|layer| Some(layer.settings.id) == self.canvas.stroke_layer) {
+                layer.mask.end_stroke();
+            }
+            self.canvas.stroke_active = false;
+            self.canvas.stroke_layer = None;
+        }
         let (area, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let painter = ui.painter().with_clip_rect(area);
         painter.rect_filled(area, 0.0, Color32::from_gray(22));
@@ -105,24 +116,24 @@ impl App {
         let fit = (area.width() / native.x).min(area.height() / native.y);
         let keyboard = !ui.ctx().egui_wants_keyboard_input();
         if keyboard {
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) { self.mask.tool = Tool::None; }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) { self.layers[index].mask.tool = Tool::None; }
             if ui.input(|i| !i.modifiers.command && !i.modifiers.ctrl) {
-                if ui.input(|i| i.key_pressed(egui::Key::X)) && self.mask.tool != Tool::None {
-                    self.mask.tool = if self.mask.tool == Tool::Brush { Tool::Eraser } else { Tool::Brush };
+                if ui.input(|i| i.key_pressed(egui::Key::X)) && self.layers[index].mask.tool != Tool::None {
+                    self.layers[index].mask.tool = if self.layers[index].mask.tool == Tool::Brush { Tool::Eraser } else { Tool::Brush };
                 }
-                if self.mask.tool != Tool::None {
+                if self.layers[index].mask.tool != Tool::None {
                     for (key, shifted, increase) in [
                         (egui::Key::OpenBracket, egui::Key::OpenCurlyBracket, false),
                         (egui::Key::CloseBracket, egui::Key::CloseCurlyBracket, true),
                     ] {
                         if ui.input(|i| i.key_pressed(key) || i.key_pressed(shifted)) {
-                            adjust_brush(&mut self.mask.brush, increase, ui.input(|i| i.modifiers.shift));
+                            adjust_brush(&mut self.layers[index].mask.brush, increase, ui.input(|i| i.modifiers.shift));
                         }
                     }
                 }
             }
         }
-        let painting = self.mask.tool != Tool::None;
+        let painting = self.layers[index].mask.tool != Tool::None;
         let original = keyboard && ui.input(|i| i.key_down(egui::Key::Space));
         if keyboard && ui.input(|i| i.key_pressed(egui::Key::F))
             || response.double_clicked() && !painting && !self.set_center
@@ -165,15 +176,15 @@ impl App {
                 }
             }
         }
-        let center = rect.min + rect.size() * Vec2::from(self.params.rays_center);
-        let rays = (!painting && (self.params.rays_on || self.set_center)).then(|| ui.interact(
+        let center = rect.min + rect.size() * Vec2::from(self.layers[index].settings.params.rays_center);
+        let rays = (!painting && (self.layers[index].settings.params.rays_on || self.set_center)).then(|| ui.interact(
             Rect::from_center_size(center, Vec2::splat(26.0)).intersect(area),
             ui.scope_id().with("rays center"), egui::Sense::drag()));
         if let Some(handle) = &rays {
             handle.clone().on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag the rays center");
             if handle.dragged() {
                 if let Some(pos) = handle.interact_pointer_pos() {
-                    self.params.rays_center = normalized_position(rect, pos);
+                    self.layers[index].settings.params.rays_center = normalized_position(rect, pos);
                     self.dirty = true;
                 }
             }
@@ -210,19 +221,19 @@ impl App {
                 painter.text(pos, align, label, egui::FontId::proportional(13.0), Color32::WHITE);
             }
         }
-        if (painting || self.panels.mask_tab_open()) && self.mask.view != MaskView::Off && !original {
-            if let Some(texture) = self.mask.overlay_texture() { painter.image(texture.id(), rect, uv, Color32::WHITE); }
+        if (painting || self.panels.mask_tab_open()) && self.layers[index].mask.view != MaskView::Off && !original {
+            if let Some(texture) = self.layers[index].mask.overlay_texture() { painter.image(texture.id(), rect, uv, Color32::WHITE); }
         }
         let position = response.interact_pointer_pos().filter(|p| rect.contains(*p));
         if !painting && self.set_center && response.clicked() {
             if let Some(pos) = position {
-                self.params.rays_center = normalized_position(rect, pos);
+                self.layers[index].settings.params.rays_center = normalized_position(rect, pos);
                 self.set_center = false;
                 self.dirty = true;
             }
         }
-        if !painting && (self.params.rays_on || self.set_center) {
-            let p = rect.min + rect.size() * Vec2::from(self.params.rays_center);
+        if !painting && (self.layers[index].settings.params.rays_on || self.set_center) {
+            let p = rect.min + rect.size() * Vec2::from(self.layers[index].settings.params.rays_center);
             let stroke = egui::Stroke::new(1.5, Color32::YELLOW);
             painter.circle_stroke(p, 7.0, stroke);
             for axis in [Vec2::new(12.0, 0.0), Vec2::new(0.0, 12.0)] {
@@ -230,41 +241,43 @@ impl App {
             }
         }
         let primary_down = ui.input(|i| i.pointer.primary_down());
-        let erase = self.mask.tool == Tool::Eraser || ui.input(|i| i.modifiers.alt);
+        let erase = self.layers[index].mask.tool == Tool::Eraser || ui.input(|i| i.modifiers.alt);
         if painting && !dragging_handle {
             let pointer = ui.input(|i| i.pointer.interact_pos());
             let start = !self.canvas.stroke_active && response.is_pointer_button_down_on()
                 && primary_down && pointer.is_some_and(|p| rect.contains(p));
             if start || self.canvas.stroke_active {
-                self.mask.begin_stroke(erase);
+                self.layers[index].mask.begin_stroke(erase);
                 self.canvas.stroke_active = true;
+                self.canvas.stroke_layer = Some(self.selected);
                 if let Some(pos) = pointer {
-                    self.mask.stroke_to([
+                    self.layers[index].mask.stroke_to([
                         (pos.x - rect.left()) / rect.width() * pixels.x,
                         (pos.y - rect.top()) / rect.height() * pixels.y,
                     ]);
                 }
             } else if !self.canvas.stroke_active && response.clicked() {
                 if let Some(pos) = position {
-                    self.mask.begin_stroke(erase);
+                    self.layers[index].mask.begin_stroke(erase);
                     let uv = normalized_position(rect, pos);
-                    self.mask.stroke_to([uv[0] * pixels.x, uv[1] * pixels.y]);
-                    self.mask.end_stroke();
+                    self.layers[index].mask.stroke_to([uv[0] * pixels.x, uv[1] * pixels.y]);
+                    self.layers[index].mask.end_stroke();
                 }
             }
         }
         if self.canvas.stroke_active && (!primary_down || !painting) {
-            self.mask.end_stroke();
+            self.layers[index].mask.end_stroke();
             self.canvas.stroke_active = false;
+            self.canvas.stroke_layer = None;
         }
         if painting {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()).filter(|p| area.contains(*p)) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-                let radius = self.mask.brush.size * rect.width() / pixels.x;
+                let radius = self.layers[index].mask.brush.size * rect.width() / pixels.x;
                 let color = if erase { Color32::from_rgb(100, 220, 255) } else { Color32::from_rgb(255, 100, 215) };
                 painter.circle_stroke(pos, radius + 1.0, egui::Stroke::new(2.0, Color32::from_black_alpha(190)));
                 painter.circle_stroke(pos, radius, egui::Stroke::new(1.0, color));
-                painter.circle_stroke(pos, radius * self.mask.brush.hardness,
+                painter.circle_stroke(pos, radius * self.layers[index].mask.brush.hardness,
                     egui::Stroke::new(1.0, color.gamma_multiply(0.45)));
                 painter.circle_filled(pos, 1.5, color);
             }

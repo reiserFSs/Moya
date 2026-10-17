@@ -30,8 +30,8 @@ pub struct Mask {
     pub enabled: bool, pub tool: Tool, pub brush: BrushSettings, pub view: MaskView,
     pub overlay_opacity: f32, pub combine: Combine, pub lum_range: [f32; 2],
     pub feather: f32, pub grow: f32,
-    w: u32, h: u32, data: Vec<f32>, sum: f64, dirty: Option<[u32; 4]>,
-    image: Option<Image>, overlay: Option<TextureHandle>, thumb: Option<TextureHandle>,
+    w: u32, h: u32, data: Vec<f32>, sum: f64, fingerprint: u64, dirty: Option<[u32; 4]>,
+    image: Option<Image>, overlay: Option<TextureHandle>, thumb: Option<TextureHandle>, gpu_generation: u64,
     stroke: Option<Stroke>, past: VecDeque<HistoryEntry>, future: Vec<HistoryEntry>,
     history_bytes: usize, history_limit: usize, steps: usize, evicted: usize,
     committed: bool, preview_pending: bool, last_preview: Instant,
@@ -40,14 +40,15 @@ pub struct Mask {
 impl Default for Mask {
     fn default() -> Self {
         Self { enabled: false, tool: Tool::None, brush: BrushSettings { size: 30.0, hardness: 0.75, opacity: 1.0 }, view: MaskView::Overlay, overlay_opacity: 0.4, combine: Combine::Replace, lum_range: [0.0, 1.0], feather: 5.0, grow: 5.0,
-            w: 0, h: 0, data: Vec::new(), sum: 0.0, dirty: None, image: None, overlay: None, thumb: None,
+            w: 0, h: 0, data: Vec::new(), sum: 0.0, fingerprint: 0, dirty: None, image: None, overlay: None, thumb: None, gpu_generation: 0,
             stroke: None, past: VecDeque::new(), future: Vec::new(), history_bytes: 0, history_limit: 256 * 1024 * 1024, steps: 0, evicted: 0,
             committed: false, preview_pending: false, last_preview: Instant::now() - Duration::from_secs(1), appearance: (MaskView::Overlay, 0.4), was_enabled: false }
     }
 }
 impl Mask {
     pub fn reset(&mut self, w: u32, h: u32) {
-        *self = Self::default(); self.w = w; self.h = h;
+        let generation = self.gpu_generation;
+        *self = Self::default(); self.w = w; self.h = h; self.gpu_generation = generation;
         self.data = vec![0.0; w as usize * h as usize]; self.mark_all(); self.committed = true;
     }
     fn mark_all(&mut self) { if self.w > 0 && self.h > 0 { self.dirty = Some([0, 0, self.w, self.h]); } }
@@ -57,7 +58,11 @@ impl Mask {
     fn put(&mut self, index: usize, value: f32) {
         // Store the same 16-bit precision as history, so undo restores exact values, including zero.
         let value = quantize(value) as f32 / 65535.0;
-        if self.data[index] != value { self.sum += value as f64 - self.data[index] as f64; self.data[index] = value; self.mark(index as u32 % self.w, index as u32 / self.w); }
+        if self.data[index] != value {
+            self.fingerprint ^= pixel_hash(index, quantize(self.data[index])) ^ pixel_hash(index, quantize(value));
+            self.sum += value as f64 - self.data[index] as f64;
+            self.data[index] = value; self.mark(index as u32 % self.w, index as u32 / self.w);
+        }
     }
     pub fn begin_stroke(&mut self, erase: bool) {
         if let Some(stroke) = &mut self.stroke { stroke.erase = erase; }
@@ -198,6 +203,47 @@ impl Mask {
     }
     pub fn clear_redo(&mut self) { for entry in self.future.drain(..) { self.history_bytes -= entry.bytes(); } }
     pub fn take_history_steps(&mut self) -> (usize,usize) { (std::mem::take(&mut self.steps),std::mem::take(&mut self.evicted)) }
+    pub fn fingerprint(&self) -> (u32, u32, bool, u64) { (self.w, self.h, self.enabled, self.fingerprint) }
+    pub fn generation(&self) -> u64 {
+        self.gpu_generation ^ if self.enabled { u64::MAX } else { 0 }
+    }
+    pub fn drop_farthest_redo(&mut self) {
+        if !self.future.is_empty() { self.history_bytes -= self.future.remove(0).bytes(); }
+    }
+    pub fn history_bytes(&self) -> usize { self.history_bytes }
+    pub fn retained_bytes(&self) -> usize { self.data.capacity() * std::mem::size_of::<f32>() + self.history_bytes }
+    pub fn release_gpu(&mut self) { self.image = None; self.overlay = None; self.thumb = None; self.mark_all(); }
+    pub fn drop_oldest_history(&mut self) -> bool {
+        let Some(entry) = self.past.pop_front() else { return false; };
+        self.history_bytes -= entry.bytes(); true
+    }
+    pub fn export(&self) -> Option<moya_project::MaskData> {
+        (self.w > 0 && self.h > 0 && (self.enabled || !self.is_empty())).then(|| moya_project::MaskData {
+            width: self.w, height: self.h, enabled: self.enabled,
+            data: self.data.iter().map(|&v| quantize(v)).collect(),
+        })
+    }
+    pub fn import(mask: &moya_project::MaskData, width: u32, height: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!(mask.width > 0 && mask.height > 0 && mask.width <= 16384 && mask.height <= 16384, "invalid mask dimensions");
+        anyhow::ensure!(mask.data.len() == mask.width as usize * mask.height as usize, "invalid mask pixel count");
+        anyhow::ensure!(width > 0 && height > 0 && width <= 16384 && height <= 16384, "invalid source dimensions");
+        let values: Vec<_> = mask.data.iter().map(|&v| v as f32 / 65535.0).collect();
+        let values = if (mask.width, mask.height) == (width, height) { values }
+            else { resample(&values, mask.width, mask.height, width, height) };
+        let mut result = Self::default(); result.reset(width, height); result.enabled = mask.enabled;
+        for (index, value) in values.into_iter().enumerate() { result.put(index, value); }
+        Ok(result)
+    }
+    pub fn duplicate(&self) -> Self {
+        let mut result = Self::default();
+        result.w = self.w; result.h = self.h; result.data = self.data.clone();
+        result.sum = self.sum; result.fingerprint = self.fingerprint; result.enabled = self.enabled;
+        result.tool = self.tool; result.view = self.view; result.overlay_opacity = self.overlay_opacity;
+        result.brush = BrushSettings { size: self.brush.size, hardness: self.brush.hardness, opacity: self.brush.opacity };
+        result.combine = self.combine; result.lum_range = self.lum_range;
+        result.feather = self.feather; result.grow = self.grow;
+        result.mark_all(); result.committed = true; result
+    }
     pub fn coverage(&self) -> f32 { if self.data.is_empty() { 0.0 } else { (self.sum/self.data.len() as f64).clamp(0.0,1.0) as f32 } }
     pub fn is_empty(&self) -> bool { self.sum <= 0.0 }
     pub fn save_png(&self, path: &Path) -> anyhow::Result<()> {
@@ -237,6 +283,7 @@ impl Mask {
                 for y in y0..y1 { for x in x0..x1 { let v=self.data[(y*self.w+x) as usize]; rgba.extend_from_slice(&[v,v,v,1.0]); }}
                 gpu.write_region(image,x0,y0,x1-x0,y1-y0,&rgba);
             }
+            self.gpu_generation = self.gpu_generation.wrapping_add(1);
         }
         // Cap egui overlay to 2048px long side; GPU mask and editing retain full resolution.
         let scale=(2048.0/self.w.max(self.h) as f32).min(1.0);
@@ -258,6 +305,13 @@ impl Mask {
         let image=egui::ColorImage::new([tw as usize,th as usize],pixels);
         if let Some(t)=&mut self.thumb { t.set(image,egui::TextureOptions::LINEAR); } else { self.thumb=Some(ctx.load_texture("Mask thumbnail",image,egui::TextureOptions::LINEAR)); }
     }
+}
+fn pixel_hash(index: usize, value: u16) -> u64 {
+    if value == 0 { return 0; }
+    let mut x = (index as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ value as u64;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
 }
 fn quantize(v:f32)->u16 { (v.clamp(0.0,1.0)*65535.0).round() as u16 }
 fn falloff(d:f32,hardness:f32)->f32 { let h=hardness.clamp(0.0,1.0); if d>=1.0 { 0.0 } else if d<=h { 1.0 } else { let t=(d-h)/(1.0-h); 1.0-t*t*(3.0-2.0*t) } }

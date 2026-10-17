@@ -15,7 +15,7 @@
       { "width": 23, "height": 23, "path": "icons/panel-46.png", "scale": [2], "theme": ["darkest", "dark", "medium", "light", "lightest"] }
     ] },
     { "type": "command", "id": "edit", "label": { "default": "Edit in Moya" } },
-    { "type": "command", "id": "reedit", "label": { "default": "Re-edit selected Moya layer" } }
+    { "type": "command", "id": "reedit", "label": { "default": "Re-edit selected Moya group" } }
   ],
   "requiredPermissions": {
     "localFileSystem": "fullAccess",

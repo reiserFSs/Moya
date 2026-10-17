@@ -1,16 +1,17 @@
 use std::{
     collections::VecDeque,
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use moya_core::{Params, RenderMode, presets::parse_presets};
+use moya_core::{LayerSettings, Params, RenderMode, presets::parse_presets};
 use moya_gpu::{Depth, Gpu};
 use moya_io::{Picture, SampleDepth};
-use moya_pipeline::{Renderer, ViewFlags};
+use moya_pipeline::{Document, LayerInputs, RenderRequest, ViewFlags};
+use moya_project::{MaskData, ProjectLayer, SourceRef};
 
 const HELP: &str = "\
 Usage:
@@ -18,8 +19,11 @@ Usage:
                     [--hq] [--glow-only] [--depth 8|16|32]
   moya-cli bench <in> [--preset file.json --index N | --params params.json]
                    [--hq] [--iters N] [--interactive]
+  moya-cli render <project.moya> <out> [--hq] [--glow-only] [--depth 8|16|32]
+  moya-cli bench <project.moya> [--hq] [--iters N] [--interactive]
 
-Without --preset or --params, uses the default parameters.
+Without --preset or --params, image inputs use the default parameters.
+Project inputs use all saved layers and masks; parameter overrides are not accepted.
 Preset indices are zero-based; --preset and --index must be supplied together.
 --depth defaults to the input depth; the output format must support that depth.
 --hq uses HQ rendering; otherwise uses Draft.
@@ -135,6 +139,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Options
     }
     ensure!(preset.is_some() == index.is_some(), "--preset and --index must be supplied together");
     ensure!(params.is_none() || preset.is_none(), "--params and --preset are mutually exclusive");
+    if paths[0].extension().is_some_and(|ext| ext.eq_ignore_ascii_case("moya")) {
+        ensure!(params.is_none() && preset.is_none(), "project inputs use saved layer parameters; --params and --preset are not supported");
+    }
     let mut paths = paths.into_iter();
     Ok(Some(Options {
         command,
@@ -174,6 +181,44 @@ fn load_params(options: &Options) -> Result<Params> {
     Ok(params)
 }
 
+fn load_source(source: &SourceRef) -> Result<Picture> {
+    match source {
+        SourceRef::Path(path) => moya_io::load(path)
+            .with_context(|| format!("loading project source {}", path.display())),
+        SourceRef::Embedded { file_name, bytes } => {
+            use std::io::Write;
+            let extension = Path::new(file_name).extension().and_then(|s| s.to_str())
+                .context("embedded source has no file extension")?;
+            let mut file = tempfile::Builder::new().suffix(&format!(".{extension}")).tempfile()?;
+            file.write_all(bytes).context("writing embedded source for decoding")?;
+            moya_io::load(file.path())
+                .with_context(|| format!("decoding embedded source {file_name}"))
+        }
+    }
+}
+
+fn load_input(options: &Options) -> Result<(Picture, Vec<ProjectLayer>, Option<u64>, bool)> {
+    if options.input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("moya")) {
+        let project = moya_project::load(&options.input)
+            .with_context(|| format!("loading project {}", options.input.display()))?;
+        let source = load_source(&project.source)?;
+        Ok((source, project.layers, project.selected, true))
+    } else {
+        let settings = LayerSettings { params: load_params(options)?, ..LayerSettings::default() };
+        let selected = Some(settings.id);
+        let source = moya_io::load(&options.input)
+            .with_context(|| format!("loading {}", options.input.display()))?;
+        Ok((source, vec![ProjectLayer { settings, mask: None }], selected, false))
+    }
+}
+
+fn mask_pixels(mask: &MaskData) -> Vec<f32> {
+    mask.data.iter().flat_map(|&value| {
+        let value = value as f32 / 65535.0;
+        [value, value, value, 1.0]
+    }).collect()
+}
+
 fn median(times: &mut [f64]) -> f64 {
     times.sort_unstable_by(f64::total_cmp);
     let middle = times.len() / 2;
@@ -201,9 +246,7 @@ fn interactive_variants(base: &Params) -> [(&'static str, Params); 5] {
 }
 
 fn run(options: Options) -> Result<()> {
-    let params = load_params(&options)?;
-    let source = moya_io::load(&options.input)
-        .with_context(|| format!("loading {}", options.input.display()))?;
+    let (source, layers, selected, is_project) = load_input(&options)?;
     let host_depth = match source.depth {
         SampleDepth::U8 => Depth::Eight,
         SampleDepth::U16 => Depth::Sixteen,
@@ -222,11 +265,34 @@ fn run(options: Options) -> Result<()> {
     }
     let image = gpu.upload_rgba32f(source.width, source.height, &source.rgba);
     drop(source.rgba);
-    let mut renderer = Renderer::new(Arc::clone(&gpu), image, host_depth);
+    let mut document = Document::new(Arc::clone(&gpu), image, host_depth);
+    let masks = layers.iter().map(|layer| {
+        layer.mask.as_ref().filter(|mask| mask.enabled).map(|mask| {
+            ensure!(mask.width <= limit && mask.height <= limit,
+                "mask {}×{} exceeds this GPU's {limit} px texture limit", mask.width, mask.height);
+            Ok(gpu.upload_rgba32f(mask.width, mask.height, &mask_pixels(mask)))
+        }).transpose()
+    }).collect::<Result<Vec<_>>>()?;
+    let inputs: Vec<_> = layers.iter().zip(&masks).map(|(layer, mask)| LayerInputs {
+        settings: &layer.settings, mask: mask.as_ref(), mask_generation: 0,
+    }).collect();
+    let request = RenderRequest {
+        mode,
+        view,
+        selected,
+        solo_layer: None,
+        want_layer_glows: options.command == Command::Render && !is_project,
+        want_xray: false,
+    };
     match options.command {
         Command::Render => {
-            let rendered = renderer.render(&params, mode, &view);
-            let image = if options.glow_only { rendered.glow } else { rendered.composite };
+            let rendered = document.render(&inputs, &request);
+            let image = if options.glow_only {
+                if is_project { rendered.glow_composite }
+                else { rendered.layer_glows.into_iter().next().expect("requested layer glow").1 }
+            } else {
+                rendered.composite
+            };
             let output_depth = options.depth.unwrap_or(source.depth);
             let from = if !options.glow_only && view.host_is_float && !view.solo {
                 Depth::Float
@@ -254,13 +320,13 @@ fn run(options: Options) -> Result<()> {
             let mut times = Vec::new();
             times.try_reserve_exact(options.iters).context("allocating benchmark timings")?;
             // Readback submits pending commands and waits for completion, including setup.
-            let warmup = renderer.render(&params, mode, &view);
+            let warmup = document.render(&inputs, &request);
             drop(gpu.download_rgba32f(&warmup.composite));
             drop(warmup);
             for i in 0..options.iters {
                 let start = Instant::now();
-                renderer.clear_stage_cache();
-                let output = renderer.render(&params, mode, &view);
+                document.clear_stage_caches();
+                let output = document.render(&inputs, &request);
                 let pixels = gpu.download_rgba32f(&output.composite);
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 times.push(ms);
@@ -270,22 +336,30 @@ fn run(options: Options) -> Result<()> {
             let ms = median(&mut times);
             println!("median: {ms:.3} ms ({} cold renders)", times.len());
             if options.interactive {
+                let selected_index = layers.iter().position(|layer| Some(layer.settings.id) == selected)
+                    .context("--interactive requires a selected project layer")?;
+                let layer = &layers[selected_index].settings;
                 println!("interactive single-field edits ({mode:?}; supplied parameters are the base):");
                 println!("CA/glare edits retain the base enable flags; enable those effects in --params.");
                 let mut cold_controls = Vec::new();
                 cold_controls.try_reserve_exact(options.iters)
                     .context("allocating cold control timings")?;
-                for (name, changed) in interactive_variants(&params) {
+                for (name, changed) in interactive_variants(&layer.params) {
+                    let changed_layer = LayerSettings { params: changed, ..layer.clone() };
+                    let changed_inputs: Vec<_> = inputs.iter().enumerate().map(|(index, input)| LayerInputs {
+                        settings: if index == selected_index { &changed_layer } else { input.settings },
+                        mask: input.mask, mask_generation: input.mask_generation,
+                    }).collect();
                     times.clear();
                     cold_controls.clear();
                     for _ in 0..options.iters {
                         // Restore the base every time: repeating the changed value
                         // would benchmark a cache hit rather than invalidation.
-                        let prime = renderer.render(&params, mode, &view);
+                        let prime = document.render(&inputs, &request);
                         drop(gpu.download_rgba32f(&prime.composite));
                         drop(prime);
                         let start = Instant::now();
-                        let output = renderer.render(&changed, mode, &view);
+                        let output = document.render(&changed_inputs, &request);
                         let pixels = gpu.download_rgba32f(&output.composite);
                         times.push(start.elapsed().as_secs_f64() * 1000.0);
                         drop(pixels);
@@ -294,8 +368,8 @@ fn run(options: Options) -> Result<()> {
                             // Compare identical parameters close in time rather
                             // than against a potentially cooler earlier baseline.
                             let start = Instant::now();
-                            renderer.clear_stage_cache();
-                            let output = renderer.render(&changed, mode, &view);
+                            document.clear_stage_caches();
+                            let output = document.render(&changed_inputs, &request);
                             let pixels = gpu.download_rgba32f(&output.composite);
                             cold_controls.push(start.elapsed().as_secs_f64() * 1000.0);
                             drop(pixels);
@@ -335,6 +409,54 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_loading_preserves_layers_selection_and_decodes_embedded_source() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let image_path = dir.path().join("source.png");
+        moya_io::save(&image_path, &Picture {
+            width: 2, height: 1, depth: SampleDepth::U16,
+            rgba: vec![0., 0.5, 1., 1., 1., 0., 0.25, 1.],
+            icc_profile: None,
+        }, SampleDepth::U16)?;
+        let mask = MaskData { width: 2, height: 1, data: vec![0, 65535], enabled: false };
+        let layers = vec![
+            ProjectLayer { settings: LayerSettings { id: 7, ..Default::default() }, mask: Some(mask.clone()) },
+            ProjectLayer { settings: LayerSettings { id: 9, ..Default::default() }, mask: None },
+        ];
+        let project_path = dir.path().join("layers.moya");
+        let mut project = moya_project::Project {
+            version: moya_project::VERSION,
+            source: SourceRef::Embedded { file_name: "original.png".into(), bytes: std::fs::read(&image_path)? },
+            layers: layers.clone(), selected: Some(9),
+        };
+        for embedded in [true, false] {
+            if !embedded { project.source = SourceRef::Path(PathBuf::from("source.png")); }
+            moya_project::save(&project_path, &project)?;
+            let options = parse_args([
+                OsString::from("render"), project_path.clone().into_os_string(), OsString::from("out.tif"),
+            ])?.unwrap();
+            let (picture, loaded_layers, selected, is_project) = load_input(&options)?;
+            assert!(is_project);
+            assert_eq!((picture.width, picture.height, picture.depth), (2, 1, SampleDepth::U16));
+            assert_eq!(loaded_layers, layers);
+            assert_eq!(selected, Some(9));
+        }
+        assert_eq!(mask_pixels(&mask), vec![0., 0., 0., 1., 1., 1., 1., 1.]);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_project_commands_and_rejects_parameter_overrides() {
+        let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
+        let render = parse(&["render", "layers.moya", "out.tif", "--hq", "--glow-only", "--depth", "16"])
+            .unwrap().unwrap();
+        assert!(render.hq && render.glow_only);
+        assert_eq!(render.depth, Some(SampleDepth::U16));
+        assert_eq!(parse(&["bench", "layers.MOYA"]).unwrap().unwrap().command, Command::Bench);
+        assert!(parse(&["render", "layers.moya", "out.png", "--params", "p.json"]).is_err());
+        assert!(parse(&["bench", "layers.moya", "--preset", "p.json", "--index", "0"]).is_err());
+    }
 
     #[test]
     fn parses_commands_and_rejects_invalid_combinations() {

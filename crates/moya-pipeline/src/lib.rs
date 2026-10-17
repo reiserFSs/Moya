@@ -8,19 +8,22 @@
 //! by their activation conditions, not by the glare-only slider magnitudes.
 //! Auto-update is a UI scheduling gate: callers decide whether to invoke `render`.
 //! Stored glow is encoded 8-bit-equivalent, even with HDR rendering enabled.
-use std::sync::Arc;
-use moya_core::{CaChannels, CaType, DocGeometry, GlareBlend, GlareRays, Highlights, Params, RenderMode, SpectrumBlend, Transition};
+use std::{collections::HashMap, sync::Arc};
+use moya_core::{CaChannels, CaType, DocGeometry, GlareBlend, GlareRays, Highlights, LayerBlend, LayerInput, LayerSettings, Params, RenderMode, SpectrumBlend, Transition};
 use moya_gpu::{BlendMode as B, Depth, Gpu, GradientStop, Image, RadialQuality};
+mod document;
+pub use document::{Document, DocumentOutput, LayerInputs, RenderRequest};
 
-pub struct RenderOutput {
+struct RenderOutput {
     pub glow: Image,
     /// Heat map at full opacity; the view applies its 80% layer opacity.
     pub xray: Image,
     pub composite: Image,
 }
+#[derive(Clone, Copy)]
 pub struct ViewFlags { pub xray: bool, pub solo: bool, pub host_is_float: bool }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct WorkingKey { mode:RenderMode, highlights:Highlights, host_depth:Depth }
 struct Working { generation:u64, key:WorkingKey, source:Image, color:Image, luminance:Image, depth:Depth }
 #[derive(PartialEq)]
@@ -60,28 +63,31 @@ stage_key!(CaKey { hdr32:bool, ca_on:bool, ca_distance:f32, rays_center:[f32;2],
 #[derive(PartialEq)]
 struct OutputKey { ca:u64, heatmap:u64, mode:RenderMode, unmult:bool, hdr32:bool, xray:bool, solo:bool, host_is_float:bool, detail:bool }
 /// Latest result per stage, with upstream generations rather than whole-Params keys.
-pub struct Renderer {
-    gpu: Arc<Gpu>, source: Image, host_depth: Depth, geometry: DocGeometry,
+struct LayerStages {
+    gpu: Arc<Gpu>, source: Arc<Image>, host_depth: Depth, geometry: DocGeometry,
+    source_is_working: bool,
     mask: Option<Image>, mask_generation:u64, working: Option<Arc<Working>>, generation:u64,
     extraction_cache:Option<Cached<ExtractionKey>>, heatmap_cache:Option<Cached<HeatmapKey>>,
     exposure_cache:Option<Cached<ExposureKey>>, glow_cache:Option<Cached<GlowKey>>,
     glare_cache:Option<Cached<GlareKey>>, tone_cache:Option<Cached<ToneKey>>,
     ca_cache:Option<Cached<CaKey>>, output_cache:Option<Cached<OutputKey>>,
 }
-impl Renderer {
-    pub fn new(gpu: Arc<Gpu>, source: Image, host_depth: Depth) -> Self {
+impl LayerStages {
+    #[cfg(test)]
+    fn new(gpu: Arc<Gpu>, source: Image, host_depth: Depth) -> Self {
+        Self::shared(gpu, Arc::new(source), host_depth)
+    }
+    fn shared(gpu: Arc<Gpu>, source: Arc<Image>, host_depth: Depth) -> Self {
         let geometry = DocGeometry { orig_w: source.width(), orig_h: source.height() };
-        Self { gpu, source, host_depth, geometry, mask:None, mask_generation:0, working:None, generation:0,
+        Self { gpu, source, host_depth, geometry, source_is_working:false, mask:None, mask_generation:0, working:None, generation:0,
             extraction_cache:None, heatmap_cache:None, exposure_cache:None, glow_cache:None,
             glare_cache:None, tone_cache:None, ca_cache:None, output_cache:None }
-    }
-    pub fn set_mask(&mut self, mask: Option<Image>) {
-        self.mask=mask; self.mask_generation=self.next_generation(); self.extraction_cache=None;
     }
     fn next_generation(&mut self)->u64 { self.generation+=1; self.generation }
     fn cached<K>(&mut self,key:K,images:Vec<Arc<Image>>,depths:Vec<Depth>)->Cached<K> {
         Cached { key,generation:self.next_generation(),images,depths }
     }
+    #[cfg(test)]
     fn retained_bytes(&self)->u64 {
         // At most 18 image slots; avoid allocating a set on the render path.
         let mut seen=[std::ptr::null::<Image>();18]; let mut count=0; let mut bytes=0;
@@ -96,7 +102,7 @@ impl Renderer {
         account_stages!(extraction_cache,heatmap_cache,exposure_cache,glow_cache,glare_cache,tone_cache,ca_cache,output_cache);
         bytes
     }
-    fn trim_cache(&mut self) { self.trim_cache_to(CACHE_BYTES); }
+    #[cfg(test)]
     fn trim_cache_to(&mut self,budget:u64) {
         // Keep predecessors reachable: reconstructing an evicted upstream stage
         // changes its generation and invalidates every retained descendant.
@@ -118,7 +124,7 @@ impl Renderer {
         // Photoshop resampling writes the current document grid before the
         // Color-mode luminance merge; thresholding must not see fractional codes.
         let native=|image:Image| if self.host_depth==Depth::Float {image} else {g.convert_depth(&image,self.host_depth,self.host_depth)};
-        let capped=if (cw,ch)!=(self.source.width(),self.source.height()) {Some(native(g.resize_bicubic(&self.source,cw,ch)))} else {None};
+        let capped=if !self.source_is_working && (cw,ch)!=(self.source.width(),self.source.height()) {Some(native(g.resize_bicubic(&self.source,cw,ch)))} else {None};
         let base=capped.as_ref().unwrap_or(&self.source);
         let source=if (w,h)==(base.width(),base.height()) {g.copy(base)} else {native(g.resize_bilinear(base,w,h))};
         let color = if p.highlights == Highlights::Flatten {
@@ -200,6 +206,7 @@ impl Renderer {
     }
     /// Composite-only preview. X-Ray computes no invisible glow stages;
     /// `render` and checkpoint renders always return all three current layers.
+    #[cfg(test)]
     pub fn render_preview(&mut self,params:&Params,mode:RenderMode,view:&ViewFlags)->Image {
         if !view.xray { return self.render(params,mode,view).composite; }
         let mut p=params.clone(); p.sanitize(); self.prepare(&p,mode);
@@ -211,7 +218,6 @@ impl Renderer {
         let base=transparent.as_ref().unwrap_or(if mode==RenderMode::Hq {&self.source} else {&working.source});
         let base=g.convert_depth(base,self.host_depth,Depth::Eight);
         let result=g.blend(&base,&xray,B::Normal,0.8,1.,Depth::Eight);
-        self.trim_cache();
         result
     }
     fn output_heatmap(&self,heatmap:&Arc<Image>,p:&Params,mode:RenderMode)->Arc<Image> {
@@ -228,6 +234,7 @@ impl Renderer {
         }
         image
     }
+    #[cfg(test)]
     pub fn render(&mut self,params:&Params,mode:RenderMode,view:&ViewFlags)->RenderOutput {
         self.render_with_checkpoints(params,mode,view,|_,_,_| {})
     }
@@ -403,7 +410,6 @@ impl Renderer {
         let output=self.output_cache.as_ref().unwrap();
         checkpoint("output",&output.images[0],Depth::Eight);
         let output=RenderOutput{glow:g.copy(&output.images[0]),xray:g.copy(&output.images[1]),composite:g.copy(&output.images[2])};
-        self.trim_cache();
         output
     }
     fn blur_layer(&self,v:&Image,p:&Params,mode:RenderMode,i:usize,blur_source:&mut moya_gpu::BlurSource)->Image {
@@ -551,16 +557,18 @@ impl Renderer {
     fn finish(&self,p:&Params,mode:RenderMode,view:&ViewFlags,ca:&Image,heatmap:&Arc<Image>,working_source:&Image)->Vec<Arc<Image>> {
         let g=&self.gpu;
         let depth=if p.hdr32 {Depth::Float} else {Depth::Sixteen};
-        let mut glow=if p.unmult && (view.solo || mode==RenderMode::Hq) {
+        let glow=if p.unmult && (view.solo || mode==RenderMode::Hq) {
             let converted=g.convert_depth(ca,depth,Depth::Sixteen);
             let unmult=self.native(g.unmult(&converted),Depth::Sixteen);
             g.convert_depth(&unmult,Depth::Sixteen,Depth::Eight)
         } else {g.convert_depth(ca,depth,Depth::Eight)};
+        let working_glow=Arc::new(glow);
+        let mut glow=working_glow.clone();
         let xray=self.output_heatmap(heatmap,p,mode);
-        let source=if mode==RenderMode::Hq {&self.source} else {working_source};
+        let source=if mode==RenderMode::Hq {self.source.as_ref()} else {working_source};
         // HQ returns original document dimensions even when the 4000px working cap applies.
         if mode==RenderMode::Hq && (glow.width(),glow.height())!=(self.geometry.orig_w,self.geometry.orig_h) {
-            glow=g.resize_bicubic(&glow,self.geometry.orig_w,self.geometry.orig_h);
+            glow=Arc::new(g.resize_bicubic(&glow,self.geometry.orig_w,self.geometry.orig_h));
         }
         // HQ hides the source inside the element, but the host composites that
         // element over the original document. Solo is the only source-free view.
@@ -574,7 +582,7 @@ impl Renderer {
             let glow_linear=g.convert_depth(&glow,Depth::Eight,Depth::Float);
             g.blend(&base,&glow_linear,B::LinearDodge,1.,1.,Depth::Float)
         } else {g.blend(&base,&glow,B::Screen,1.,1.,Depth::Eight)};
-        vec![Arc::new(glow),xray,Arc::new(composite)]
+        vec![glow,xray,Arc::new(composite),working_glow]
     }
 }
 
@@ -593,7 +601,7 @@ mod tests {
     #[test]
     fn cache_budget_deduplicates_images_and_preserves_predecessors() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
-        let mut renderer=Renderer::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Eight);
+        let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Eight);
         let p=Params{radius:2.,glow_iterations:1.,..Params::default()};
         let view=ViewFlags{xray:false,solo:false,host_is_float:false};
         renderer.render(&p,RenderMode::Draft,&view);
@@ -621,7 +629,7 @@ mod tests {
         for mode in [RenderMode::Draft,RenderMode::Hq] {
             for hdr32 in [false,true] {
                 for glare_on in [false,true] {
-                    let mut renderer=Renderer::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Float);
+                    let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Float);
                     let mut p=Params{radius:2.,glow_iterations:1.,glare_on,hdr32,
                         glare_length:0.01,glare_detail:0.1,glare_sharpness:0.1,..Params::default()};
                     renderer.render(&p,mode,&view);
@@ -646,7 +654,7 @@ mod tests {
         let view=ViewFlags{xray:false,solo:false,host_is_float:false};
         for mode in [RenderMode::Draft,RenderMode::Hq] {
             for colorize in [false,true] {
-                let mut renderer=Renderer::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Float);
+                let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Float);
                 let mut p=Params{radius:2.,glow_iterations:1.,colorize,..Params::default()};
                 renderer.render(&p,mode,&view);
                 let extraction=renderer.extraction_cache.as_ref().unwrap().generation;
@@ -662,7 +670,7 @@ mod tests {
     #[test]
     fn glare_edits_reuse_glow_and_xray_preview_skips_it() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
-        let mut renderer=Renderer::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Eight);
+        let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Eight);
         let mut p=Params{radius:2.,glow_iterations:1.,glare_on:true,glare_length:0.01,..Params::default()};
         let mut view=ViewFlags{xray:false,solo:false,host_is_float:false};
         renderer.render(&p,RenderMode::Draft,&view);
@@ -681,7 +689,7 @@ mod tests {
     #[test]
     fn checkpoints_preserve_render_and_stage_order() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
-        let mut renderer=Renderer::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Eight);
+        let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Eight);
         let p=Params{radius:2.,glow_iterations:1.,..Params::default()};
         let view=ViewFlags{xray:false,solo:false,host_is_float:false};
         let mut stages=Vec::new();
@@ -712,7 +720,7 @@ mod tests {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
         let mut pixels=[0.;36];for pixel in pixels.chunks_exact_mut(4) {pixel[3]=1.;}pixels[16..20].fill(1.);
         let source=gpu.upload_rgba32f(3,3,&pixels);
-        let renderer=Renderer::new(gpu.clone(),gpu.copy(&source),Depth::Eight);
+        let renderer=LayerStages::new(gpu.clone(),gpu.copy(&source),Depth::Eight);
         let p=Params{ca_on:true,ca_blur:0.,ca_distance:1.,ca_direction:45.,..Params::default()};
         let zero=renderer.ca(&source,&p,RenderMode::Draft);
         let minimum=renderer.ca(&source,&Params{ca_blur:0.001,..p},RenderMode::Draft);
@@ -728,7 +736,7 @@ mod tests {
     fn rays_copy_inherits_fill_and_merges_before_levels() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
         let source=gpu.quantize(&gpu.fill(3,3,[0.25,0.4,0.6,1.]),Depth::Sixteen);
-        let renderer=Renderer::new(gpu.clone(),gpu.copy(&source),Depth::Sixteen);
+        let renderer=LayerStages::new(gpu.clone(),gpu.copy(&source),Depth::Sixteen);
         let p=Params{rays_samples:1.,rays_spacing:0.,rays_falloff:1.,main_opacity:50.,..Params::default()};
         for (hdr32,depth,mode) in [(false,Depth::Sixteen,B::Screen),(true,Depth::Float,B::LinearDodge)] {
             let p=Params{hdr32,..p.clone()};
@@ -745,7 +753,7 @@ mod tests {
     #[test]
     fn float_extraction_skips_unavailable_vibrance_without_conversion() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
-        let mut renderer=Renderer::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,2.,1.]),Depth::Float);
+        let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,2.,1.]),Depth::Float);
         let p=Params{hdr32:true,colorize:false,saturation:1.,..Params::default()};
         renderer.prepare(&p,RenderMode::Hq);
         let expected=gpu.download_rgba32f(&renderer.extraction(&p));
@@ -755,7 +763,7 @@ mod tests {
     #[test]
     fn precise_threshold_rounds_descriptor_white_before_levels() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
-        let mut renderer=Renderer::new(gpu.clone(),gpu.fill(1,1,[235./255.,235./255.,235./255.,1.]),Depth::Eight);
+        let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(1,1,[235./255.,235./255.,235./255.,1.]),Depth::Eight);
         let p=Params{transition:Transition::Precise,..Params::default()};
         renderer.prepare(&p,RenderMode::Draft);
         let result=gpu.download_rgba32f(&renderer.extraction(&p));
@@ -772,7 +780,7 @@ mod tests {
     fn glare_first_copy_keeps_screen_before_linear_dodge() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
         let source=gpu.fill(3,3,[0.01,0.02,0.03,1.]);
-        let renderer=Renderer::new(gpu.clone(),gpu.copy(&source),Depth::Sixteen);
+        let renderer=LayerStages::new(gpu.clone(),gpu.copy(&source),Depth::Sixteen);
         let p=Params{hdr32:false,colorize:false,glare_rays:GlareRays::Two,
             glare_length:0.01,glare_rotation:0.,glare_opacity:100.,main_opacity:100.,
             glare_detail:0.,glare_sharpness:0.,glare_gamma:1.,..Params::default()};

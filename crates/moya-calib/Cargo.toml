@@ -7,7 +7,6 @@ publish.workspace = true
 [dependencies]
 moya-core.workspace = true
 moya-gpu.workspace = true
-moya-pipeline.workspace = true
 moya-io.workspace = true
 serde.workspace = true
 anyhow.workspace = true

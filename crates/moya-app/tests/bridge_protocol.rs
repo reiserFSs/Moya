@@ -1,13 +1,13 @@
 #![cfg(target_os = "macos")]
 
 use anyhow::{Context, Result, bail, ensure};
-use moya_core::Params;
+use moya_core::{LayerBlend, LayerSettings};
 use moya_io::{Picture, SampleDepth};
 use serde_json::{Value, json};
 use std::{
     fs,
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -101,13 +101,38 @@ fn assert_rejected(socket: &mut WebSocket<TcpStream>, request: Value) -> Result<
     }
 }
 
-fn edit(id: &str, source: &PathBuf, depth: u32, return_mode: &str) -> Value {
+fn edit(id: &str, source: &Path, depth: u32, return_mode: &str, project: Option<&Path>) -> Value {
     json!({
-        "type": "edit", "id": id, "source": source, "params": null,
+        "type": "edit", "id": id, "source": source, "projectPath": project,
         "document": {"name": "Bridge protocol acceptance", "id": 1,
             "width": 32, "height": 24, "depth": depth},
         "returnMode": return_mode,
     })
+}
+
+fn assert_tiff(path: &Path, expected: &Path, depth: SampleDepth) -> Result<Picture> {
+    ensure!(path.is_absolute() && path == expected, "wrong TIFF path: {} (expected {})", path.display(), expected.display());
+    let bytes = fs::read(path)?;
+    ensure!(bytes.starts_with(b"II\x2a\x00") || bytes.starts_with(b"MM\x00\x2a"), "output is not a TIFF: {}", path.display());
+    let picture = moya_io::load(path).with_context(|| format!("loading {}", path.display()))?;
+    ensure!((picture.width, picture.height, picture.depth) == (32, 24, depth), "wrong TIFF dimensions/depth: {}", path.display());
+    ensure!(picture.rgba.len() == 32 * 24 * 4, "incomplete TIFF pixels");
+    ensure!(picture.rgba.iter().all(|value| value.is_finite()), "TIFF contains nonfinite samples");
+    ensure!(picture.rgba.chunks_exact(4).all(|pixel| (0.0..=1.0).contains(&pixel[3])), "TIFF contains invalid alpha");
+    Ok(picture)
+}
+
+fn assert_error(socket: &mut WebSocket<TcpStream>, request: Value, previous: Option<&str>) -> Result<()> {
+    let id = request["id"].clone();
+    send(socket, request)?;
+    if let Some(previous) = previous {
+        let cancelled = receive(socket)?;
+        ensure!(cancelled["type"] == "cancelled" && cancelled["id"] == previous, "expected replacement cancellation: {cancelled}");
+    }
+    let response = receive(socket)?;
+    ensure!(response["type"] == "error" && response["id"] == id, "expected request error: {response}");
+    ensure!(response["message"].as_str().is_some_and(|message| !message.is_empty()), "error has no explanation: {response}");
+    Ok(())
 }
 
 /// Exercises the real GUI application's Open -> HQ render -> Send path.
@@ -127,8 +152,8 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
         discovery: PathBuf::from(home).join("Library/Application Support/Moya/bridge.json"),
         temp,
     };
-    let cases = [(8, SampleDepth::U8, "glow"), (16, SampleDepth::U16, "composite"), (32, SampleDepth::F32, "glow")];
-    for (bits, depth, _) in cases {
+    let depths = [(8, SampleDepth::U8), (16, SampleDepth::U16), (32, SampleDepth::F32)];
+    for (bits, depth) in depths {
         let mut rgba = Vec::with_capacity(32 * 24 * 4);
         for y in 0..24 {
             for x in 0..32 {
@@ -153,7 +178,7 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
             last_discovery = String::from_utf8_lossy(&bytes).into_owned();
             if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
                 if value["pid"].as_u64() == Some(u64::from(pid)) {
-                    ensure!(value["version"] == 1, "unsupported discovery version: {value}");
+                    ensure!(value["version"] == 2, "unsupported discovery version: {value}");
                     ensure!(value["port"] == 47811, "unexpected discovery port: {value}");
                     let token = value["token"].as_str().context("discovery token is missing")?;
                     ensure!(token.len() == 32 && token.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "invalid discovery token: {value}");
@@ -164,7 +189,7 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
         ensure!(Instant::now() < deadline, "timed out waiting for bridge discovery for child pid {pid}: {last_discovery}");
         thread::sleep(Duration::from_millis(100));
     };
-    let hello = json!({"type": "hello", "version": 1, "token": discovery["token"], "client": "moya-bridge", "nonce": "0".repeat(64)});
+    let hello = json!({"type": "hello", "version": 2, "token": discovery["token"], "client": "moya-bridge", "nonce": "0".repeat(64)});
     let mut bad_hello = hello.clone();
     let mut bad_token = discovery["token"].as_str().unwrap().to_owned();
     let replacement = if bad_token.starts_with('0') { "1" } else { "0" };
@@ -174,19 +199,53 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
     assert_rejected(&mut unauthenticated, bad_hello).context("bad-token hello")?;
     drop(unauthenticated);
     let mut pre_hello = connect()?;
-    assert_rejected(&mut pre_hello, edit("00000000-0000-4000-8000-000000000000", &app.temp.join("source-8.tiff"), 8, "glow"))
+    assert_rejected(&mut pre_hello, edit("00000000-0000-4000-8000-000000000000", &app.temp.join("source-8.tiff"), 8, "layers", None))
         .context("edit before hello")?;
     drop(pre_hello);
 
     let mut socket = connect()?;
     send(&mut socket, hello)?;
     let response = receive(&mut socket)?;
-    ensure!(response["type"] == "hello" && response["version"] == 1 && response["app"] == "moya", "hello failed: {response}");
+    ensure!(response["type"] == "hello" && response["version"] == 2 && response["app"] == "moya", "hello failed: {response}");
     ensure!(response["appVersion"].as_str().is_some_and(|s| !s.is_empty()), "hello lacks app version: {response}");
-    let mut previous_id = None::<String>;
-    for (index, (bits, depth, return_mode)) in cases.into_iter().enumerate() {
+    let source = app.temp.join("source-8.tiff");
+    let error_id = "00000000-0000-4000-8000-000000000001";
+    assert_error(&mut socket, edit(error_id, &source, 8, "layers", Some(Path::new("relative.moya"))), None)?;
+    assert_error(&mut socket, edit(error_id, &source, 12, "layers", None), None)?;
+    assert_error(&mut socket, edit(error_id, &app.temp.join("missing.tiff"), 8, "layers", None), None)?;
+    assert_error(&mut socket, edit(error_id, &source, 8, "layers", Some(&app.temp.join("missing.moya"))), Some(error_id))?;
+
+    // Distinct bottom-to-top metadata catches reordered, flattened or omitted hidden layers.
+    let custom_path = app.temp.join("custom.moya");
+    let custom = moya_project::Project {
+        version: moya_project::VERSION,
+        source: moya_project::SourceRef::Path(source.clone()),
+        layers: [LayerBlend::Screen, LayerBlend::LinearDodge, LayerBlend::Lighten, LayerBlend::Normal]
+            .into_iter().enumerate().map(|(index, blend)| {
+                let mut settings = LayerSettings {
+                    id: index as u64 + 1, name: format!("Saved layer {index}"),
+                    blend, opacity: (index + 1) as f32 * 0.25, visible: index != 1,
+                    ..LayerSettings::default()
+                };
+                settings.params.threshold = 0.0;
+                moya_project::ProjectLayer { settings, mask: None }
+            }).collect(),
+        selected: Some(3),
+    };
+    moya_project::save(&custom_path, &custom)?;
+    let mut cases = Vec::new();
+    for (bits, depth) in depths {
+        for mode in ["layers", "composite"] {
+            cases.push((bits, depth, mode, None));
+        }
+    }
+    cases.push((8, SampleDepth::U8, "layers", Some(custom_path.clone())));
+    cases.push((8, SampleDepth::U8, "composite", Some(custom_path)));
+    let mut previous_id = Some(error_id.to_owned());
+    for (index, (bits, depth, return_mode, project)) in cases.into_iter().enumerate() {
         let id = format!("{:08x}-0000-4000-8000-{:012x}", pid, ((nonce + index as u128) & 0xffffffffffff) as u64);
-        send(&mut socket, edit(&id, &app.temp.join(format!("source-{bits}.tiff")), bits, return_mode))?;
+        let source = app.temp.join(format!("source-{bits}.tiff"));
+        send(&mut socket, edit(&id, &source, bits, return_mode, project.as_deref()))?;
         if let Some(previous) = &previous_id {
             let cancelled = receive(&mut socket).context("waiting for previous session replacement")?;
             ensure!(cancelled["type"] == "cancelled" && cancelled["id"] == *previous,
@@ -197,24 +256,54 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
         let result = receive(&mut socket).with_context(|| format!("waiting for {bits}-bit HQ Send result"))?;
         ensure!(result["type"] == "result" && result["id"] == id, "expected result for {id}: {result}");
         ensure!(result["depth"] == bits && result["returnMode"] == return_mode, "wrong result depth/mode: {result}");
-        let blend = match (return_mode, bits) {
-            ("composite", _) => "normal",
-            ("glow", 32) => "linearDodge",
-            _ => "screen",
-        };
-        ensure!(result["blend"] == blend && result["layerName"] == "Moya Glow", "wrong placement metadata: {result}");
-        let params: Params = serde_json::from_value(result["params"].clone()).context("result must contain full Params")?;
-        let serialized_params = serde_json::to_value(&params)?;
-        ensure!(serialized_params.as_object().unwrap().keys().all(|key| result["params"].get(key).is_some()), "result params must contain the complete parameter model");
-        ensure!(params.hdr32 == (bits == 32), "result params do not match {bits}-bit document");
-        if bits == 32 { ensure!(params.gamma == 1.0, "32-bit document must use linear gamma"); }
-        if return_mode == "glow" { ensure!(!params.unmult, "glow metadata must preserve the re-edit params, not export-only Unmult"); }
-        let path = PathBuf::from(result["path"].as_str().context("result TIFF path is missing")?);
-        ensure!(path.is_absolute(), "result path must be absolute: {}", path.display());
-        ensure!(path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff")), "result is not a TIFF: {}", path.display());
-        ensure!(path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(".moya.tif")), "wrong Moya result filename: {}", path.display());
-        let picture = moya_io::load(&path).with_context(|| format!("loading {bits}-bit result {}", path.display()))?;
-        assert_eq!((picture.width, picture.height, picture.depth), (32, 24, depth), "result TIFF dimensions/depth");
+        ensure!(result["groupName"] == "Moya", "wrong result group: {result}");
+        for legacy in ["params", "path", "blend", "layerName"] {
+            ensure!(result.get(legacy).is_none(), "legacy {legacy} field in v2 result: {result}");
+        }
+        let project_path = PathBuf::from(result["projectPath"].as_str().context("missing projectPath")?);
+        ensure!(project_path.is_absolute() && project_path == source.with_extension("moya"), "wrong project path: {result}");
+        let bytes = fs::read(&project_path)?;
+        ensure!(bytes.starts_with(b"PK\x03\x04"), "project must be a ZIP archive");
+        let saved = moya_project::load(&project_path).context("reading exported project")?;
+        ensure!(saved.source == moya_project::SourceRef::Path(source.clone()), "project must reference the source, not embed it");
+        if project.is_some() {
+            ensure!(saved.layers == custom.layers && saved.selected == custom.selected, "re-edit did not preserve saved layer settings/order");
+        } else {
+            ensure!(saved.layers.len() == 1, "new session must contain exactly one default layer");
+            let settings = &saved.layers[0].settings;
+            ensure!(settings.name == "Layer 1" && settings.visible && settings.opacity == 1.0 && settings.blend == LayerBlend::Auto, "wrong default layer");
+        }
+        let layers = result["layers"].as_array().context("missing layers array")?;
+        let stem = source.file_stem().unwrap().to_string_lossy();
+        if return_mode == "layers" {
+            ensure!(result.get("composite") == Some(&Value::Null), "layers result must have null composite");
+            ensure!(layers.len() == saved.layers.len(), "not all project layers were exported");
+            for (index, (layer, saved_layer)) in layers.iter().zip(&saved.layers).enumerate() {
+                let settings = &saved_layer.settings;
+                let blend = match settings.blend {
+                    LayerBlend::Auto if bits == 32 => "linearDodge",
+                    LayerBlend::Auto | LayerBlend::Screen => "screen",
+                    LayerBlend::LinearDodge => "linearDodge",
+                    LayerBlend::Lighten => "lighten",
+                    LayerBlend::Normal => "normal",
+                };
+                ensure!(layer["name"] == settings.name && layer["blend"] == blend && layer["visible"] == settings.visible, "wrong layer metadata/order: {layer}");
+                let opacity = layer["opacity"].as_f64().context("missing numeric opacity")?;
+                ensure!((0.0..=100.0).contains(&opacity) && (opacity - f64::from(settings.opacity) * 100.0).abs() < 0.0001, "wrong layer opacity: {layer}");
+                let path = PathBuf::from(layer["path"].as_str().context("missing layer TIFF path")?);
+                let expected = source.with_file_name(format!("{stem}.moya-layer-{}.tif", index + 1));
+                let picture = assert_tiff(&path, &expected, depth)?;
+                if project.is_some() {
+                    ensure!(picture.rgba.chunks_exact(4).any(|pixel| pixel[..3].iter().any(|value| *value > 0.0)), "saved layer TIFF contains no effect pixels");
+                }
+            }
+        } else {
+            ensure!(layers.is_empty(), "composite result must not contain layers");
+            let path = PathBuf::from(result["composite"].as_str().context("missing composite TIFF path")?);
+            let picture = assert_tiff(&path, &source.with_file_name(format!("{stem}.moya.tif")), depth)?;
+            ensure!(picture.rgba.chunks_exact(4).all(|pixel| pixel[3] == 1.0), "opaque source must produce an opaque composite");
+            ensure!(picture.rgba.chunks_exact(4).any(|pixel| pixel[..3].iter().any(|value| *value > 0.0)), "composite TIFF is empty");
+        }
         send(&mut socket, json!({"type": "placed", "id": id}))?;
         previous_id = Some(id);
     }

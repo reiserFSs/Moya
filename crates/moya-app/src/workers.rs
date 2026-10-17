@@ -164,6 +164,54 @@ impl SendWriter {
 impl Drop for SendWriter {
     fn drop(&mut self) { self.cancel(); }
 }
+
+/// Own every TIFF and the project until the host acknowledges the whole result.
+pub struct SendBatch {
+    writers: Vec<SendWriter>,
+    remaining: Cell<usize>,
+    completed: Cell<bool>,
+}
+impl SendBatch {
+    pub fn new(
+        ctx: egui::Context,
+        pictures: Vec<(PathBuf, Picture)>,
+        depth: SampleDepth,
+        project_path: PathBuf,
+        project: moya_project::Project,
+    ) -> Self {
+        let mut writers = Vec::with_capacity(pictures.len() + 1);
+        for (path, picture) in pictures {
+            writers.push(SendWriter::new(ctx.clone(), path, picture, depth));
+        }
+        writers.push(SendWriter::with_writer(ctx, project_path, move |staging| {
+            moya_project::save(staging, &project)
+        }));
+        Self { remaining: Cell::new(writers.len()), writers, completed: Cell::new(false) }
+    }
+    pub fn poll(&self) -> Option<anyhow::Result<()>> {
+        if self.completed.get() { return None; }
+        for writer in &self.writers {
+            if let Some(result) = writer.poll() {
+                if let Err(error) = result {
+                    self.completed.set(true);
+                    self.cancel();
+                    return Some(Err(error));
+                }
+                self.remaining.set(self.remaining.get() - 1);
+            }
+        }
+        if self.remaining.get() == 0 {
+            self.completed.set(true);
+            Some(Ok(()))
+        } else { None }
+    }
+    pub fn cancel(&self) {
+        for writer in &self.writers { writer.cancel(); }
+    }
+    pub fn keep_output(&self) {
+        for writer in &self.writers { writer.keep_output(); }
+    }
+}
 fn write_output<F>(state: &Mutex<OutputState>, path: &Path, write: F) -> anyhow::Result<()>
 where F: FnOnce(&Path) -> anyhow::Result<()> {
     anyhow::ensure!(!state.lock().cancelled, "output cancelled");
@@ -293,5 +341,51 @@ mod tests {
         drop(state);
         assert_eq!(std::fs::read(&path).unwrap(), b"user file");
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn batch_cancellation_cleans_finished_outputs_and_active_writer() {
+        let finished = test_path();
+        let project = test_path().with_extension("moya");
+        let active = test_path();
+        let mut writers = Vec::new();
+        for path in [&finished, &project] {
+            let state = Arc::new(Mutex::new(OutputState::default()));
+            let (tx, results) = mpsc::channel();
+            tx.send(write_output(&state, path, |staging| {
+                std::fs::write(staging, b"finished")?;
+                Ok(())
+            })).unwrap();
+            writers.push(SendWriter { state, results, completed: Cell::new(false) });
+        }
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(OutputState::default()));
+        let worker = state.clone();
+        let output = active.clone();
+        let (tx, results) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = write_output(&worker, &output, |staging| {
+                std::fs::write(staging, b"in flight")?;
+                started_tx.send(staging.to_owned()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            });
+            tx.send(result).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        writers.push(SendWriter { state, results, completed: Cell::new(false) });
+        let batch = SendBatch { remaining: Cell::new(writers.len()), writers, completed: Cell::new(false) };
+        let timeout = std::time::Duration::from_secs(5);
+        let staging = started_rx.recv_timeout(timeout).unwrap();
+        assert!(batch.poll().is_none());
+        batch.cancel();
+        assert!(!finished.exists());
+        assert!(!project.exists());
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(timeout).unwrap();
+        assert!(!active.exists());
+        assert!(!staging.exists());
+        assert!(batch.poll().unwrap().is_err());
     }
 }
