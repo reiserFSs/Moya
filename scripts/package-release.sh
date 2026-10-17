@@ -6,7 +6,9 @@ if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
     exit 1
 fi
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-name=Moya-0.1.0-macos-arm64
+version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$root/Cargo.toml")
+[ -n "$version" ] || { echo "Cannot read workspace version from Cargo.toml" >&2; exit 1; }
+name="Moya-$version-macos-arm64"
 dist="$root/target/release-dist"
 stage="$dist/$name"
 mkdir -p "$dist"
@@ -90,13 +92,13 @@ echo 'Start Photoshop, then choose Plugins > Moya.'
 echo 'If macOS blocks Moya.app, right-click it in Finder and choose Open.'
 INSTALL
 chmod 755 "$stage/Install Moya.command"
-cat > "$stage/README.txt" <<'README'
-Moya 0.1.0 — macOS Apple Silicon
+cat > "$stage/README.txt" <<README
+Moya $version — macOS Apple Silicon
 
 Requires an Apple Silicon Mac with Metal support, Photoshop 24 or later,
 and Adobe Creative Cloud for installing the Photoshop plugin.
 
-1. Unzip Moya-0.1.0-macos-arm64.zip.
+1. Unzip $name.zip.
 2. Quit Photoshop, then double-click Install Moya.command.
    If macOS blocks the installer, right-click it in Finder and choose Open.
    The app goes into /Applications, or ~/Applications if that is not writable.

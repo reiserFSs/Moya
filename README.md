@@ -14,7 +14,7 @@ GPU-powered glow and light effects, with a standalone macOS app and a Photoshop 
 
 **Requirements:** macOS 13 or later on Apple Silicon. The optional plugin requires Adobe Photoshop 2024 or later and Creative Cloud for `.ccx` installation.
 
-1. Download **[Moya-0.1.0-macos-arm64.zip](https://github.com/reiserFSs/Moya/releases/download/v0.1.0/Moya-0.1.0-macos-arm64.zip)** from [Releases](https://github.com/reiserFSs/Moya/releases).
+1. Download **Moya-&lt;version&gt;-macos-arm64.zip** from the [latest release](https://github.com/reiserFSs/Moya/releases/latest).
 2. Unzip it and **quit Photoshop** before installing the plugin.
 3. Double-click **Install Moya.command**. It copies the app to `/Applications` (or `~/Applications` if needed), clears quarantine on that copied app, and opens **Moya Photoshop Plugin.ccx** for installation. Approve installation in Creative Cloud.
 4. Open **Moya** from Applications. For the plugin, start Photoshop and open **Plugins › Moya**.

@@ -2,7 +2,7 @@
   "manifestVersion": 5,
   "id": "local.moya.bridge",
   "name": "Moya",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "index.html",
   "host": { "app": "PS", "minVersion": "24.0.0", "data": { "apiVersion": 2 } },
   "icons": [

@@ -29,17 +29,20 @@ uxp = Path.home() / "Library/Application Support/Adobe/UXP"
 registration = uxp / "PluginsInfo/v1/PS.json"
 external = uxp / "Plugins/External"
 plugin_id = "local.moya.bridge"
-version = "1.0.0"
-destination = external / f"{plugin_id}_{version}"
 
 try:
     manifest = json.loads((source / "manifest.json").read_text())
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version or "/" in version:
+        raise ValueError("bridge manifest must include a plain version string")
+    destination = external / f"{plugin_id}_{version}"
+
     host = manifest["host"]
     hosts = host if isinstance(host, list) else [host]
-    if (manifest["id"] != plugin_id or manifest["version"] != version
+    if (manifest["id"] != plugin_id
             or not any(h.get("app") == "PS" and h.get("minVersion") == "24.0.0"
                        for h in hosts)):
-        raise ValueError("bridge manifest must specify local.moya.bridge 1.0.0 and Photoshop 24.0.0")
+        raise ValueError("bridge manifest must specify local.moya.bridge and Photoshop 24.0.0")
     if not isinstance(manifest.get("name"), str) or not manifest["name"].strip():
         raise ValueError("bridge manifest must include its display name")
     original = registration.read_bytes()
@@ -112,7 +115,12 @@ try:
             if had_previous:
                 previous.rename(destination)
             raise
-    print(f"Installed Moya plugin: {destination}")
+    # Remove superseded versions only after the new one is in place and registered.
+    for old in external.glob(f"{plugin_id}_*"):
+        if old != destination and old.is_dir() and not old.is_symlink():
+            shutil.rmtree(old)
+            print(f"Removed previous version: {old}")
+    print(f"Installed Moya plugin {version}: {destination}")
     if backup:
         print(f"Registration backup: {backup}")
     print("Start Photoshop, then open Plugins > Moya.")
