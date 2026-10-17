@@ -658,6 +658,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
             });
+        self.confirm_dialogs(&ctx);
         for layer in &mut self.layers { layer.settings.sanitize(); }
         if old_hover != self.hover_params {
             self.dirty = true;

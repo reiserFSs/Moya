@@ -14,7 +14,12 @@ pub(crate) struct PanelState {
     spectrum_mix: std::collections::HashMap<u64, f32>,
     preset_load_warning: Option<String>,
     preset_backup_pending: bool,
+    /// Pending in-app confirmation (rendered as an egui modal; never blocks the event loop).
+    confirm: Option<Confirm>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Confirm { DeleteLayer(u64), ClearMask(u64) }
 
 impl PanelState {
     pub(crate) fn new(loaded: anyhow::Result<Vec<Preset>>) -> Self {
@@ -25,13 +30,51 @@ impl PanelState {
             ))),
         };
         let preset_backup_pending = preset_load_warning.is_some();
-        Self { tab: 0, presets, preset_name: "My Preset".into(), rename: None, delete: None, layer_rename: None, layer_drag: None, spectrum_mix: Default::default(), preset_load_warning, preset_backup_pending }
+        Self { tab: 0, presets, preset_name: "My Preset".into(), rename: None, delete: None, layer_rename: None, layer_drag: None, spectrum_mix: Default::default(), preset_load_warning, preset_backup_pending, confirm: None }
     }
 
     pub(crate) fn mask_tab_open(&self) -> bool { self.tab == 3 }
 }
 
 impl App {
+    fn delete_layer(&mut self, id: u64) {
+        self.history.remove_layer(&mut self.layers, &mut self.selected, id);
+        if self.solo_layer == Some(id) { self.solo_layer = None; }
+        self.panels.layer_rename = None;
+    }
+
+    /// Confirmation dialogs for destructive (but undoable) actions. Enter confirms, Esc cancels.
+    pub(crate) fn confirm_dialogs(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = self.panels.confirm else { return; };
+        let (title, text, action) = match confirm {
+            Confirm::DeleteLayer(id) => {
+                let name = self.layers.iter().find(|l| l.settings.id == id).map(|l| l.settings.name.clone()).unwrap_or_default();
+                ("Delete layer?", format!("Delete \"{name}\" and its mask? You can undo this with Cmd+Z."), "Delete")
+            }
+            Confirm::ClearMask(_) => ("Clear mask?", "Clear the entire mask? You can undo this with Cmd+Z.".to_owned(), "Clear"),
+        };
+        let mut decision = None;
+        let modal = egui::Modal::new(egui::Id::unique("moya.confirm")).show(ctx, |ui| {
+            ui.set_width(300.0);
+            ui.heading(title);
+            ui.add_space(4.0);
+            ui.label(text);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(action).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) { decision = Some(true); }
+                if ui.button("Cancel").clicked() { decision = Some(false); }
+            });
+        });
+        if modal.should_close() && decision.is_none() { decision = Some(false); }
+        let Some(confirmed) = decision else { return; };
+        self.panels.confirm = None;
+        if !confirmed { return; }
+        match confirm {
+            Confirm::DeleteLayer(id) => { if self.layers.iter().any(|l| l.settings.id == id) && self.layers.len() > 1 { self.delete_layer(id); } }
+            Confirm::ClearMask(id) => { if let Some(layer) = self.layers.iter_mut().find(|l| l.settings.id == id) { layer.mask.clear(); } }
+        }
+    }
+
     /// Narrow strip shown when the Layers panel is collapsed: expand button + one swatch per layer.
     pub(crate) fn layer_strip(&mut self, ui: &mut egui::Ui) -> bool {
         let mut expand = false;
@@ -191,15 +234,12 @@ impl App {
                 }
                 if ui.add_enabled(self.layers.len() > 1, egui::Button::new("Delete")).on_hover_text("Delete selected layer; edited layers ask for confirmation").clicked() {
                     let layer = &self.layers[index];
-                    let confirm = !layer.mask.is_empty() || layer.settings.params != Params::default();
-                    if !confirm || rfd::MessageDialog::new().set_title("Delete layer?")
-                        .set_description("Delete this layer and its mask? You can undo this change.")
-                        .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes
-                    {
-                        let id = layer.settings.id;
-                        self.history.remove_layer(&mut self.layers, &mut self.selected, id);
-                        if self.solo_layer == Some(id) { self.solo_layer = None; }
-                        self.panels.layer_rename = None;
+                    let id = layer.settings.id;
+                    if !layer.mask.is_empty() || layer.settings.params != Params::default() {
+                        // In-app confirmation: a native modal alert would block the event loop.
+                        self.panels.confirm = Some(Confirm::DeleteLayer(id));
+                    } else {
+                        self.delete_layer(id);
                     }
                 }
             });
@@ -387,10 +427,8 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Invert").on_hover_text("Swap selected and excluded pixels").clicked() { self.layers[index].mask.invert(); }
                     if ui.button("Clear").on_hover_text("Clear the entire mask; asks for confirmation when non-empty").clicked() {
-                        if self.layers[index].mask.is_empty() || rfd::MessageDialog::new().set_title("Clear mask?")
-                            .set_description("Clear the entire mask? You can undo this change.")
-                            .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes
-                        { self.layers[index].mask.clear(); }
+                        if self.layers[index].mask.is_empty() { self.layers[index].mask.clear(); }
+                        else { self.panels.confirm = Some(Confirm::ClearMask(self.layers[index].settings.id)); }
                     }
                     if ui.button("Save mask…").on_hover_text("Save the grayscale mask as a PNG image").clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name("mask.png").save_file() {
@@ -582,8 +620,10 @@ fn choice<T: Copy + PartialEq>(ui: &mut egui::Ui, label: &str, value: &mut T, op
     let selected = options.iter().find(|(v, _)| v == value).map_or("", |(_, s)| *s);
     ui.horizontal(|ui| {
         ui.label(label);
+        // Fit the dropdown into the space left after the label so narrow panels never overlap it.
+        let width = (ui.available_width() - ui.spacing().item_spacing.x).clamp(60.0, 145.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            egui::ComboBox::from_id_salt(label).selected_text(selected).width(145.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(label).selected_text(selected).width(width).show_ui(ui, |ui| {
                 for &(v, name) in options { ui.selectable_value(value, v, name); }
             });
         });
