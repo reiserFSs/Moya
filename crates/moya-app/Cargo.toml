@@ -1,0 +1,22 @@
+[package]
+name = "moya-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "moya"
+path = "src/main.rs"
+
+[dependencies]
+moya-core = { workspace = true }
+moya-gpu = { workspace = true }
+moya-pipeline = { workspace = true }
+moya-io = { workspace = true }
+eframe = { workspace = true, features = ["persistence"] }
+image = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rfd = "0.15"
+tungstenite = "0.26"

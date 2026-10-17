@@ -1,0 +1,12 @@
+[package]
+name = "moya-gpu"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+anyhow = { workspace = true }
+parking_lot = "0.12"

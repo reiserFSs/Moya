@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "depthUnits": {"8": 255, "16": 32768, "32": 1},
+  "deterministic": {
+    "8": {"maxAbs": 1},
+    "16": {"maxAbs": 16},
+    "32": {"maxAbs": 0.001, "maxUlps": 4, "criterion": "Each RGB abs(actual-expectedPS) <= max(maxAbs, maxUlps * ULP(abs(expectedPS))); ULP is IEEE-754 binary32 spacing, including subnormals"}
+  },
+  "blurOps": ["gaussianBlur", "motionBlur", "radialBlur", "offset"],
+  "blur": {
+    "8": {"maxAbs": 3, "rmse": 0.5},
+    "16": {"maxAbs": 385.50588235294117, "rmse": 64.25098039215686},
+    "32": {"maxAbs": 0.011764705882352941, "rmse": 0.00196078431372549}
+  },
+  "stylizeOps": ["ripple", "smartSharpen", "addNoise", "Adobe Camera Raw Filter"],
+  "stylize": {"minPsnrDb": 40},
+  "noiseCriterion": "PSNR of six per-channel residual mean/std comparisons; random sample pixel errors are diagnostic only"
+}

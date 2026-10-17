@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; padding: 14px 14px 12px; color: #d8d8d8; font-size: 12px; }
+.header { display: flex; flex-direction: row; align-items: center; margin-bottom: 12px; }
+.header img { width: 28px; height: 28px; margin-right: 10px; }
+.title { font-size: 17px; font-weight: 600; letter-spacing: 0.5px; color: #f2f2f2; }
+.status { display: flex; flex-direction: row; align-items: center; padding: 8px 10px; margin-bottom: 14px;
+  border-radius: 6px; background-color: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.08); }
+.dot { width: 8px; height: 8px; border-radius: 4px; margin-right: 8px; flex-shrink: 0; background-color: #7a7a7a; }
+.status[data-kind="busy"] .dot { background-color: #e8a64a; }
+.status[data-kind="active"] .dot { background-color: #f0b46e; }
+.status[data-kind="ok"] .dot { background-color: #5cc489; }
+.status[data-kind="error"] .dot { background-color: #e5615a; }
+.status[data-kind="error"] { border-color: rgba(229, 97, 90, 0.45); }
+#status { flex-grow: 1; white-space: pre-wrap; line-height: 16px; }
+sp-button { width: 100%; margin-bottom: 8px; }
+.option { margin: 6px 0 2px; }
+.hint { color: #8c8c8c; font-size: 11px; margin: 0 0 12px 26px; line-height: 15px; }
+.settings { border-top: 1px solid rgba(255, 255, 255, 0.08); padding-top: 8px; margin-top: 6px; }
+.settings-toggle { display: flex; flex-direction: row; align-items: center; color: #a8a8a8; font-size: 11px; cursor: pointer; }
+.chevron { margin-right: 6px; font-size: 9px; }
+#settingsBody { display: none; margin-top: 8px; }
+#settingsBody.open { display: block; }
+#settingsBody label { display: block; color: #8c8c8c; font-size: 11px; margin-bottom: 4px; }
+sp-textfield { width: 100%; }
+</style></head><body>
+<div class="header">
+  <img src="icons/plugin-96.png" alt="">
+  <span class="title">Moya</span>
+</div>
+<div class="status" id="statusBox" data-kind="idle">
+  <div class="dot"></div>
+  <div id="status" role="status">Ready</div>
+</div>
+<sp-button id="edit" variant="cta">Edit in Moya</sp-button>
+<sp-button id="reedit" variant="secondary" quiet>Re-edit selected layer</sp-button>
+<sp-checkbox id="composite" class="option">Return full composite</sp-checkbox>
+<div class="hint">Off: returns the glow as a Screen layer (Linear Dodge in 32-bit).</div>
+<div class="settings">
+  <div class="settings-toggle" id="settingsToggle"><span class="chevron" id="chevron">▶</span>Settings</div>
+  <div id="settingsBody">
+    <label for="appPath">Moya application (optional override)</label>
+    <sp-textfield id="appPath" aria-label="Moya application path" placeholder="Auto-detect in /Applications, then ~/Applications"></sp-textfield>
+  </div>
+</div>
+<script src="index.js"></script>
+</body></html>
