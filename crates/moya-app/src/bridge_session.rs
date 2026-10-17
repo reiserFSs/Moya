@@ -126,6 +126,25 @@ impl App {
         Ok((workers::SendBatch::new(self.egui_ctx.clone(), self.gpu.clone(), images, project_path, project), message))
     }
 
+    /// Opens a Photoshop edit; called once the unsaved-changes check has passed.
+    pub(crate) fn start_edit(&mut self, edit: bridge::Edit) {
+        self.cancel_session();
+        self.session = Some(edit.clone());
+        if let Some(project) = &edit.project_path {
+            if self.open_project_with_source(project, &edit.source) {
+                self.session_ready = true;
+                self.bridge_reply(serde_json::json!({"type":"opened","id":edit.id}));
+                if self.bridge_test_auto_send { self.queue_send(); }
+            } else {
+                self.bridge_reply(serde_json::json!({"type":"error","id":edit.id,"message":self.status}));
+                self.session = None;
+            }
+        } else {
+            self.request_load(&edit.source, false);
+        }
+        self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
     pub(super) fn poll_bridge(&mut self) {
         // Paint the queued busy state before the synchronous GPU render.
         if self.send_pending { self.send_to_photoshop(); }
@@ -133,27 +152,7 @@ impl App {
             let event = self.bridge.as_ref().and_then(|bridge| bridge.events.try_recv().ok());
             let Some(event) = event else { break; };
             match event {
-                bridge::Event::Edit(edit) => {
-                    if !self.confirm_discard() {
-                        self.bridge_reply(serde_json::json!({"type":"cancelled","id":edit.id}));
-                        continue;
-                    }
-                    self.cancel_session();
-                    self.session = Some(edit.clone());
-                    if let Some(project) = &edit.project_path {
-                        if self.open_project_with_source(project, &edit.source) {
-                            self.session_ready = true;
-                            self.bridge_reply(serde_json::json!({"type":"opened","id":edit.id}));
-                            if self.bridge_test_auto_send { self.queue_send(); }
-                        } else {
-                            self.bridge_reply(serde_json::json!({"type":"error","id":edit.id,"message":self.status}));
-                            self.session = None;
-                        }
-                    } else {
-                        self.request_load(&edit.source, false);
-                    }
-                    self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
+                bridge::Event::Edit(edit) => self.guard_discard(crate::projects::Pending::Edit(edit)),
                 bridge::Event::Placed(id) => {
                     if self.session.as_ref().is_some_and(|session| session.id == id) {
                         if let Some((batch, _)) = self.sending.take() { batch.keep_output(); }

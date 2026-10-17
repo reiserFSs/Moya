@@ -14,7 +14,12 @@ pub struct State {
     saved_embed: bool,
     saved: Vec<(LayerSettings, (u32, u32, bool, u64))>,
     closing: bool,
+    /// Action waiting on the in-app "Unsaved Moya project" dialog.
+    pending: Option<Pending>,
 }
+
+/// Actions that replace the current document and therefore need the unsaved-changes check.
+pub(crate) enum Pending { Open(PathBuf), Edit(crate::bridge::Edit), Close }
 
 pub fn is_project(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("moya"))
@@ -164,29 +169,60 @@ impl App {
         true
     }
 
-    pub(crate) fn confirm_discard(&mut self) -> bool {
+    /// Runs `action` now when nothing is unsaved; otherwise shows the in-app dialog and runs it on Save/Discard.
+    pub(crate) fn guard_discard(&mut self, action: Pending) {
         for layer in &mut self.layers { layer.mask.end_stroke(); }
         self.history.observe(&mut self.layers, self.selected, false);
-        if !self.project_is_dirty() { return true; }
-        match rfd::MessageDialog::new().set_title("Unsaved Moya project")
-            .set_description("Save your project before continuing? Unsaved changes will be lost.")
-            .set_level(rfd::MessageLevel::Warning)
-            .set_buttons(rfd::MessageButtons::YesNoCancelCustom("Save".into(), "Discard".into(), "Cancel".into())).show() {
-            rfd::MessageDialogResult::Yes => self.save_project(false),
-            rfd::MessageDialogResult::No => true,
-            rfd::MessageDialogResult::Custom(label) if label == "Save" => self.save_project(false),
-            rfd::MessageDialogResult::Custom(label) if label == "Discard" => true,
-            _ => false,
+        if !self.project_is_dirty() { self.run_pending(action); return; }
+        if let Some(Pending::Edit(old)) = self.project.pending.replace(action) {
+            self.bridge_reply(serde_json::json!({"type":"cancelled","id":old.id}));
+        }
+    }
+
+    fn run_pending(&mut self, action: Pending) {
+        match action {
+            Pending::Open(path) => self.open_now(&path),
+            Pending::Edit(edit) => self.start_edit(edit),
+            Pending::Close => {
+                self.project.closing = true;
+                self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Save / Discard / Cancel, drawn by egui so the event loop keeps running. Enter saves, Esc cancels.
+    pub(crate) fn unsaved_dialog(&mut self, ctx: &egui::Context) {
+        if self.project.pending.is_none() { return; }
+        let mut decision = None;
+        let modal = egui::Modal::new(egui::Id::unique("moya.unsaved")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading("Unsaved Moya project");
+            ui.add_space(4.0);
+            ui.label("Save your project before continuing? Unsaved changes will be lost.");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) { decision = Some(Some(true)); }
+                if ui.button("Discard").clicked() { decision = Some(Some(false)); }
+                if ui.button("Cancel").clicked() { decision = Some(None); }
+            });
+        });
+        if modal.should_close() && decision.is_none() { decision = Some(None); }
+        let Some(choice) = decision else { return; };
+        // A failed or cancelled save keeps the dialog (and the action) pending.
+        if choice == Some(true) && !self.save_project(false) { return; }
+        let Some(action) = self.project.pending.take() else { return; };
+        match choice {
+            Some(_) => self.run_pending(action),
+            None => if let Pending::Edit(edit) = action {
+                self.bridge_reply(serde_json::json!({"type":"cancelled","id":edit.id}));
+            },
         }
     }
 
     pub(crate) fn handle_project_close(&mut self, ctx: &egui::Context) {
         if self.project.closing || !ctx.input(|input| input.viewport().close_requested()) { return; }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        if self.confirm_discard() {
-            self.project.closing = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
+        self.guard_discard(Pending::Close);
     }
 
     pub(crate) fn project_controls(&mut self, ui: &mut egui::Ui) {

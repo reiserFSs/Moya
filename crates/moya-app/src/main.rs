@@ -215,7 +215,9 @@ impl App {
         }
     }
     fn open(&mut self, path: &Path) {
-        if !self.confirm_discard() { return; }
+        self.guard_discard(projects::Pending::Open(path.to_owned()));
+    }
+    fn open_now(&mut self, path: &Path) {
         self.cancel_session();
         if projects::is_project(path) { self.open_project(path); return; }
         self.request_load(path, false);
@@ -659,6 +661,7 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
             });
         self.confirm_dialogs(&ctx);
+        self.unsaved_dialog(&ctx);
         for layer in &mut self.layers { layer.settings.sanitize(); }
         if old_hover != self.hover_params {
             self.dirty = true;
