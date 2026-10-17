@@ -4,6 +4,7 @@ mod data;
 mod history;
 mod mask;
 mod panels;
+mod workers;
 
 use eframe::{
     egui,
@@ -81,13 +82,14 @@ struct App {
     glow_only: bool,
     export_depth: usize,
     egui_ctx: egui::Context,
-    /// Decode in flight on a worker thread; finished on the UI thread (GPU upload).
-    loading: Option<(PathBuf, mpsc::Receiver<anyhow::Result<Picture>>)>,
+    loader: workers::Loader,
+    loading: Option<(u64, PathBuf, bool)>,
+    saving: Option<mpsc::Receiver<anyhow::Result<PathBuf>>>,
     bridge: Option<bridge::Bridge>,
     session: Option<bridge::Edit>,
     session_ready: bool,
     send_pending: bool,
-    sending: Option<mpsc::Receiver<anyhow::Result<serde_json::Value>>>,
+    sending: Option<(workers::SendWriter, Option<serde_json::Value>)>,
     bridge_test_auto_send: bool,
 }
 impl App {
@@ -137,7 +139,7 @@ impl App {
             dirty: false,
             force: false,
             status,
-            panels: panels::PanelState::new(loaded.unwrap_or_default()),
+            panels: panels::PanelState::new(loaded),
             canvas: canvas::CanvasState::default(),
             mask: mask::Mask::default(),
             logo,
@@ -145,7 +147,9 @@ impl App {
             glow_only: false,
             export_depth: 1,
             egui_ctx: cc.egui_ctx.clone(),
+            loader: workers::Loader::new(cc.egui_ctx.clone()),
             loading: None,
+            saving: None,
             bridge: None,
             session: None,
             session_ready: false,
@@ -190,29 +194,28 @@ impl App {
     }
     fn open(&mut self, path: &Path) {
         self.cancel_session();
-        let (tx, rx) = mpsc::channel();
-        let worker_path = path.to_owned();
-        let ctx = self.egui_ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(moya_io::load(&worker_path));
-            ctx.request_repaint();
-        });
-        self.loading = Some((path.to_owned(), rx));
+        self.request_load(path, false);
+    }
+    fn request_load(&mut self, path: &Path, mask: bool) {
+        let generation = self.loader.request(path.to_owned());
+        self.loading = Some((generation, path.to_owned(), mask));
         self.busy = true;
         self.status = format!("Loading {}…", path.file_name().unwrap_or_default().to_string_lossy());
     }
     fn poll_loading(&mut self) {
-        let Some((path, rx)) = self.loading.as_ref() else {
-            return;
-        };
-        let result = match rx.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("image loader thread panicked")),
-        };
-        let path = path.clone();
+        let Some((generation, path, result)) = self.loader.poll() else { return; };
+        let Some((current, _, mask)) = self.loading.as_ref() else { return; };
+        if generation != *current { return; }
+        let mask = *mask;
         self.loading = None;
         self.busy = false;
+        if mask {
+            match result {
+                Ok(pic) => { self.mask.load_image(&pic); self.status.clear(); }
+                Err(e) => self.status = format!("Mask load failed: {e:#}"),
+            }
+            return;
+        }
         let result = result.and_then(|pic| {
             if let Some(session) = &self.session {
                 let depth = match pic.depth { SampleDepth::U8 => 8, SampleDepth::U16 => 16, SampleDepth::F32 => 32 };
@@ -225,7 +228,11 @@ impl App {
         });
         match result {
             Ok(pic) => {
+                let pending_params = self.session.as_ref().and_then(|s| s.params.clone());
+                let old_params = self.params.clone();
+                if let Some(mut params) = pending_params { params.sanitize(); self.params = params; }
                 let opened = self.finish_open(&path, pic);
+                if !opened { self.params = old_params; }
                 if let Some(session) = self.session.as_ref() {
                     if opened {
                         self.session_ready = true;
@@ -345,6 +352,7 @@ impl App {
         self.force = false;
     }
     fn save(&mut self) {
+        if self.saving.is_some() { return; }
         self.status.clear();
         let mut dialog = rfd::FileDialog::new()
             .add_filter("PNG / TIFF / OpenEXR", &["png", "tif", "tiff", "exr"])
@@ -367,10 +375,16 @@ impl App {
             Ok(pic) => pic,
             Err(e) => { self.status = format!("Save failed: {e:#}"); return; }
         };
-        self.status = match moya_io::save(&path, &pic, depth) {
-            Ok(()) => format!("Saved {}", path.display()),
-            Err(e) => format!("Save failed: {e:#}"),
-        };
+        let (tx, rx) = mpsc::channel();
+        self.saving = Some(rx);
+        self.status = "Saving HQ…".into();
+        self.busy = true;
+        let ctx = self.egui_ctx.clone();
+        std::thread::spawn(move || {
+            let result = moya_io::save(&path, &pic, depth).map(|()| path);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
     }
 
     fn render_hq(&mut self, params: &Params, glow: bool, opaque: bool, depth: SampleDepth) -> anyhow::Result<Picture> {
@@ -411,6 +425,8 @@ impl App {
         self.session_ready = false;
         self.send_pending = false;
         self.sending = None;
+        self.loader.invalidate();
+        self.loading = None;
     }
 
     fn queue_send(&mut self) {
@@ -441,20 +457,14 @@ impl App {
         };
         let stem = session.source.file_stem().unwrap_or_default().to_string_lossy();
         let path = session.source.with_file_name(format!("{stem}.moya.tif"));
-        let (tx, rx) = mpsc::channel();
-        self.sending = Some(rx);
-        self.status = "Sending to Photoshop…".into();
-        let ctx = self.egui_ctx.clone();
-        std::thread::spawn(move || {
-            let result = moya_io::save(&path, &pic, depth).map(|()| serde_json::json!({
-                "type":"result", "id":session.id, "path":path, "depth":session.document.depth,
-                "returnMode":session.return_mode,
-                "blend":if !glow { "normal" } else if session.document.depth == 32 { "linearDodge" } else { "screen" },
-                "layerName":"Moya Glow", "params":params
-            }));
-            let _ = tx.send(result);
-            ctx.request_repaint();
+        let message = serde_json::json!({
+            "type":"result", "id":session.id, "path":path, "depth":session.document.depth,
+            "returnMode":session.return_mode,
+            "blend":if !glow { "normal" } else if session.document.depth == 32 { "linearDodge" } else { "screen" },
+            "layerName":"Moya Glow", "params":params
         });
+        self.sending = Some((workers::SendWriter::new(self.egui_ctx.clone(), path, pic, depth), Some(message)));
+        self.status = "Sending to Photoshop…".into();
     }
 
     fn poll_bridge(&mut self) {
@@ -466,15 +476,12 @@ impl App {
             match event {
                 bridge::Event::Edit(edit) => {
                     self.open(&edit.source);
-                    if let Some(mut params) = edit.params.clone() {
-                        params.sanitize();
-                        self.params = params;
-                    }
                     self.session = Some(edit);
                     self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 bridge::Event::Placed(id) => {
                     if self.session.as_ref().is_some_and(|session| session.id == id) {
+                        if let Some((writer, _)) = self.sending.take() { writer.keep_output(); }
                         self.status = "Placed in Photoshop".into();
                     }
                 }
@@ -489,19 +496,17 @@ impl App {
                 }
             }
         }
-        let result = self.sending.as_ref().and_then(|rx| match rx.try_recv() {
-            Ok(result) => Some(result),
-            Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!("TIFF writer stopped"))),
-        });
+        let result = self.sending.as_mut().and_then(|(writer, _)| writer.poll());
         if let Some(result) = result {
-            self.sending = None;
             match result {
-                Ok(message) => {
-                    self.bridge_reply(message);
+                Ok(()) => {
+                    if let Some(message) = self.sending.as_mut().and_then(|(_, message)| message.take()) {
+                        self.bridge_reply(message);
+                    }
                     self.status = "Waiting for Photoshop…".into();
                 }
                 Err(e) => {
+                    self.sending = None;
                     self.status = format!("Send failed: {e:#}");
                     if let Some(session) = &self.session {
                         self.bridge_reply(serde_json::json!({"type":"error","id":session.id,"message":self.status}));
@@ -540,6 +545,20 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_bridge();
         self.poll_loading();
+        if let Some(rx) = &self.saving {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!("image writer stopped"))),
+            };
+            if let Some(result) = result {
+                self.saving = None;
+                self.status = match result {
+                    Ok(path) => format!("Saved {}", path.display()),
+                    Err(e) => format!("Save failed: {e:#}"),
+                };
+            }
+        }
         let before = self.params.clone();
         let old_hover = self.hover_params.clone();
         let old_view = (self.xray, self.solo);
@@ -563,7 +582,7 @@ impl eframe::App for App {
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_owned())) {
             self.open(&path);
         }
-        self.busy = self.send_pending || self.sending.is_some() || self.loading.is_some()
+        self.busy = self.send_pending || self.sending.is_some() || self.saving.is_some() || self.loading.is_some()
             || (self.renderer.is_some() && self.dirty && (self.auto_update || self.force));
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -573,7 +592,7 @@ impl eframe::App for App {
                     self.open_dialog();
                 }
                 if ui
-                    .add_enabled(self.renderer.is_some(), egui::Button::new("Save HQ…"))
+                    .add_enabled(self.renderer.is_some() && self.saving.is_none(), egui::Button::new("Save HQ…"))
                     .clicked()
                 {
                     self.save();
@@ -617,7 +636,7 @@ impl eframe::App for App {
                         .on_hover_text("Send HQ result (Cmd+Enter)").clicked() {
                         self.queue_send();
                     }
-                    if ui.add_enabled(self.sending.is_none() && !self.send_pending, egui::Button::new("Cancel")).clicked() {
+                    if ui.button("Cancel").clicked() {
                         self.cancel_session();
                         self.status = "Photoshop session cancelled".into();
                     }

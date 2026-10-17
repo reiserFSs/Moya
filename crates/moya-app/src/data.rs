@@ -87,8 +87,11 @@ fn migrate_presets(path: &Path) -> Result<()> {
     result.with_context(|| format!("Migrating {} to {}", legacy.display(), path.display()))
 }
 
-pub fn save_presets(presets: &[Preset]) -> Result<()> {
-    let path = config_path();
+pub fn save_presets(presets: &[Preset], backup_pending: &mut bool) -> Result<()> {
+    save_presets_at(&config_path(), presets, backup_pending)
+}
+
+fn save_presets_at(path: &Path, presets: &[Preset], backup_pending: &mut bool) -> Result<()> {
     let parent = path.parent().context("Preset path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("Creating {}", parent.display()))?;
     let (temp, mut file) = temporary_presets_file(parent)?;
@@ -96,6 +99,10 @@ pub fn save_presets(presets: &[Preset]) -> Result<()> {
         file.write_all(serialize_presets(presets).as_bytes())?;
         file.sync_all()?;
         drop(file);
+        if *backup_pending {
+            backup_failed_presets(path)?;
+            *backup_pending = false;
+        }
         replace_file(&temp, &path)?;
         Ok(())
     })();
@@ -103,6 +110,22 @@ pub fn save_presets(presets: &[Preset]) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result.with_context(|| format!("Saving {}", path.display()))
+}
+
+fn backup_failed_presets(path: &Path) -> Result<()> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".bak-{timestamp}"));
+    let backup = PathBuf::from(name);
+    // Publish without replacing an existing backup; remove the source only afterwards.
+    match fs::hard_link(path, &backup) {
+        Ok(()) => fs::remove_file(path)
+            .with_context(|| format!("Moving {} to {}", path.display(), backup.display())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("Backing up {} to {}", path.display(), backup.display())),
+    }
 }
 
 #[cfg(not(windows))]
@@ -154,6 +177,48 @@ mod tests {
         assert_eq!(fs::read_to_string(&path)?, "existing Moya file");
         assert_eq!(fs::read_to_string(&legacy)?, "changed legacy file");
         assert_eq!(fs::read_dir(path.parent().unwrap())?.count(), 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_presets_are_backed_up_only_before_the_first_write() -> Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = env::temp_dir().join(format!("moya-presets-backup-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root)?;
+        let path = root.join("userPresets.json");
+        let broken = b"{broken presets";
+        fs::write(&path, broken)?;
+        let mut backup_pending = true;
+        let presets = [Preset { name: "Recovered".into(), params: Default::default() }];
+        save_presets_at(&path, &presets, &mut backup_pending)?;
+        assert!(!backup_pending);
+        let backups: Vec<_> = fs::read_dir(&root)?
+            .collect::<std::io::Result<Vec<_>>>()?.into_iter()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("userPresets.json.bak-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(backups[0].path())?, broken);
+        assert_eq!(parse_presets(&fs::read_to_string(&path)?)?[0].name, "Recovered");
+        save_presets_at(&path, &[], &mut backup_pending)?;
+        assert_eq!(fs::read_dir(&root)?.count(), 2);
+        assert_eq!(fs::read(backups[0].path())?, broken);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn backup_failure_keeps_the_original_and_blocks_the_save() -> Result<()> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let root = env::temp_dir().join(format!("moya-presets-backup-failure-{}-{nonce}", std::process::id()));
+        let path = root.join("userPresets.json");
+        fs::create_dir_all(&path)?;
+        fs::write(path.join("original"), b"preserved")?;
+        let mut backup_pending = true;
+        assert!(save_presets_at(&path, &[], &mut backup_pending).is_err());
+        assert!(backup_pending);
+        assert_eq!(fs::read(path.join("original"))?, b"preserved");
+        assert_eq!(fs::read_dir(&root)?.count(), 1);
         fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -195,6 +195,7 @@ pub struct Gpu {
     pending: Mutex<Pending>,
     pipelines: [wgpu::ComputePipeline; 35],
     display: wgpu::ComputePipeline,
+    gray_upload: OnceLock<wgpu::ComputePipeline>,
     layout: wgpu::BindGroupLayout,
     display_layout: wgpu::BindGroupLayout,
     dummy: wgpu::Texture,
@@ -344,6 +345,7 @@ impl Gpu {
             pending: Mutex::new(Pending::default()),
             pipelines,
             display,
+            gray_upload: OnceLock::new(),
             layout,
             display_layout,
             dummy,
@@ -428,25 +430,128 @@ impl Gpu {
         pending.profile = profile;
         (pending.generation, pending.epoch)
     }
+    /// Upload straight-alpha RGBA32F using staging bands bounded by the device buffer limit.
+    /// Dimensions may reach `device.limits().max_texture_dimension_2d`; total image
+    /// bytes may exceed `max_buffer_size` (each padded row must still fit).
     pub fn upload_rgba32f(&self, w: u32, h: u32, rgba: &[f32]) -> Image {
+        self.upload_rgba32f_capped(w, h, rgba, self.device.limits().max_buffer_size)
+    }
+    fn upload_rgba32f_capped(&self, w: u32, h: u32, rgba: &[f32], cap: u64) -> Image {
         assert_eq!(rgba.len(), w as usize * h as usize * 4);
         self.flush();
         let img = self.image(w, h);
-        self.queue.write_texture(
-            img.texture.as_image_copy(),
-            bytemuck::cast_slice(rgba),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 16),
-                rows_per_image: Some(h),
-            },
-            img.texture.size(),
-        );
+        self.upload_bands(img.texture.as_image_copy(), img.texture.size(), 16, rgba, cap);
         img
+    }
+    fn transfer_rows(w: u32, bytes_per_pixel: u32, cap: u64) -> u32 {
+        let pitch = (u64::from(w) * u64::from(bytes_per_pixel)).div_ceil(256) * 256;
+        assert!(pitch > 0 && pitch <= cap, "one transfer row exceeds buffer limit");
+        (cap / pitch).min(u64::from(u32::MAX)) as u32
+    }
+    fn upload_bands(&self, target: wgpu::TexelCopyTextureInfo<'_>, size: wgpu::Extent3d, bytes_per_pixel: u32, data: &[f32], cap: u64) {
+        let rows = Self::transfer_rows(size.width, bytes_per_pixel, cap.min(self.device.limits().max_buffer_size));
+        let row_floats = size.width as usize * bytes_per_pixel as usize / 4;
+        for y in (0..size.height).step_by(rows as usize) {
+            let height = rows.min(size.height - y);
+            let mut target = target.clone();
+            target.origin.y += y;
+            self.queue.write_texture(
+                target,
+                bytemuck::cast_slice(&data[y as usize * row_floats..(y + height) as usize * row_floats]),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size.width * bytes_per_pixel),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d { height, ..size },
+            );
+            // Submit each staging allocation before allocating the next band.
+            self.queue.submit([]);
+        }
+    }
+    /// Upload one unclamped float per pixel; expand to (gray, gray, gray, 1) on the GPU.
+    pub fn upload_gray32f(&self, w: u32, h: u32, gray: &[f32]) -> Image {
+        self.upload_gray32f_capped(w, h, gray, self.device.limits().max_buffer_size)
+    }
+    fn upload_gray32f_capped(&self, w: u32, h: u32, gray: &[f32], cap: u64) -> Image {
+        assert!(w > 0 && h > 0, "images must be nonempty");
+        assert_eq!(gray.len(), w as usize * h as usize);
+        self.flush();
+        let source = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Moya gray upload"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.upload_bands(source.as_image_copy(), source.size(), 4, gray, cap);
+        let image = self.image(w, h);
+        let pipeline = self.gray_upload.get_or_init(|| {
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Moya gray expansion"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("gray_upload.wgsl").into()),
+            });
+            let bindings = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None, bind_group_layouts: &[Some(&bindings)], immediate_size: 0,
+            });
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Moya gray expansion"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        let source_view = source.create_view(&Default::default());
+        let target_view = image.texture.create_view(&Default::default());
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&target_view) },
+            ],
+        });
+        self.record(None, |encoder| {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
+        });
+        image
     }
     /// Overwrite a nonempty region with tightly packed, unclamped RGBA32F pixels.
     /// Pending operations are submitted first so existing consumers see the old pixels.
     pub fn write_region(&self, img: &Image, x: u32, y: u32, w: u32, h: u32, rgba: &[f32]) {
+        self.write_region_capped(img, x, y, w, h, rgba, self.device.limits().max_buffer_size);
+    }
+    fn write_region_capped(&self, img: &Image, x: u32, y: u32, w: u32, h: u32, rgba: &[f32], cap: u64) {
         assert!(w > 0 && h > 0, "regions must be nonempty");
         assert!(x <= img.width() && w <= img.width() - x);
         assert!(y <= img.height() && h <= img.height() - y);
@@ -454,62 +559,56 @@ impl Gpu {
         self.flush();
         let mut target = img.texture.as_image_copy();
         target.origin = wgpu::Origin3d { x, y, z: 0 };
-        self.queue.write_texture(
-            target,
-            bytemuck::cast_slice(rgba),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 16),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
+        self.upload_bands(target, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, 16, rgba, cap);
     }
+    /// Read RGBA32F in padded-row bands bounded by the device buffer limit.
+    /// Supports texture-limit dimensions and images larger than `max_buffer_size`,
+    /// provided one padded RGBA32F row fits in that buffer limit.
     pub fn download_rgba32f(&self, img: &Image) -> Vec<f32> {
+        self.download_rgba32f_capped(img, self.device.limits().max_buffer_size)
+    }
+    fn download_rgba32f_capped(&self, img: &Image, cap: u64) -> Vec<f32> {
         let pitch = (img.width() * 16).div_ceil(256) * 256;
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Moya readback"),
-            size: pitch as u64 * img.height() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        self.record(None, |e| {
-            e.copy_texture_to_buffer(
-                img.texture.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(pitch),
-                        rows_per_image: Some(img.height()),
+        let rows = Self::transfer_rows(img.width(), 16, cap.min(self.device.limits().max_buffer_size));
+        let mut result = Vec::with_capacity(img.width() as usize * img.height() as usize * 4);
+        for y in (0..img.height()).step_by(rows as usize) {
+            let height = rows.min(img.height() - y);
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Moya readback band"),
+                size: u64::from(pitch) * u64::from(height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            self.record(None, |e| {
+                let mut source = img.texture.as_image_copy();
+                source.origin.y = y;
+                e.copy_texture_to_buffer(
+                    source,
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(pitch),
+                            rows_per_image: Some(height),
+                        },
                     },
-                },
-                img.texture.size(),
-            )
-        });
-        self.flush();
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU polling failed");
-        rx.recv().unwrap().expect("GPU readback failed");
-        let bytes = buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect("mapped readback range");
-        let mut result = Vec::with_capacity((img.width() * img.height() * 4) as usize);
-        for row in bytes.chunks_exact(pitch as usize) {
-            result.extend_from_slice(bytemuck::cast_slice(&row[..img.width() as usize * 16]));
+                    wgpu::Extent3d { width: img.width(), height, depth_or_array_layers: 1 },
+                )
+            });
+            self.flush();
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            self.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU polling failed");
+            rx.recv().unwrap().expect("GPU readback failed");
+            let bytes = buffer.slice(..).get_mapped_range().expect("mapped readback range");
+            for row in bytes.chunks_exact(pitch as usize) {
+                result.extend_from_slice(bytemuck::cast_slice(&row[..img.width() as usize * 16]));
+            }
+            drop(bytes);
+            buffer.unmap();
         }
-        drop(bytes);
-        buffer.unmap();
         result
     }
     pub fn write_display_rgba8(&self, img: &Image, target: &wgpu::Texture) {
@@ -549,6 +648,12 @@ impl Gpu {
         args: &[f32],
         stops: &[[f32; 4]],
     ) -> Image {
+        let mut out = self.image(w, h);
+        self.run_into(op, inputs, &mut out, args, stops);
+        out
+    }
+    fn run_into(&self, op: u32, inputs: &[&Image], out: &mut Image, args: &[f32], stops: &[[f32; 4]]) {
+        let (w, h) = (out.width(), out.height());
         static PROFILE_OPS: OnceLock<bool> = OnceLock::new();
         let start = (*PROFILE_OPS.get_or_init(|| std::env::var_os("MOYA_PROFILE_OPS").is_some()))
             .then(|| {
@@ -558,7 +663,6 @@ impl Gpu {
                     .expect("GPU profiling pre-dispatch completion");
                 Instant::now()
             });
-        let mut out = self.image(w, h);
         let mut params = [0f32; 32];
         params[4..4 + args.len()].copy_from_slice(args);
         let uniform = self
@@ -623,7 +727,6 @@ impl Gpu {
             epoch,
             rounded: false,
         });
-        out
     }
     fn unary(&self, op: u32, img: &Image, args: &[f32]) -> Image {
         self.run(op, &[img], img.width(), img.height(), args, &[])
@@ -635,11 +738,13 @@ impl Gpu {
         self.run(1, &[], w, h, &rgba, &[])
     }
     pub fn resize_bilinear(&self, img: &Image, w: u32, h: u32) -> Image {
+        assert!(w > 0 && h > 0, "resize target dimensions must be nonzero");
         self.run(2, &[img], w, h, &[], &[])
     }
     pub fn resize_bicubic(&self, img: &Image, w: u32, h: u32) -> Image {
+        assert!(w > 0 && h > 0, "resize target dimensions must be nonzero");
         // Antialias before reduction; a bounded half-size pyramid avoids huge reconstruction footprints.
-        if w * 2 < img.width() || h * 2 < img.height() {
+        if w < img.width().div_ceil(2) || h < img.height().div_ceil(2) {
             let half = self.resize_bicubic(
                 img,
                 (img.width().div_ceil(2)).max(w),
@@ -747,7 +852,11 @@ impl Gpu {
         let dx = (distance as f64 * radians.cos() + 0.5).trunc() as f32;
         let dy = (distance as f64 * radians.sin() + 0.5).trunc() as f32;
         let span = dx.abs().max(dy.abs());
-        if span <= 256. {
+        let vertical = dy.abs() > dx.abs();
+        let slope = if span == 0. { 0. } else if vertical { dx / dy } else { dy / dx };
+        let minor = if vertical { img.width() } else { img.height() };
+        let limit = self.device.limits().max_texture_dimension_2d;
+        if span <= 256. && !(d != Depth::Float && slope != 0. && minor + 4 > limit) {
             let vertical = dy.abs() > dx.abs();
             let slope = if span == 0. { 0. } else if vertical { dx / dy } else { dy / dx };
             let vertical = if vertical { 1. } else { 0. };
@@ -773,20 +882,33 @@ impl Gpu {
         let last = ((((major - 1) as f32 + 0.5) * slope * 128.).floor() / 128.).floor() as i32;
         let origin = first.min(last) - 2;
         let extent = minor + (last - first).unsigned_abs() + 4;
-        let (w, h) = if vertical { (extent, major) } else { (major, extent) };
         let axis = if vertical { 1. } else { 0. };
         let grid = depth(d);
-        let mut prefix = self.run(32, &[img], w, h, &[slope, axis, origin as f32, grid], &[]);
-        let mut offset = 1;
-        while offset < major {
-            let second = if 2 * offset < major { 1. } else { 0. };
-            let third = if 4 * offset < major { 1. } else { 0. };
-            let fourth = if 8 * offset < major { 1. } else { 0. };
-            prefix = self.run(33, &[&prefix], w, h, &[axis, offset as f32, second, third, fourth], &[]);
-            offset *= 16;
+        // Each strip retains the full major axis, preserving the prefix addition
+        // tree exactly. Four overlapping rows cover every inverse cubic tap.
+        let strip_limit = limit.min(4096);
+        let core = strip_limit - 4;
+        let mut output = self.image(img.width(), img.height());
+        let mut start = 0;
+        while start < extent - 4 {
+            let count = core.min(extent - 4 - start);
+            let strip_origin = origin + start as i32;
+            let strip_extent = count + 4;
+            let (w, h) = if vertical { (strip_extent, major) } else { (major, strip_extent) };
+            let mut prefix = self.run(32, &[img], w, h, &[slope, axis, strip_origin as f32, grid], &[]);
+            let mut offset = 1;
+            while offset < major {
+                let second = if 2 * offset < major { 1. } else { 0. };
+                let third = if 4 * offset < major { 1. } else { 0. };
+                let fourth = if 8 * offset < major { 1. } else { 0. };
+                prefix = self.run(33, &[&prefix], w, h, &[axis, offset as f32, second, third, fourth], &[]);
+                offset *= 16;
+            }
+            self.run_into(34, &[&prefix], &mut output,
+                &[slope, axis, strip_origin as f32, grid, span, count as f32], &[]);
+            start += count;
         }
-        self.run(34, &[&prefix], img.width(), img.height(),
-            &[slope, axis, origin as f32, grid, span], &[])
+        output
     }
     /// Zoom about PS's normalized center: 1/128 bins, then canvas scaling minus one pixel.
     pub fn radial_zoom_blur(
@@ -1201,6 +1323,53 @@ mod tests {
     }
 
     #[test]
+    fn transfers_band_at_injected_buffer_limits() {
+        let gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
+        // Odd widths exercise readback padding; seven rows leave a partial final band.
+        for w in [3u32, 19] {
+            let h = 7;
+            let pixels: Vec<f32> = (0..w * h * 4)
+                .map(|i| (i as f32 - 71.) / 16.)
+                .collect();
+            let pitch = u64::from((w * 16).div_ceil(256) * 256);
+            for rows in [1, 2, 3] {
+                let cap = pitch * rows + 17;
+                assert_eq!(Gpu::transfer_rows(w, 16, cap), rows as u32);
+                let image = gpu.upload_rgba32f_capped(w, h, &pixels, cap);
+                assert_eq!(gpu.download_rgba32f_capped(&image, cap), pixels);
+                // Also exercise a pending consumer before the banded readback.
+                let copied = gpu.copy(&image);
+                assert_eq!(gpu.download_rgba32f_capped(&copied, cap), pixels);
+            }
+            let gray: Vec<f32> = (0..w * h).map(|i| (i as f32 - 13.) / 8.).collect();
+            let expected: Vec<f32> = gray.iter().flat_map(|&v| [v, v, v, 1.]).collect();
+            for cap in [256, 529] {
+                let image = gpu.upload_gray32f_capped(w, h, &gray, cap);
+                assert_eq!(gpu.download_rgba32f_capped(&image, pitch * 2), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn region_upload_bands_preserve_offsets_and_pending_consumers() {
+        let gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
+        let original = [-2., 3., 0.5, 1.];
+        for cap in [256, 529] {
+            let image = gpu.fill(5, 9, original);
+            let before = gpu.copy(&image);
+            let patch: Vec<f32> = (0..3 * 7 * 4).map(|i| (i as f32 - 37.) / 8.).collect();
+            gpu.write_region_capped(&image, 1, 1, 3, 7, &patch, cap);
+            assert_eq!(gpu.download_rgba32f(&before), original.repeat(45));
+            let mut expected = original.repeat(45);
+            for y in 0..7 {
+                expected[((y + 1) * 5 + 1) * 4..((y + 1) * 5 + 4) * 4]
+                    .copy_from_slice(&patch[y * 12..(y + 1) * 12]);
+            }
+            assert_eq!(gpu.download_rgba32f(&image), expected);
+        }
+    }
+
+    #[test]
     fn write_region_preserves_float_pixels_and_pending_consumers() {
         let gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
         let original = [-2., 3., 0.5, 1.];
@@ -1338,3 +1507,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod motion_tests;

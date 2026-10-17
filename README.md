@@ -34,6 +34,10 @@ For manual installation, copy **Moya.app** to `/Applications` or `~/Applications
 
 Window size, last parameters, and the last open folder are remembered. User presets are stored in the platform config directory (`~/Library/Application Support/Moya/userPresets.json` on macOS).
 
+Image and mask-file decoding runs on one background worker: newer requests replace queued work and stale results are discarded. HQ encoding and file writes also run in the background. Whole-mask undo uses compact snapshots and always retains the newest edit, even when it exceeds the history budget.
+
+If the preset file cannot be read, a persistent warning remains visible. Before the first subsequent preset write, Moya preserves the original as `userPresets.json.bak-<timestamp>`; if that backup fails, it does not overwrite the original. Cancelling a Photoshop send removes any result produced by that send.
+
 ## Photoshop
 
 1. Choose **Plugins › Moya › Edit in Moya**, or **Edit in Moya** in the plugin panel. The visible document is exported at its current bit depth with its color profile. Moya starts if needed; approve Photoshop's permission prompt on first use.

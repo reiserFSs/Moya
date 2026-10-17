@@ -43,6 +43,34 @@ fn encode(x: f32) -> f32 {
 }
 
 #[test]
+fn exposure_preserves_signed_infinity_outside_lut() {
+    let gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
+    let input = gpu.upload_rgba32f(1, 1, &[f32::INFINITY, f32::NEG_INFINITY, 0.25, 1.]);
+    let output = gpu.download_rgba32f(&gpu.exposure(&input, 0., 0., 2., Depth::Float));
+    assert_eq!(output[0], f32::INFINITY);
+    assert_eq!(output[1], f32::NEG_INFINITY);
+    assert!((output[2] - 0.5).abs() < 1e-6);
+    let overflow = gpu.upload_rgba32f(1, 1, &[1e38, -1e38, 0., 1.]);
+    let output = gpu.download_rgba32f(&gpu.exposure(&overflow, 4., 0., 0.45, Depth::Float));
+    assert_eq!(output[0], f32::INFINITY);
+    assert_eq!(output[1], f32::NEG_INFINITY);
+}
+
+#[test]
+fn zero_resize_targets_are_rejected_before_dispatch_or_recursion() {
+    let gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
+    let input = gpu.fill(2, 2, [1.; 4]);
+    for (w, h) in [(0, 1), (1, 0), (0, 0)] {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu.resize_bilinear(&input, w, h)
+        })).is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu.resize_bicubic(&input, w, h)
+        })).is_err());
+    }
+}
+
+#[test]
 fn levels_exposure_and_storage() {
     let gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
     let pixels = [

@@ -4,6 +4,8 @@
 //! at 4000 and returns original-size layers. Glow copies are blurred and merged
 //! one at a time. Depth switches include sRGB transfer and Photoshop quantization.
 //! Latest-stage caches are byte-bounded; checkpoint renders replay every stage.
+//! Stage keys omit ignored extraction sliders and key glow's glare side effects
+//! by their activation conditions, not by the glare-only slider magnitudes.
 //! Auto-update is a UI scheduling gate: callers decide whether to invoke `render`.
 //! Stored glow is encoded 8-bit-equivalent, even with HDR rendering enabled.
 use std::sync::Arc;
@@ -40,7 +42,16 @@ stage_key!(ExtractionParams { threshold:f32, dr_compression:f32, transition:Tran
 #[derive(Debug, PartialEq)]
 struct ExtractionKey { params:ExtractionParams, mask_generation:u64 }
 stage_key!(ExposureKey { exposure:f32, hdr32:bool, rays_on:bool, rays_center:[f32;2], rays_samples:f32, rays_spacing:f32, rays_falloff:f32, main_opacity:f32 });
-stage_key!(GlowKey { radius:f32, aspect_ratio:f32, aspect_rotation:f32, hdr32:bool, glow_iterations:f32, colorize:bool, hue:f32, saturation:f32, rays_on:bool, main_opacity:f32, core_opacity:f32, glare_on:bool, glare_detail:f32, glare_sharpness:f32 });
+stage_key!(GlowParams { radius:f32, aspect_ratio:f32, aspect_rotation:f32, hdr32:bool, glow_iterations:f32, colorize:bool, hue:f32, saturation:f32, rays_on:bool, main_opacity:f32, core_opacity:f32, glare_on:bool });
+#[derive(Debug, PartialEq)]
+struct GlowKey { params:GlowParams, hq_detail:bool, float_sharpen:bool }
+impl GlowKey {
+    fn new(upstream:u64,p:&Params,mode:RenderMode,depth:Depth)->Self {
+        Self { params:GlowParams::new(upstream,p),
+            hq_detail:mode==RenderMode::Hq && p.glare_on && p.glare_detail>0.,
+            float_sharpen:p.glare_on && p.glare_sharpness>0. && depth==Depth::Float }
+    }
+}
 stage_key!(GlareKey { glare_on:bool, glare_rays:GlareRays, glare_opacity:f32, main_opacity:f32, glare_detail:f32, glare_rotation:f32, glare_length:f32, glare_sharpness:f32, glare_gamma:f32, glare_blend:GlareBlend, colorize:bool, hdr32:bool, hue:f32, saturation:f32 });
 stage_key!(ToneParams { tonemap:bool, exposure:f32, gamma:f32, colorize:bool, saturation:f32, protect_core:bool, spectrum_mix:f32, spectrum_frequency:f32, spectrum_saturation:f32, spectrum_blur:f32, spectrum_blend:SpectrumBlend, hdr32:bool, glare_blend:GlareBlend, main_opacity:f32 });
 #[derive(Debug, PartialEq)]
@@ -161,7 +172,11 @@ impl Renderer {
     fn ensure_extraction(&mut self,p:&Params)->u64 {
         let working=self.working.as_ref().unwrap();
         let depth=working.depth;
-        let key=ExtractionKey{params:ExtractionParams::new(working.generation,p),mask_generation:self.mask_generation};
+        // Key only the controls extraction reads at this working depth.
+        let mut params=ExtractionParams::new(working.generation,p);
+        if p.colorize {params.hue=0.;}
+        if p.colorize || depth==Depth::Float {params.saturation=0.;}
+        let key=ExtractionKey{params,mask_generation:self.mask_generation};
         if !self.extraction_cache.as_ref().is_some_and(|c|c.key==key) {
             // Release obsolete descendants before allocating their replacements.
             self.clear_stage_cache();
@@ -255,7 +270,7 @@ impl Renderer {
         }
         let glare_generation=self.glare_cache.as_ref().unwrap().generation;
         let glare_image=self.glare_cache.as_ref().unwrap().images.first().cloned();
-        let glow_key=GlowKey::new(exposure_generation,&p);
+        let glow_key=GlowKey::new(exposure_generation,&p,mode,depth);
         if !self.glow_cache.as_ref().is_some_and(|c|c.key==glow_key) {
         self.glow_cache=None; self.tone_cache=None; self.ca_cache=None; self.output_cache=None;
         let mut v=exposure_v.clone(); let mut core=exposure_core.clone();
@@ -569,11 +584,11 @@ mod tests {
     #[test]
     fn stage_keys_exclude_downstream_parameters() {
         let a=Params::default(); let mut b=a.clone(); b.ca_distance+=10.; b.ca_on=!b.ca_on; b.unmult=!b.unmult;
-        assert_eq!(GlowKey::new(1,&a),GlowKey::new(1,&b));
+        assert_eq!(GlowKey::new(1,&a,RenderMode::Draft,Depth::Sixteen),GlowKey::new(1,&b,RenderMode::Draft,Depth::Sixteen));
         b.glare_length+=1.;
-        assert_eq!(GlowKey::new(1,&a),GlowKey::new(1,&b));
+        assert_eq!(GlowKey::new(1,&a,RenderMode::Draft,Depth::Sixteen),GlowKey::new(1,&b,RenderMode::Draft,Depth::Sixteen));
         assert_ne!(GlareKey::new(1,&a),GlareKey::new(1,&b));
-        assert_ne!(GlowKey::new(1,&a),GlowKey::new(2,&a));
+        assert_ne!(GlowKey::new(1,&a,RenderMode::Draft,Depth::Sixteen),GlowKey::new(2,&a,RenderMode::Draft,Depth::Sixteen));
     }
     #[test]
     fn cache_budget_deduplicates_images_and_preserves_predecessors() {
@@ -598,6 +613,51 @@ mod tests {
         assert_eq!(renderer.extraction_cache.as_ref().unwrap().generation,extraction);
         renderer.trim_cache_to(0);
         assert_eq!(renderer.retained_bytes(),0);
+    }
+    #[test]
+    fn inactive_slider_changes_reuse_stage_generations() {
+        let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
+        let view=ViewFlags{xray:false,solo:false,host_is_float:false};
+        for mode in [RenderMode::Draft,RenderMode::Hq] {
+            for hdr32 in [false,true] {
+                for glare_on in [false,true] {
+                    let mut renderer=Renderer::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Float);
+                    let mut p=Params{radius:2.,glow_iterations:1.,glare_on,hdr32,
+                        glare_length:0.01,glare_detail:0.1,glare_sharpness:0.1,..Params::default()};
+                    renderer.render(&p,mode,&view);
+                    let glow=renderer.glow_cache.as_ref().unwrap().generation;
+                    p.glare_detail=0.2; p.glare_sharpness=0.2;
+                    renderer.render(&p,mode,&view);
+                    assert_eq!(glow,renderer.glow_cache.as_ref().unwrap().generation,"{mode:?}, HDR {hdr32}, glare {glare_on}");
+                    p.glare_detail=0.;
+                    renderer.render(&p,mode,&view);
+                    let next=renderer.glow_cache.as_ref().unwrap().generation;
+                    assert_eq!(glow!=next,mode==RenderMode::Hq && glare_on);
+                    p.glare_sharpness=0.;
+                    renderer.render(&p,mode,&view);
+                    assert_eq!(next!=renderer.glow_cache.as_ref().unwrap().generation,glare_on && hdr32);
+                }
+            }
+        }
+    }
+    #[test]
+    fn ignored_extraction_sliders_reuse_stage_generations() {
+        let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
+        let view=ViewFlags{xray:false,solo:false,host_is_float:false};
+        for mode in [RenderMode::Draft,RenderMode::Hq] {
+            for colorize in [false,true] {
+                let mut renderer=Renderer::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Float);
+                let mut p=Params{radius:2.,glow_iterations:1.,colorize,..Params::default()};
+                renderer.render(&p,mode,&view);
+                let extraction=renderer.extraction_cache.as_ref().unwrap().generation;
+                let exposure=renderer.exposure_cache.as_ref().unwrap().generation;
+                if colorize {p.hue=120.;}
+                if colorize || mode==RenderMode::Hq {p.saturation=75.;}
+                renderer.render(&p,mode,&view);
+                assert_eq!(extraction,renderer.extraction_cache.as_ref().unwrap().generation,"{mode:?}, colorize {colorize}");
+                assert_eq!(exposure,renderer.exposure_cache.as_ref().unwrap().generation);
+            }
+        }
     }
     #[test]
     fn glare_edits_reuse_glow_and_xray_preview_skips_it() {

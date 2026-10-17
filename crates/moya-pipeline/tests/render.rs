@@ -58,9 +58,9 @@ fn staged_cache_matches_cold_over_parameter_mask_and_view_sequences() {
         let mut p=Params{radius:3.,glow_iterations:2.,glare_length:0.01,rays_samples:3.,
             glare_on:true,ca_on:true,spectrum_mix:20.,..Params::default()};
         let mut mask:Option<f32>=None;
-        for step in 0..100 {
+        for step in 0..132 {
             let value=next();
-            match step%48 {
+            match step%64 {
                 0=>p.gamma=0.8+value*1.5,
                 1=>p.hue=-90.+value*180.,
                 2=>p.ca_distance=value*4.,
@@ -108,9 +108,26 @@ fn staged_cache_matches_cold_over_parameter_mask_and_view_sequences() {
                 44=>p.rays_samples=3.+value*3.,
                 45=>p.rays_falloff=0.5+value,
                 46=>p.glare_gamma=0.8+value,
-                _=>p.glow_iterations=1.+(value*2.).floor(),
+                47=>p.glow_iterations=1.+(value*2.).floor(),
+                // Exercise ignored sliders and both sides of glow's boolean gates.
+                48=>{p.colorize=true; p.glare_on=true; p.hdr32=false;},
+                49=>p.hue=-90.+value*180.,
+                50=>p.saturation=value*100.,
+                51=>p.glare_detail=0.,
+                52=>p.glare_detail=0.1+value*0.1,
+                53=>p.glare_detail=0.3+value*0.1,
+                54=>p.glare_sharpness=0.,
+                55=>p.glare_sharpness=0.1+value*0.1,
+                56=>p.glare_sharpness=0.3+value*0.1,
+                57=>{p.colorize=false; p.hdr32=true;},
+                58=>p.saturation=value*100.,
+                59=>p.glare_sharpness=0.,
+                60=>p.glare_sharpness=0.1+value*0.1,
+                61=>p.glare_sharpness=0.3+value*0.1,
+                62=>p.glare_on=false,
+                _=>{p.glare_detail=value; p.glare_sharpness=value;},
             }
-            let mode=if step<96 {initial_mode} else if step%2==0 {RenderMode::Draft} else {RenderMode::Hq};
+            let mode=if step<128 {initial_mode} else if step%2==0 {RenderMode::Draft} else {RenderMode::Hq};
             let view=ViewFlags{xray:step%3==0,solo:step%5==0,host_is_float:step%7==0};
             let mut cold=Renderer::new(gpu.clone(),gpu.upload_rgba32f(width,height,&pixels),host_depth);
             if let Some(v)=mask {cold.set_mask(Some(gpu.fill(width,height,[v,v,v,1.])));}

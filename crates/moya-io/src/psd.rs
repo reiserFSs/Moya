@@ -1,9 +1,11 @@
 //! Flattened RGB/grayscale PSD and PSB composites; layers are not rendered.
 use anyhow::{bail, ensure, Context, Result};
 use flate2::{Decompress, FlushDecompress, Status};
-use std::path::Path;
+use std::{fs::File, io::{BufReader, Read, Seek, SeekFrom}, path::Path};
+#[cfg(test)]
+use std::io::Cursor;
 
-use super::{Picture, SampleDepth};
+use super::{LoadLimits, Picture, SampleDepth};
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -22,34 +24,76 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into()?))
     }
-    fn length(&mut self, large: bool) -> Result<usize> {
-        let n = if large {
-            u64::from_be_bytes(self.take(8)?.try_into()?)
-        } else {
-            self.u32()? as u64
-        };
-        usize::try_from(n).context("PSD section length exceeds address space")
+}
+
+struct Stream<R> {
+    source: R,
+    end: u64,
+}
+
+impl<R: Read + Seek> Stream<R> {
+    fn new(mut source: R) -> Result<Self> {
+        let end = source.seek(SeekFrom::End(0))?;
+        source.seek(SeekFrom::Start(0))?;
+        Ok(Self { source, end })
+    }
+    fn position(&mut self) -> Result<u64> { Ok(self.source.stream_position()?) }
+    fn bytes<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let mut bytes = [0; N];
+        self.source.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn u16(&mut self) -> Result<u16> { Ok(u16::from_be_bytes(self.bytes()?)) }
+    fn u32(&mut self) -> Result<u32> { Ok(u32::from_be_bytes(self.bytes()?)) }
+    fn length(&mut self, large: bool) -> Result<u64> {
+        Ok(if large { u64::from_be_bytes(self.bytes()?) } else { self.u32()? as u64 })
+    }
+    fn section_end(&mut self, length: u64, parent: u64) -> Result<u64> {
+        let end = self.position()?.checked_add(length).context("PSD section length overflow")?;
+        ensure!(end <= parent && end <= self.end, "truncated PSD section");
+        Ok(end)
+    }
+    fn skip_to(&mut self, end: u64) -> Result<()> {
+        ensure!(end >= self.position()? && end <= self.end, "invalid PSD section boundary");
+        self.source.seek(SeekFrom::Start(end))?;
+        Ok(())
+    }
+    fn retained(&mut self, length: u64, budget: u64) -> Result<Vec<u8>> {
+        ensure!(length <= budget, "PSD data exceeds memory limit");
+        let length = usize::try_from(length).context("PSD data exceeds address space")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).context("allocating PSD data")?;
+        bytes.resize(length, 0);
+        self.source.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 }
 
-pub(super) fn load(path: &Path) -> Result<Picture> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    decode(&bytes).with_context(|| format!("decoding PSD {}", path.display()))
+pub(super) fn load(path: &Path, limits: LoadLimits) -> Result<Picture> {
+    let file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    decode_reader(BufReader::new(file), limits)
+        .with_context(|| format!("decoding PSD {}", path.display()))
 }
 
+#[cfg(test)]
 fn decode(bytes: &[u8]) -> Result<Picture> {
-    let mut input = Reader { bytes };
-    ensure!(input.take(4)? == b"8BPS", "invalid PSD signature");
+    decode_reader(Cursor::new(bytes), LoadLimits { max_pixels: 268_435_456, max_bytes: 4 * 1024 * 1024 * 1024 })
+}
+
+fn decode_reader<R: Read + Seek>(source: R, limits: LoadLimits) -> Result<Picture> {
+    let mut input = Stream::new(source)?;
+    ensure!(input.bytes::<4>()? == *b"8BPS", "invalid PSD signature");
     let version = input.u16()?;
     ensure!(matches!(version, 1 | 2), "unsupported PSD version {version}");
     let large = version == 2;
-    ensure!(input.take(6)? == [0; 6], "invalid PSD reserved header bytes");
+    ensure!(input.bytes::<6>()? == [0; 6], "invalid PSD reserved header bytes");
     let channels = input.u16()? as usize;
     ensure!((1..=56).contains(&channels), "invalid PSD channel count");
     let height = input.u32()?;
     let width = input.u32()?;
     let limit = if large { 300_000 } else { 30_000 };
     ensure!(width > 0 && height > 0 && width <= limit && height <= limit, "invalid PSD dimensions");
+    limits.check(width, height)?;
     let bits = input.u16()?;
     let depth = match bits {
         8 => SampleDepth::U8,
@@ -65,40 +109,70 @@ fn decode(bytes: &[u8]) -> Result<Picture> {
     };
     ensure!(channels >= colors, "PSD lacks required color channels");
     let color_length = input.length(false)?;
-    input.take(color_length)?;
+    let color_end = input.section_end(color_length, input.end)?;
+    input.skip_to(color_end)?;
     let resource_length = input.length(false)?;
-    let mut resources = Reader { bytes: input.take(resource_length)? };
+    let resource_end = input.section_end(resource_length, input.end)?;
     let mut icc_profile = None;
     let mut alpha_ids = None;
-    while !resources.bytes.is_empty() {
-        ensure!(resources.take(4)? == b"8BIM", "invalid PSD image resource signature");
-        let id = resources.u16()?;
-        let name_length = resources.take(1)?[0] as usize;
-        resources.take(name_length)?;
-        if (name_length + 1) % 2 != 0 {
-            resources.take(1)?;
+    let mut retained = 0u64;
+    while input.position()? < resource_end {
+        ensure!(input.bytes::<4>()? == *b"8BIM", "invalid PSD image resource signature");
+        let id = input.u16()?;
+        let name_length = input.bytes::<1>()?[0] as u64;
+        let name_end = input.section_end(((name_length + 2) & !1) - 1, resource_end)?;
+        input.skip_to(name_end)?;
+        let n = input.length(false)?;
+        let data_end = input.section_end(n, resource_end)?;
+        if id == 1039 || id == 1053 {
+            if id == 1053 {
+                ensure!(n % 4 == 0 && n / 4 <= channels as u64, "invalid PSD alpha identifiers");
+            }
+            let data = input.retained(n, limits.max_bytes.saturating_sub(retained))?;
+            let target = if id == 1039 { &mut icc_profile } else { &mut alpha_ids };
+            retained -= target.as_ref().map_or(0, |v: &Vec<u8>| v.len() as u64);
+            retained += n;
+            *target = Some(data);
+        } else {
+            input.skip_to(data_end)?;
         }
-        let n = resources.length(false)?;
-        let data = resources.take(n)?;
-        if id == 1039 {
-            icc_profile = Some(data.to_vec());
-        } else if id == 1053 {
-            ensure!(n % 4 == 0 && n / 4 <= channels, "invalid PSD alpha identifiers");
-            alpha_ids = Some(data);
-        }
-        if n % 2 != 0 {
-            resources.take(1)?;
-        }
+        let padded_end = input.section_end(n % 2, resource_end)?;
+        input.skip_to(padded_end)?;
     }
+    ensure!(input.position()? == resource_end, "invalid PSD resource section");
     let layer_length = input.length(large)?;
-    let mut layers = Reader { bytes: input.take(layer_length)? };
+    let layer_end = input.section_end(layer_length, input.end)?;
     let mut layer_count = 0i16;
-    if !layers.bytes.is_empty() {
-        let n = layers.length(large)?;
-        let mut info = Reader { bytes: layers.take(n)? };
+    if layer_length > 0 {
+        let n = input.length(large)?;
+        let info_end = input.section_end(n, layer_end)?;
         if n > 0 {
-            layer_count = info.u16()? as i16;
+            ensure!(n >= 2, "truncated PSD layer count");
+            layer_count = input.u16()? as i16;
         }
+        input.skip_to(info_end)?;
+        if n == 0 && input.position()? < layer_end {
+            let mask_length = input.length(false)?;
+            let mask_end = input.section_end(mask_length, layer_end)?;
+            input.skip_to(mask_end)?;
+            while input.position()? < layer_end {
+                let signature = input.bytes::<4>()?;
+                ensure!(signature == *b"8BIM" || signature == *b"8B64", "invalid PSD layer block signature");
+                let key = input.bytes::<4>()?;
+                let wide = large && matches!(&key, b"LMsk" | b"Lr16" | b"Lr32" | b"Layr" | b"Mt16" | b"Mt32" | b"Mtrn" | b"Alph" | b"FMsk" | b"lnk2" | b"FEid" | b"FXid" | b"PxSD");
+                let length = input.length(wide)?;
+                let end = input.section_end(length, layer_end)?;
+                if key == *b"Lr16" || key == *b"Lr32" {
+                    ensure!(length >= 2, "truncated PSD layer count");
+                    layer_count = input.u16()? as i16;
+                }
+                input.skip_to(end)?;
+                let padding = (4 - length % 4) % 4;
+                let padded_end = input.section_end(padding, layer_end)?;
+                input.skip_to(padded_end)?;
+            }
+        }
+        input.skip_to(layer_end)?;
     }
     // A negative layer count declares merged transparency. Positive alpha IDs
     // describe saved selection channels, not transparency.
@@ -106,7 +180,7 @@ fn decode(bytes: &[u8]) -> Result<Picture> {
         None
     } else if layer_count < 0 {
         Some(colors)
-    } else if let Some(ids) = alpha_ids {
+    } else if let Some(ids) = alpha_ids.as_deref() {
         ids.chunks_exact(4).position(|id| id == [0; 4])
             .map(|i| channels - ids.len() / 4 + i)
             .filter(|&i| i >= colors)
@@ -121,12 +195,16 @@ fn decode(bytes: &[u8]) -> Result<Picture> {
     let rows = (height as usize).checked_mul(channels).context("PSD row count overflow")?;
     let decoded_length = row_bytes.checked_mul(rows).context("PSD composite size overflow")?;
     let rgba_length = pixels.checked_mul(4).context("PSD RGBA size overflow")?;
-    let allocation = rgba_length.checked_mul(4).and_then(|n| n.checked_add(decoded_length))
+    let allocation = (rgba_length as u64).checked_mul(4)
+        .and_then(|n| n.checked_add(decoded_length as u64 + 1))
+        .and_then(|n| n.checked_add(retained))
+        .and_then(|n| n.checked_add(row_bytes as u64))
         .context("PSD allocation size overflow")?;
-    // ponytail: bound decoder working storage to 1 GiB; streaming channels can
-    // lift this ceiling when larger PSB composites are needed.
-    ensure!(allocation <= 1024 * 1024 * 1024, "PSD decoded image exceeds 1 GiB memory limit");
+    ensure!(allocation <= limits.max_bytes, "PSD decoded image exceeds memory limit");
     let compression = input.u16()?;
+    let encoded_length = input.end - input.position()?;
+    let encoded = input.retained(encoded_length, limits.max_bytes - allocation)?;
+    let mut input = Reader { bytes: &encoded };
     let mut owned;
     let raw = match compression {
         0 => input.take(decoded_length)?,
@@ -350,6 +428,82 @@ mod tests {
         unpack_row(&[128, 254, 42, 128], 3, &mut out).unwrap();
         assert_eq!(out, [42; 3]);
     }
+
+    #[test]
+    fn global_high_depth_layers_declare_merged_alpha_with_selection_ids() {
+        for version in [1u16, 2] {
+            for bits in [16u16, 32] {
+                let mut file = b"8BPS".to_vec();
+                file.extend(version.to_be_bytes());
+                file.extend([0; 6]);
+                file.extend(3u16.to_be_bytes());
+                file.extend(1u32.to_be_bytes());
+                file.extend(1u32.to_be_bytes());
+                file.extend(bits.to_be_bytes());
+                file.extend(1u16.to_be_bytes());
+                file.extend(0u32.to_be_bytes());
+                let mut resource = b"8BIM".to_vec();
+                resource.extend(1053u16.to_be_bytes());
+                resource.extend([0, 0]);
+                resource.extend(8u32.to_be_bytes());
+                resource.extend(7u32.to_be_bytes());
+                resource.extend(9u32.to_be_bytes());
+                file.extend((resource.len() as u32).to_be_bytes());
+                file.extend(resource);
+                let mut layers = if version == 2 { 0u64.to_be_bytes().to_vec() } else { 0u32.to_be_bytes().to_vec() };
+                layers.extend(0u32.to_be_bytes());
+                layers.extend(b"8BIM");
+                layers.extend(if bits == 16 { b"Lr16" } else { b"Lr32" });
+                if version == 2 { layers.extend(4u64.to_be_bytes()); }
+                else { layers.extend(4u32.to_be_bytes()); }
+                layers.extend((-1i16).to_be_bytes());
+                layers.extend([0; 2]);
+                if version == 2 { file.extend((layers.len() as u64).to_be_bytes()); }
+                else { file.extend((layers.len() as u32).to_be_bytes()); }
+                file.extend(layers);
+                file.extend(0u16.to_be_bytes());
+                for value in [0.75f32, 0.5, 1.0] {
+                    if bits == 16 { file.extend(((value * 65535.0).round() as u16).to_be_bytes()); }
+                    else { file.extend(value.to_be_bytes()); }
+                }
+                let picture = decode(&file).unwrap();
+                assert!((picture.rgba[0] - 0.5).abs() < 0.0001);
+                assert!((picture.rgba[3] - 0.5).abs() < 0.0001);
+                assert!(picture.rgba.iter().all(|v| v.is_finite()));
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_huge_layer_section_is_skipped_and_budgets_reject_allocations() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("moya-sparse-psb-{}-{nonce}.psb", std::process::id()));
+        let fixture = fixture(2, 8, 0, false);
+        let layer_length = 1u64 << 33;
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&fixture[..50]).unwrap();
+        file.write_all(&layer_length.to_be_bytes()).unwrap();
+        file.write_all(&(layer_length - 8).to_be_bytes()).unwrap();
+        file.write_all(&1i16.to_be_bytes()).unwrap();
+        file.seek(SeekFrom::Start(58 + layer_length)).unwrap();
+        file.write_all(&fixture[58..]).unwrap();
+        drop(file);
+        let limits = LoadLimits { max_pixels: 100, max_bytes: 1024 };
+        let picture = load(&path, limits);
+        let rejected = load(&path, LoadLimits { max_bytes: 32, ..limits });
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(picture.unwrap().rgba.len(), 24);
+        assert!(rejected.is_err());
+        let mut encoded = fixture.clone();
+        encoded.extend([0; 1024]);
+        assert!(decode_reader(Cursor::new(encoded), limits).is_err());
+        let mut resources = fixture;
+        resources[30..34].copy_from_slice(&2060u32.to_be_bytes());
+        resources[42..46].copy_from_slice(&2048u32.to_be_bytes());
+        resources.splice(46..50, [0; 2048]);
+        assert!(decode_reader(Cursor::new(resources), limits).is_err());
+    }
+
     #[test]
     fn merged_alpha_is_returned_straight() {
         let mut file = fixture(1, 8, 0, true);
@@ -373,7 +527,7 @@ mod tests {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!("moya-psd-{}-{nonce}.psd", std::process::id()));
         std::fs::write(&path, fixture(1, 8, 0, false)).unwrap();
-        let picture = load(&path);
+        let picture = load(&path, LoadLimits { max_pixels: 268_435_456, max_bytes: 4 * 1024 * 1024 * 1024 });
         std::fs::remove_file(&path).unwrap();
         let picture = picture.unwrap();
         assert_eq!((picture.width, picture.height), (3, 2));

@@ -9,11 +9,20 @@ pub(crate) struct PanelState {
     rename: Option<(usize, String)>,
     delete: Option<usize>,
     spectrum_mix: f32,
+    preset_load_warning: Option<String>,
+    preset_backup_pending: bool,
 }
 
 impl PanelState {
-    pub(crate) fn new(presets: Vec<Preset>) -> Self {
-        Self { tab: 0, presets, preset_name: "My Preset".into(), rename: None, delete: None, spectrum_mix: 50.0 }
+    pub(crate) fn new(loaded: anyhow::Result<Vec<Preset>>) -> Self {
+        let (presets, preset_load_warning) = match loaded {
+            Ok(presets) => (presets, None),
+            Err(error) => (Vec::new(), Some(format!(
+                "Presets could not be loaded: {error:#}. Unloaded presets are not included in new saves."
+            ))),
+        };
+        let preset_backup_pending = preset_load_warning.is_some();
+        Self { tab: 0, presets, preset_name: "My Preset".into(), rename: None, delete: None, spectrum_mix: 50.0, preset_load_warning, preset_backup_pending }
     }
 
     pub(crate) fn mask_tab_open(&self) -> bool { self.tab == 3 }
@@ -22,6 +31,12 @@ impl PanelState {
 impl App {
     pub(crate) fn controls(&mut self, ui: &mut egui::Ui) {
         self.hover_params = None;
+        if let Some(warning) = &self.panels.preset_load_warning {
+            ui.colored_label(Color32::YELLOW, warning);
+            if self.panels.preset_backup_pending {
+                ui.weak("Before saving, the existing file will be preserved as userPresets.json.bak-<timestamp>.");
+            }
+        }
         ui.horizontal(|ui| {
             for (i, label) in ["Main", "Glare", "FX", "Mask", "Presets"].iter().enumerate() {
                 ui.selectable_value(&mut self.panels.tab, i, *label);
@@ -151,10 +166,7 @@ impl App {
                         }
                         if ui.button("Load image…").on_hover_text("Load an image as a mask, resampled to the current image size").clicked() {
                             if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                match moya_io::load(&path) {
-                                    Ok(pic) => self.mask.load_image(&pic),
-                                    Err(e) => self.status = format!("Mask load failed: {e:#}"),
-                                }
+                                self.request_load(&path, true);
                             }
                         }
                     });
@@ -187,7 +199,9 @@ impl App {
     }
 
     fn persist_presets(&mut self) {
-        if let Err(e) = data::save_presets(&self.panels.presets) { self.status = format!("Preset save failed: {e:#}"); }
+        if let Err(e) = data::save_presets(&self.panels.presets, &mut self.panels.preset_backup_pending) {
+            self.status = format!("Preset save failed: {e:#}");
+        }
     }
 
     fn preset_controls(&mut self, ui: &mut egui::Ui) {

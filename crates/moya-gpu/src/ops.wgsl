@@ -12,6 +12,10 @@ fn linear(t:texture_2d<f32>,p:vec2<f32>)->vec4<f32>{let v=vec2<i32>(floor(p));le
 fn cubic(x:f32)->f32{let v=abs(x);if(v<1.){return (1.5*v-2.5)*v*v+1.;}if(v<2.){return ((-.5*v+2.5)*v-4.)*v+2.;}return 0.;}
 fn bicubic(p:vec2<f32>)->vec4<f32>{let origin=vec2<i32>(floor(p));var sum=vec4(0.);for(var y=-1;y<=2;y++){for(var x=-1;x<=2;x++){let q=origin+vec2(x,y);sum+=load(a,q)*cubic(p.x-f32(q.x))*cubic(p.y-f32(q.y));}}return sum;}
 fn motion_cubic(x:f32)->f32{let v=abs(x);if(v<1.){return (1.25*v-2.25)*v*v+1.;}if(v<2.){return ((-.75*v+3.75)*v-6.)*v+3.;}return 0.;}
+fn motion_load(p:vec2<i32>)->vec4<f32>{
+ let value=load(a,p);
+ return select(value,vec4(0.),(bitcast<vec4<u32>>(value)&vec4(0x7f800000u))==vec4(0x7f800000u));
+}
 // Inclusive prefix differences plus repeated clamped endpoints, in shear space.
 fn motion_box(major:i32,minor:i32,vertical:bool)->vec4<f32>{
  let dims=vec2<i32>(textureDimensions(a));let last=select(dims.x,dims.y,vertical)-1;
@@ -183,7 +187,7 @@ case 14u:{
   if(arg(3)>0.){v=pow(max(v,0.),563./256.);}
   v=v*exp2(arg(0))+arg(1);
   if(arg(2)!=1.){
-   if(arg(3)==0.&&arg(4)>0.&&v!=0.){
+   if(arg(3)==0.&&arg(4)>0.&&v!=0.&&abs(v)<=3.4028234663852886e38){
     let parts=frexp(abs(v));let position=(parts.fract*2.-1.)*arg(4);
     let index=u32(floor(position));let fraction=position-f32(index);
     let left=stops[index];let right=stops[index+1u];
@@ -402,11 +406,11 @@ case 32u:{
  let g=fract(ceil((f32(major)+.5)*arg(0)*128.)/128.);
  let base=minor+i32(arg(2))-i32(floor(phase));var sum=vec4(0.);
  if(arg(3)>0.){
-  for(var k=-1;k<=2;k++){sum+=load(a,select(vec2(major,base-k),vec2(base-k,major),vertical))*motion_cubic(f32(k)-g);}
+  for(var k=-1;k<=2;k++){sum+=motion_load(select(vec2(major,base-k),vec2(base-k,major),vertical))*motion_cubic(f32(k)-g);}
   out=floor(clamp(sum,vec4(0.),vec4(1.))*arg(3)+.5)/arg(3);
  }else{
-  let first=load(a,select(vec2(major,base),vec2(base,major),vertical));
-  let second=load(a,select(vec2(major,base-1),vec2(base-1,major),vertical));
+  let first=motion_load(select(vec2(major,base),vec2(base,major),vertical));
+  let second=motion_load(select(vec2(major,base-1),vec2(base-1,major),vertical));
   out=mix(first,second,g);
  }
 }
@@ -455,6 +459,8 @@ case 34u:{
  let vertical=arg(1)>0.;let major=select(p.x,p.y,vertical);let minor=select(p.y,p.x,vertical);
  let phase=floor((f32(major)+.5)*arg(0)*128.)/128.;let f=fract(phase);
  let z=minor+i32(floor(phase))-i32(arg(2));var sum=vec4(0.);
+ // Only this strip's non-overlapping interior owns the output pixel.
+ if(arg(5)>0.&&(z<2||z>=i32(arg(5))+2)){return;}
  if(arg(3)>0.){
   for(var j=-1;j<=2;j++){sum+=motion_box(major,z+j,vertical)*motion_cubic(f32(j)-f);}
   out=clamp(sum,vec4(0.),vec4(1.));

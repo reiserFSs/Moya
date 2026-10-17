@@ -164,7 +164,7 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
         ensure!(Instant::now() < deadline, "timed out waiting for bridge discovery for child pid {pid}: {last_discovery}");
         thread::sleep(Duration::from_millis(100));
     };
-    let hello = json!({"type": "hello", "version": 1, "token": discovery["token"], "client": "moya-bridge"});
+    let hello = json!({"type": "hello", "version": 1, "token": discovery["token"], "client": "moya-bridge", "nonce": "0".repeat(64)});
     let mut bad_hello = hello.clone();
     let mut bad_token = discovery["token"].as_str().unwrap().to_owned();
     let replacement = if bad_token.starts_with('0') { "1" } else { "0" };

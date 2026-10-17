@@ -29,9 +29,11 @@ cargo run -p moya-cli --release -- bench in.png --params p.json --interactive --
 
 ## Photoshop bridge
 
-Moya listens on loopback WebSocket port **47811**. On launch it writes `~/Library/Application Support/Moya/bridge.json`, containing the port and a per-launch random token, and removes it on exit. The plugin must send that token first, preventing unrelated browser pages from driving the app. A port conflict is reported in the app status bar.
+Moya binds both `127.0.0.1:47811` and `[::1]:47811` before publishing `~/Library/Application Support/Moya/bridge.json` (mode 0600), containing the port and a per-launch random token. IPv6 is skipped only when unavailable on the system; a conflict on either address aborts startup without replacing discovery. Discovery is removed on exit.
 
 The plugin connects to `ws://localhost:47811`: Photoshop 27.x rejects numeric-IP network permissions in v5 manifests ([Adobe developer forum](https://forums.creativeclouddeveloper.com/t/websocket-connection-not-working-in-manifestversion-5/6322)). The manifest allows `ws://localhost/`.
+
+The first WebSocket message must be a JSON `hello` with `version: 1`, `client: "moya-bridge"`, the discovery `token`, and a cryptographically random 64-hex-character `nonce`. The server replies with `type: "hello"`, `app: "moya"`, `version: 1`, `appVersion`, and `proof`: lowercase hex SHA-256 of the UTF-8 concatenation `token || nonce`. The plugin verifies this proof before sending any document data, rejecting missing or incorrect proof. The hello deadline is one second, with a 4 KiB message/frame limit before authentication and 1 MiB afterward. At most eight unauthenticated candidates are retained; a new connection evicts the oldest candidate. Accepted streams are explicitly blocking during the bounded HTTP upgrade, then nonblocking for message processing.
 
 Source TIFF and result TIFF files live in the plugin's temporary folder and are removed after placement. On render or write errors, the session stays open so Send can be retried. The target document is tracked independently of Photoshop's current active document. Layer XMP stores effect settings for re-editing.
 
@@ -43,9 +45,16 @@ cargo test -p moya-app --test bridge_protocol -- --ignored --test-threads=1
 
 ## Masks and preview
 
-Painting updates only the changed rectangle on the GPU. The preview re-renders at most about every 63 ms during a stroke and immediately when it ends. Mask edits remain full resolution; the overlay is capped at a 2048-pixel long side. Undo keeps sparse 16-bit mask diffs, bounded by 256 MiB and 200 steps, on the same timeline as parameter edits.
+Painting updates only the changed rectangle on the GPU. The preview re-renders at most about every 63 ms during a stroke and immediately when it ends. Mask edits remain full resolution; the overlay is capped at a 2048-pixel long side. Mask uploads use `Gpu::upload_gray32f` (single channel, expanded to RGBA on the GPU). Undo stores each mask step as sparse 16-bit diffs or a compact 16-bit snapshot, whichever is smaller. History is bounded by exact bytes (256 MiB) and 200 steps, and the newest step is always kept even if it alone exceeds the budget. It shares one timeline with parameter edits.
 
 The shared renderer computes only extraction and the heatmap for X-Ray. Draft working grids are bounded to a 1500-pixel long side for landscape or 1300 for portrait. HQ uses up to 4000 pixels and resamples to original dimensions.
+
+## Robustness limits
+
+- **Decoding:** `moya_io::load` checks header dimensions and the decoded size before allocating. Defaults are at most 16384 px per side and 4 GiB of RGBA-f32 storage; `load_with_limits(LoadLimits { .. })` overrides them. PSD/PSB files are streamed: the layer data is skipped by seeking, and only the composite section is read, after a budget check. 16/32-bit PSDs read the merged-transparency count from the global `Lr16`/`Lr32` blocks.
+- **Saving:** `moya_io::save` encodes into a sibling temp file, syncs it, and then renames it over the destination. A failed save leaves the existing file untouched. TIFFs switch to BigTIFF near the 4 GiB offset ceiling.
+- **GPU size limits:** long-span motion blur processes minor-axis strips of at most min(device limit, 4096) px, with overlap, so intermediates always fit the device. The output is bit-identical to the unstripped path. Uploads, region writes and readback are split into bands within `max_buffer_size`, so any image up to `max_texture_dimension_2d` per side round-trips. Resizers reject zero-sized targets.
+- **Non-finite input:** the motion-blur prefix scan zeroes non-finite channels first, so a stray inf/NaN only affects its own kernel window. Float exposure handles ±inf without NaN.
 
 ## Profiling and performance
 

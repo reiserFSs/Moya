@@ -4,6 +4,7 @@ use eframe::egui;
 use moya_core::Params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -63,9 +64,7 @@ pub struct Bridge {
 impl Bridge {
     pub fn start(ctx: egui::Context) -> Result<Self> {
         // Bind before touching discovery: a second app must leave the owner alone.
-        let listener = TcpListener::bind(("127.0.0.1", PORT))
-            .context("starting Photoshop bridge on port 47811")?;
-        listener.set_nonblocking(true)?;
+        let listeners = bind_loopback(PORT)?;
         let mut random = [0u8; 16];
         File::open("/dev/urandom")?.read_exact(&mut random)?;
         let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -94,7 +93,7 @@ impl Bridge {
         let worker_stop = stop.clone();
         let worker_token = token.clone();
         let worker = thread::Builder::new().name("photoshop-bridge".into()).spawn(move || {
-            serve(listener, &worker_token, worker_stop, event_tx, outgoing_rx, ctx);
+            serve(listeners, &worker_token, worker_stop, event_tx, outgoing_rx, ctx);
         });
         match worker {
             Ok(worker) => Ok(Self {
@@ -130,10 +129,50 @@ fn remove_owned_discovery(path: &Path, token: &str) {
     }
 }
 
+fn bind_loopback(port: u16) -> Result<Vec<TcpListener>> {
+    let ipv4 = TcpListener::bind(("127.0.0.1", port))
+        .context("starting IPv4 Photoshop bridge")?;
+    let port = ipv4.local_addr()?.port();
+    let mut listeners = vec![ipv4];
+    match TcpListener::bind(("::1", port)) {
+        Ok(listener) => listeners.push(listener),
+        Err(error) if matches!(error.kind(), io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported)
+            || matches!(error.raw_os_error(), Some(47 | 97)) => {
+            eprintln!("IPv6 loopback unavailable; Photoshop bridge uses IPv4 only: {error}");
+        }
+        Err(error) => return Err(error).context("starting IPv6 Photoshop bridge"),
+    }
+    for listener in &listeners { listener.set_nonblocking(true)?; }
+    Ok(listeners)
+}
+
+fn server_proof(token: &str, nonce: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(token.as_bytes());
+    hash.update(nonce.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+fn accept_socket(stream: TcpStream) -> Result<WebSocket<TcpStream>> {
+    // macOS accepted sockets inherit O_NONBLOCK from their listener.
+    stream.set_nonblocking(false)?;
+    let timeout = Some(Duration::from_millis(250));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(4096))
+        .max_frame_size(Some(4096));
+    let socket = tungstenite::accept_with_config(stream, Some(config))?;
+    socket.get_ref().set_nonblocking(true)?;
+    Ok(socket)
+}
+
 fn authenticated(value: &Value, token: &str) -> bool {
     value["type"] == "hello" && value["version"].as_u64() == Some(1)
         && value["token"].as_str() == Some(token)
         && value["client"] == "moya-bridge"
+        && value["nonce"].as_str().is_some_and(|nonce|
+            nonce.len() == 64 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -189,7 +228,7 @@ fn notify(events: &mpsc::Sender<Event>, ctx: &egui::Context, event: Event) {
 }
 
 fn serve(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     token: &str,
     stop: Arc<AtomicBool>,
     events: mpsc::Sender<Event>,
@@ -200,15 +239,11 @@ fn serve(
     let mut candidates: Vec<(WebSocket<TcpStream>, Instant)> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         // Bound unauthenticated connections and handshake time without disturbing the active client.
-        for _ in 0..4 {
-            let Ok((stream, _)) = listener.accept() else { break };
-            if candidates.len() >= 8 { continue; }
-            let timeout = Some(Duration::from_millis(100));
-            if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
-                continue;
-            }
-            if let Ok(socket) = tungstenite::accept(stream) {
-                if socket.get_ref().set_nonblocking(true).is_ok() {
+        for listener in &listeners {
+            for _ in 0..4 {
+                let Ok((stream, _)) = listener.accept() else { break };
+                if candidates.len() >= 8 { candidates.remove(0); }
+                if let Ok(socket) = accept_socket(stream) {
                     candidates.push((socket, Instant::now()));
                 }
             }
@@ -216,13 +251,18 @@ fn serve(
         let mut index = 0;
         while index < candidates.len() {
             let (socket, started) = &mut candidates[index];
-            let mut remove = started.elapsed() > Duration::from_secs(5);
+            let mut remove = started.elapsed() > Duration::from_secs(1);
             let mut accept = false;
+            let mut proof = String::new();
             if !remove {
                 match socket.read() {
                     Ok(Message::Text(text)) => {
-                        accept = serde_json::from_str::<Value>(&text).ok()
-                            .is_some_and(|value| authenticated(&value, token));
+                        accept = text.len() <= 4096 && serde_json::from_str::<Value>(&text).ok()
+                            .is_some_and(|value| {
+                                if !authenticated(&value, token) { return false; }
+                                proof = server_proof(token, value["nonce"].as_str().unwrap());
+                                true
+                            });
                         remove = true;
                     }
                     Ok(Message::Ping(_) | Message::Pong(_)) => { let _ = socket.flush(); }
@@ -232,8 +272,13 @@ fn serve(
             }
             if remove {
                 let (mut socket, _) = candidates.remove(index);
+                socket.set_config(|config| {
+                    config.max_message_size = Some(1024 * 1024);
+                    config.max_frame_size = Some(1024 * 1024);
+                });
                 if accept && send(&mut socket, json!({
                     "type": "hello", "app": "moya", "version": 1, "appVersion": env!("CARGO_PKG_VERSION"),
+                    "proof": proof,
                 })) {
                     if let Some(mut previous) = active.take() {
                         let _ = previous.close(None);
@@ -303,9 +348,99 @@ fn serve(
 mod tests {
     use super::*;
 
+    struct Server {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl Server {
+        fn new() -> Self {
+            let listeners = bind_loopback(0).unwrap();
+            let port = listeners[0].local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let (events, _) = mpsc::channel();
+            let (_, outgoing) = mpsc::channel();
+            let worker = thread::spawn(move || serve(listeners, "secret", worker_stop,
+                events, outgoing, egui::Context::default()));
+            Self { port, stop, worker: Some(worker) }
+        }
+
+        fn connect(&self, host: &str) -> WebSocket<TcpStream> {
+            let stream = TcpStream::connect(format!("{host}:{}", self.port)).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            tungstenite::client(format!("ws://localhost:{}", self.port), stream).unwrap().0
+        }
+
+        fn authenticate(&self, socket: &mut WebSocket<TcpStream>) {
+            let nonce = "a".repeat(64);
+            socket.send(Message::Text(json!({"type":"hello", "version":1,
+                "client":"moya-bridge", "token":"secret", "nonce":nonce}).to_string().into())).unwrap();
+            let response: Value = serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(response["proof"], server_proof("secret", &nonce));
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[test]
+    fn ipv6_loopback_authenticates() {
+        let server = Server::new();
+        server.authenticate(&mut server.connect("[::1]"));
+    }
+
+    #[test]
+    fn ipv6_port_conflict_aborts_both_binds() {
+        let reserved = TcpListener::bind("[::1]:0").unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        assert!(bind_loopback(port).is_err());
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn oldest_idle_candidate_is_evicted_for_plugin() {
+        let server = Server::new();
+        let _idle: Vec<_> = (0..8).map(|_| server.connect("127.0.0.1")).collect();
+        server.authenticate(&mut server.connect("127.0.0.1"));
+    }
+
+    #[test]
+    fn blocking_upgrade_accepts_slow_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || loop {
+            if let Ok((stream, _)) = listener.accept() {
+                return accept_socket(stream).is_ok();
+            }
+            thread::sleep(Duration::from_millis(1));
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        stream.write_all(b"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
+        assert!(worker.join().unwrap());
+    }
+
+    #[test]
+    fn oversized_hello_header_rejected_without_payload() {
+        let server = Server::new();
+        let mut socket = server.connect("127.0.0.1");
+        // Masked frame advertising 64 MiB; send only its header, not an allocation.
+        socket.get_mut().write_all(&[0x81, 0xff, 0, 0, 0, 0, 4, 0, 0, 0, 1, 2, 3, 4]).unwrap();
+        assert!(matches!(socket.read(), Ok(Message::Close(_)) | Err(_)));
+    }
+
     #[test]
     fn authentication_and_edit_validation() {
-        let hello = json!({"type":"hello", "version":1, "token":"secret", "client":"moya-bridge"});
+        let hello = json!({"type":"hello", "version":1, "token":"secret", "client":"moya-bridge", "nonce":"0".repeat(64)});
         assert!(authenticated(&hello, "secret"));
         assert!(!authenticated(&hello, "wrong"));
         for (field, value) in [("type", json!("edit")), ("version", json!(2)), ("client", json!("other"))] {
