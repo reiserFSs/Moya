@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "moya-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "moya-calib"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "moya-core",
@@ -1842,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "moya-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "moya-core",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "moya-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "moya-gpu"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "moya-io"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "moya-pipeline"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "moya-core",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "moya-project"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
