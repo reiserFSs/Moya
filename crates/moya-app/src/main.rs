@@ -57,6 +57,12 @@ struct Preview {
     id: egui::TextureId,
     size: [u32; 2],
 }
+
+fn preview_request(view: ViewFlags, selected: u64, solo_layer: Option<u64>) -> RenderRequest {
+    RenderRequest { mode: RenderMode::Draft, view, selected: Some(selected), solo_layer,
+        want_layer_glows: false, want_xray: view.xray,
+        want_composite: true, want_glow_composite: false }
+}
 struct App {
     gpu: Arc<Gpu>,
     render_state: egui_wgpu::RenderState,
@@ -66,6 +72,8 @@ struct App {
     project: projects::State,
     hover_params: Option<Params>,
     last_render_ms: Option<f32>,
+    last_rendered: std::time::Instant,
+    idle_trimmed: bool,
     busy: bool,
     history: history::History,
     last_folder: Option<PathBuf>,
@@ -137,6 +145,8 @@ impl App {
             last_folder,
             hover_params: None,
             last_render_ms: None,
+            last_rendered: std::time::Instant::now(),
+            idle_trimmed: false,
             busy: false,
             renderer: None,
             picture: None,
@@ -267,7 +277,7 @@ impl App {
             }
         }
     }
-    fn finish_open(&mut self, path: &Path, pic: Picture) -> bool {
+    fn finish_open(&mut self, path: &Path, mut pic: Picture) -> bool {
         let limit = self.gpu.max_image_dimension();
         if pic.width > limit || pic.height > limit {
             self.status = format!(
@@ -286,6 +296,7 @@ impl App {
             SampleDepth::F32 => Depth::Float,
         };
         let image = self.gpu.upload_rgba32f(pic.width, pic.height, &pic.rgba);
+        pic.rgba = Vec::new();
         let (w, h) = moya_core::DocGeometry { orig_w: pic.width, orig_h: pic.height }.working_size(RenderMode::Draft);
         let draft = self.gpu.resize_bicubic(&image, w, h);
         self.source_preview = Some(self.gpu.convert_depth(&draft, depth, Depth::Eight));
@@ -360,6 +371,8 @@ impl App {
         self.busy = true;
         self.render_preview();
         self.last_render_ms = Some(started.elapsed().as_secs_f32() * 1000.0);
+        self.last_rendered = std::time::Instant::now();
+        self.idle_trimmed = false;
         self.busy = self.loading.is_some();
     }
     fn render_preview(&mut self) {
@@ -371,11 +384,10 @@ impl App {
         let inputs: Vec<_> = self.layers.iter().map(|layer| LayerInputs {
             settings: &layer.settings, mask: layer.mask.gpu_image(), mask_generation: layer.mask.generation(),
         }).collect();
-        let request = RenderRequest { mode: RenderMode::Draft, view: flags, selected: Some(self.selected),
-            solo_layer: self.solo_layer, want_layer_glows: false, want_xray: self.xray };
+        let request = preview_request(flags, self.selected, self.solo_layer);
         let output = self.renderer.as_mut().unwrap().render(&inputs, &request);
         if let Some(params) = original { self.layers[index].settings.params = params; }
-        self.display(output.xray.as_ref().unwrap_or(&output.composite));
+        self.display(output.xray.as_ref().or(output.composite.as_ref()).expect("requested preview"));
         self.dirty = false;
         self.force = false;
     }
@@ -406,42 +418,41 @@ impl App {
         self.status = "Saving HQ…".into();
         self.busy = true;
         let ctx = self.egui_ctx.clone();
+        let gpu = self.gpu.clone();
         std::thread::spawn(move || {
-            let result = moya_io::save(&path, &pic, depth).map(|()| path);
+            let result = pic.save(&gpu, &path).map(|()| path);
+            drop(pic);
             let _ = tx.send(result);
             ctx.request_repaint();
         });
     }
 
-    fn render_hq(&mut self, glow: bool, opaque: bool, depth: SampleDepth) -> anyhow::Result<Picture> {
+    fn render_hq(&mut self, glow: bool, opaque: bool, depth: SampleDepth) -> anyhow::Result<workers::ExportImage> {
         let flags = ViewFlags { xray: false, solo: false, host_is_float: self.flags().host_is_float };
         let inputs: Vec<_> = self.layers.iter().map(|layer| LayerInputs {
             settings: &layer.settings, mask: layer.mask.gpu_image(), mask_generation: layer.mask.generation(),
         }).collect();
         let renderer = self.renderer.as_mut().ok_or_else(|| anyhow::anyhow!("Open an image first"))?;
         let output = renderer.render(&inputs, &RenderRequest { mode: RenderMode::Hq, view: flags,
-            selected: Some(self.selected), solo_layer: None, want_layer_glows: false, want_xray: false });
-        let image = if glow { &output.glow_composite } else { &output.composite };
+            selected: Some(self.selected), solo_layer: None, want_layer_glows: false, want_xray: false,
+            want_composite: !glow, want_glow_composite: glow });
+        let image = if glow { output.glow_composite } else { output.composite }.expect("requested HQ output");
         let from = if !glow && flags.host_is_float { Depth::Float } else { Depth::Eight };
         let to = match depth { SampleDepth::U8 => Depth::Eight, SampleDepth::U16 => Depth::Sixteen, SampleDepth::F32 => Depth::Float };
-        let converted = (from != to).then(|| self.gpu.convert_depth(image, from, to));
-        let image = converted.as_ref().unwrap_or(image);
-        let mut rgba = self.gpu.download_rgba32f(image);
-        if opaque {
-            for pixel in rgba.chunks_exact_mut(4) {
-                pixel[0] *= pixel[3];
-                pixel[1] *= pixel[3];
-                pixel[2] *= pixel[3];
-                pixel[3] = 1.0;
-            }
-        }
-        let pic = Picture {
-            width: image.width(), height: image.height(), depth, rgba,
+        let image = if from != to { self.gpu.convert_depth(&image, from, to) } else { image };
+        let pic = workers::ExportImage {
+            image, depth, opaque,
             icc_profile: self.picture.as_ref().and_then(|p| p.icc_profile.clone()),
         };
         self.dirty = true;
         self.force = true;
         Ok(pic)
+    }
+
+    fn trim_idle(&self) {
+        let budget = self.source_preview.as_ref()
+            .map_or(0, |image| image.width() as u64 * image.height() as u64 * 16 * 3);
+        self.gpu.trim_idle(budget);
     }
 
 
@@ -477,6 +488,7 @@ impl eframe::App for App {
             };
             if let Some(result) = result {
                 self.saving = None;
+                self.trim_idle();
                 self.status = match result {
                     Ok(path) => format!("Saved {}", path.display()),
                     Err(e) => format!("Save failed: {e:#}"),
@@ -665,5 +677,33 @@ impl eframe::App for App {
         if self.dirty && self.auto_update {
             ui.ctx().request_repaint();
         }
+        if !self.busy && !self.idle_trimmed {
+            let elapsed = self.last_rendered.elapsed();
+            if elapsed >= std::time::Duration::from_secs(5) {
+                self.trim_idle();
+                self.idle_trimmed = true;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs(5) - elapsed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_selected_layer_keeps_composite_fallback_in_xray() {
+        let gpu = Arc::new(Gpu::new_blocking().expect("GPU is mandatory for preview tests"));
+        let image = gpu.upload_rgba32f(1, 1, &[0.25, 0.5, 0.75, 1.0]);
+        let mut document = Document::new(gpu, image, Depth::Eight);
+        let mut layers = layers::new_document(Params::default());
+        layers[0].settings.visible = false;
+        let inputs = [LayerInputs { settings: &layers[0].settings, mask: None, mask_generation: 0 }];
+        let request = preview_request(ViewFlags { xray: true, solo: false, host_is_float: false }, layers[0].settings.id, None);
+        let output = document.render(&inputs, &request);
+        assert!(output.xray.is_none());
+        assert!(output.composite.is_some());
     }
 }

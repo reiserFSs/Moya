@@ -120,7 +120,7 @@ impl History {
             } else { break; }
         }
         self.prune_removed();
-        // Deleted masks own full CPU images; retention shares the global diff budget.
+        // Deleted masks retain two-byte CPU pixels; retention shares the global diff budget.
         while layers.iter().map(|l| l.mask.history_bytes()).sum::<usize>()
             + self.removed.values().map(|l| l.mask.retained_bytes()).sum::<usize>() > self.mask_limit
         {
@@ -277,6 +277,24 @@ mod tests {
         history.observe(&mut layers, selected, false);
         assert!(!history.can_redo());
         assert!(!layers[0].mask.redo());
+    }
+
+    #[test]
+    fn deleted_u16_mask_fits_exact_pixel_budget_and_restores_exactly() {
+        let saved=moya_project::MaskData { width:4,height:1,enabled:false,data:vec![0,1,32768,65535] };
+        let mut layers=vec![Layer::new(1,"Masked"),Layer::new(2,"Other")];
+        layers[0].mask=crate::mask::Mask::import(&saved,4,1).unwrap();
+        let mut selected=1;
+        let mut history=History::new(&layers,selected);
+        history.mask_limit=8;
+        assert!(history.remove_layer(&mut layers,&mut selected,1));
+        assert_eq!(history.removed[&1].mask.retained_bytes(),8);
+        assert!(history.undo(&mut layers,&mut selected));
+        assert_eq!(layers[0].mask.export().unwrap(),saved);
+        assert!(layers[0].mask.gpu_image().is_none());
+        assert!(history.redo(&mut layers,&mut selected));
+        history.mask_limit=7;history.observe(&mut layers,selected,false);
+        assert!(history.removed.is_empty());assert!(!history.can_undo());
     }
 
     #[test]

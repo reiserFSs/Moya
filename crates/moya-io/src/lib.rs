@@ -4,6 +4,9 @@ use anyhow::{Context, Result, bail, ensure};
 use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder};
 
 mod psd;
+mod streaming;
+mod stream_codecs;
+pub use streaming::save_streaming;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleDepth { U8, U16, F32 }
@@ -123,7 +126,14 @@ pub fn save(path: &Path, pic: &Picture, depth: SampleDepth) -> Result<()> {
                 encode_tiff(&mut encoder, pic, depth)?;
             }
         }
-        "exr" => image::codecs::openexr::OpenExrEncoder::new(&mut writer).write_image(bytemuck::cast_slice(&pic.rgba), pic.width, pic.height, ExtendedColorType::Rgba32F)?,
+        // Canonical tile order: the previous parallel EXR writer emitted tiles in
+        // completion order, so identical pixels could produce different files.
+        "exr" => stream_codecs::exr(&mut writer, pic.width, pic.height, &mut |y, rows, out| {
+            let start = y as usize * pic.width as usize * 4;
+            let end = start + rows as usize * pic.width as usize * 4;
+            out.copy_from_slice(&pic.rgba[start..end]);
+            Ok(())
+        })?,
         _ => unreachable!(),
     }
     writer.flush().with_context(|| format!("writing {}", path.display()))?;
@@ -171,6 +181,61 @@ fn quantize16(data: &[f32]) -> Vec<u16> { data.iter().map(|v| (v.clamp(0.0, 1.0)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_is_byte_identical_for_all_formats_and_depths() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut seed = 0x1234_5678u32;
+        // Multiple TIFF strips and EXR blocks; incompressible samples exercise PNG chunking.
+        let pic = Picture {
+            width: 317, height: 269, depth: SampleDepth::F32,
+            rgba: (0..317 * 269 * 4).map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / 16777215.0 * 1.5 - 0.25
+            }).collect(),
+            icc_profile: Some(b"test opaque ICC profile payload".to_vec()),
+        };
+        for (ext, depth) in [
+            ("png", SampleDepth::U8), ("png", SampleDepth::U16),
+            ("jpg", SampleDepth::U8), ("tiff", SampleDepth::U8),
+            ("tiff", SampleDepth::U16), ("tiff", SampleDepth::F32),
+            ("exr", SampleDepth::F32),
+        ] {
+            let reference = dir.path().join(format!("reference-{depth:?}.{ext}"));
+            let streamed = dir.path().join(format!("streamed-{depth:?}.{ext}"));
+            save(&reference, &pic, depth)?;
+            save_streaming(&streamed, pic.width, pic.height, depth, pic.icc_profile.as_deref(), |y, rows, out| {
+                assert_eq!(out.len(), rows as usize * pic.width as usize * 4);
+                let start = y as usize * pic.width as usize * 4;
+                out.copy_from_slice(&pic.rgba[start..start + out.len()]);
+                Ok(())
+            })?;
+            assert_eq!(std::fs::read(&reference)?, std::fs::read(&streamed)?, "{ext} {depth:?}");
+            if ext == "exr" {
+                let old = dir.path().join("old.exr");
+                image::codecs::openexr::OpenExrEncoder::new(File::create(&old)?)
+                    .write_image(bytemuck::cast_slice(&pic.rgba), pic.width, pic.height, ExtendedColorType::Rgba32F)?;
+                assert_eq!(load(&old)?.rgba, load(&streamed)?.rgba);
+                save(&reference, &pic, depth)?;
+                assert_eq!(std::fs::read(&reference)?, std::fs::read(&streamed)?, "EXR repeated run");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_callback_failure_is_atomic() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for ext in ["png", "tiff", "exr", "jpg"] {
+            let path = dir.path().join(format!("victim.{ext}"));
+            std::fs::write(&path, b"ORIGINAL")?;
+            let depth = if ext == "exr" { SampleDepth::F32 } else { SampleDepth::U8 };
+            assert!(save_streaming(&path, 17, 19, depth, None, |_, _, _| bail!("readback failed")).is_err());
+            assert_eq!(std::fs::read(&path)?, b"ORIGINAL");
+        }
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 4);
+        Ok(())
+    }
 
     #[test]
     fn codec_depth_roundtrips_and_icc() -> Result<()> {

@@ -8,6 +8,11 @@ publish.workspace = true
 anyhow = { workspace = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tiff", "exr"] }
 tiff = "0.11.3"
+png = "0.18.1"
+exr = "1.74.2"
+fdeflate = "0.3.7"
+crc32fast = "1"
+simd-adler32 = "0.3.10"
 flate2 = "1"
 bytemuck = { workspace = true }
 tempfile = "3"

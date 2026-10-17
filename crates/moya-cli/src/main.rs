@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use moya_core::{LayerSettings, Params, RenderMode, presets::parse_presets};
+use moya_core::{DocGeometry, LayerSettings, Params, RenderMode, presets::parse_presets};
 use moya_gpu::{Depth, Gpu};
 use moya_io::{Picture, SampleDepth};
 use moya_pipeline::{Document, LayerInputs, RenderRequest, ViewFlags};
@@ -264,6 +264,8 @@ fn run(options: Options) -> Result<()> {
         bail!("{}×{} exceeds this GPU's {limit} px texture limit", source.width, source.height);
     }
     let image = gpu.upload_rgba32f(source.width, source.height, &source.rgba);
+    let (draft_w, draft_h) = DocGeometry { orig_w: source.width, orig_h: source.height }.working_size(RenderMode::Draft);
+    let idle_budget = u64::from(draft_w) * u64::from(draft_h) * 16 * 3;
     drop(source.rgba);
     let mut document = Document::new(Arc::clone(&gpu), image, host_depth);
     let masks = layers.iter().map(|layer| {
@@ -281,17 +283,19 @@ fn run(options: Options) -> Result<()> {
         view,
         selected,
         solo_layer: None,
-        want_layer_glows: options.command == Command::Render && !is_project,
+        want_composite: !options.glow_only,
+        want_glow_composite: options.command == Command::Render && options.glow_only && is_project,
+        want_layer_glows: options.command == Command::Render && options.glow_only && !is_project,
         want_xray: false,
     };
     match options.command {
         Command::Render => {
             let rendered = document.render(&inputs, &request);
             let image = if options.glow_only {
-                if is_project { rendered.glow_composite }
+                if is_project { rendered.glow_composite.expect("requested glow composite") }
                 else { rendered.layer_glows.into_iter().next().expect("requested layer glow").1 }
             } else {
-                rendered.composite
+                rendered.composite.expect("requested composite")
             };
             let output_depth = options.depth.unwrap_or(source.depth);
             let from = if !options.glow_only && view.host_is_float && !view.solo {
@@ -305,29 +309,26 @@ fn run(options: Options) -> Result<()> {
                 SampleDepth::F32 => Depth::Float,
             };
             let image = if from == to { image } else { gpu.convert_depth(&image, from, to) };
-            let picture = Picture {
-                width: image.width(),
-                height: image.height(),
-                depth: output_depth,
-                rgba: gpu.download_rgba32f(&image),
-                icc_profile: source.icc_profile,
-            };
+            gpu.trim_idle(idle_budget);
             let path = options.output.as_ref().expect("validated output path");
-            moya_io::save(path, &picture, output_depth)
+            moya_io::save_streaming(path, image.width(), image.height(), output_depth, source.icc_profile.as_deref(),
+                |y, rows, out| gpu.download_row_range(&image, y, rows, out))
                 .with_context(|| format!("saving {}", path.display()))?;
+            drop(image);
+            gpu.trim_idle(idle_budget);
         }
         Command::Bench => {
             let mut times = Vec::new();
             times.try_reserve_exact(options.iters).context("allocating benchmark timings")?;
             // Readback submits pending commands and waits for completion, including setup.
             let warmup = document.render(&inputs, &request);
-            drop(gpu.download_rgba32f(&warmup.composite));
+            drop(gpu.download_rgba32f(warmup.composite.as_ref().expect("requested composite")));
             drop(warmup);
             for i in 0..options.iters {
                 let start = Instant::now();
                 document.clear_stage_caches();
                 let output = document.render(&inputs, &request);
-                let pixels = gpu.download_rgba32f(&output.composite);
+                let pixels = gpu.download_rgba32f(output.composite.as_ref().expect("requested composite"));
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 times.push(ms);
                 println!("render {}: {:.3} ms", i + 1, ms);
@@ -356,11 +357,11 @@ fn run(options: Options) -> Result<()> {
                         // Restore the base every time: repeating the changed value
                         // would benchmark a cache hit rather than invalidation.
                         let prime = document.render(&inputs, &request);
-                        drop(gpu.download_rgba32f(&prime.composite));
+                        drop(gpu.download_rgba32f(prime.composite.as_ref().expect("requested composite")));
                         drop(prime);
                         let start = Instant::now();
                         let output = document.render(&changed_inputs, &request);
-                        let pixels = gpu.download_rgba32f(&output.composite);
+                        let pixels = gpu.download_rgba32f(output.composite.as_ref().expect("requested composite"));
                         times.push(start.elapsed().as_secs_f64() * 1000.0);
                         drop(pixels);
                         drop(output);
@@ -370,7 +371,7 @@ fn run(options: Options) -> Result<()> {
                             let start = Instant::now();
                             document.clear_stage_caches();
                             let output = document.render(&changed_inputs, &request);
-                            let pixels = gpu.download_rgba32f(&output.composite);
+                            let pixels = gpu.download_rgba32f(output.composite.as_ref().expect("requested composite"));
                             cold_controls.push(start.elapsed().as_secs_f64() * 1000.0);
                             drop(pixels);
                             drop(output);

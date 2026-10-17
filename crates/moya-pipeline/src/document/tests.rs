@@ -6,6 +6,8 @@ fn request() -> RenderRequest {
         view: ViewFlags { xray: false, solo: false, host_is_float: false },
         selected: None,
         solo_layer: None,
+        want_composite: true,
+        want_glow_composite: false,
         want_layer_glows: false,
         want_xray: false,
     }
@@ -47,17 +49,29 @@ fn hq_below_uses_capped_working_glow_without_output_resize_roundtrip() {
     req.mode = RenderMode::Hq;
     let output = document.render(&inputs(&settings), &req);
 
-    assert_eq!((output.composite.width(), output.composite.height()), (4001, 1));
-    let original = document.layers[&1].stages.working.as_ref().unwrap();
-    let first_output = document.layers[&1].stages.output_cache.as_ref().unwrap();
-    let raw_glow = &first_output.images[3];
-    assert_eq!((original.source.width(), original.source.height()), (4000, 1));
+    assert_eq!((output.composite.as_ref().unwrap().width(), output.composite.as_ref().unwrap().height()), (4001, 1));
+    let mut first = LayerStages::shared(gpu.clone(), document.source.clone(), Depth::Eight);
+    first.prepare(&settings[0].params, RenderMode::Hq);
+    let original = first.working.as_ref().unwrap().source.clone();
+    let view = req.view;
+    let first_output = first.render_selected(&settings[0].params, RenderMode::Hq, &view, false, false, |_, _, _| {});
+    let raw_glow = &first_output.working_glow;
+    assert_eq!((original.width(), original.height()), (4000, 1));
     assert_eq!((raw_glow.width(), raw_glow.height()), (4000, 1));
-    let expected = gpu.blend(&original.source, raw_glow, B::Screen, settings[0].opacity, 1., Depth::Eight);
-    let below = document.layers[&2].stages.working.as_ref().unwrap();
-    assert_eq!((below.source.width(), below.source.height()), (4000, 1));
-    assert_eq!(gpu.download_rgba32f(&below.source), gpu.download_rgba32f(&expected),
-        "Below must blend original-grid source with raw working glow, not downsample a final-size composite");
+    let expected = gpu.blend(&original, raw_glow, B::Screen, settings[0].opacity, 1., Depth::Eight);
+    let full_below = gpu.blend(&document.source, &first_output.glow, B::Screen, settings[0].opacity, 1., Depth::Eight);
+    let mut second = LayerStages::shared(gpu.clone(), Arc::new(full_below.clone()), Depth::Eight);
+    let mut preparer = LayerStages::shared(gpu.clone(), Arc::new(expected), Depth::Eight);
+    preparer.geometry = document.geometry;
+    preparer.source_is_working = true;
+    preparer.prepare(&settings[1].params, RenderMode::Hq);
+    second.working = preparer.working.take();
+    let second_output = second.render_selected(&settings[1].params, RenderMode::Hq, &view, false, false, |_, _, _| {});
+    let expected = gpu.blend(&full_below, &second_output.glow, B::Screen, 1., 1., Depth::Eight);
+    assert_eq!(gpu.download_rgba32f(output.composite.as_ref().unwrap()), gpu.download_rgba32f(&expected),
+        "Below must use raw working glow, not downsample a final-size composite");
+    assert!(document.layers.is_empty());
+    assert!(document.grids.is_empty());
 }
 
 #[test]
@@ -92,6 +106,43 @@ fn selected_original_xray_only_builds_extraction_and_heatmap() {
 }
 
 #[test]
+fn output_selection_and_hq_release_preserve_owned_results() {
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let mut document = Document::new(gpu.clone(), gpu.fill(3, 3, [0.25, 0.5, 0.8, 1.]), Depth::Eight);
+    let mut settings = [layer(1), layer(2)];
+    settings[1].input = LayerInput::Below;
+    let mut req = request();
+    req.want_glow_composite = true;
+    let full = document.render(&inputs(&settings), &req);
+    req.want_composite = false;
+    req.want_layer_glows = true;
+    let glow_only = document.render(&inputs(&settings), &req);
+    assert!(glow_only.composite.is_none());
+    assert_eq!(glow_only.layer_glows.len(), 2);
+    assert_eq!(gpu.download_rgba32f(glow_only.glow_composite.as_ref().unwrap()),
+        gpu.download_rgba32f(full.glow_composite.as_ref().unwrap()));
+    req.mode = RenderMode::Hq;
+    req.want_glow_composite = false;
+    let hq = document.render(&inputs(&settings), &req);
+    assert!(hq.composite.is_none());
+    assert!(hq.glow_composite.is_none());
+    assert!(document.layers.is_empty());
+    assert!(document.grids.is_empty());
+    assert_eq!(document.retained_bytes(), 0);
+    assert_eq!(gpu.download_rgba32f(&hq.layer_glows[1].1).len(), 36);
+    req.want_layer_glows = false;
+    req.want_xray = true;
+    req.view.xray = true;
+    req.selected = Some(2);
+    let xray = document.render(&inputs(&settings), &req);
+    assert!(xray.composite.is_none());
+    assert!(xray.glow_composite.is_none());
+    assert!(document.layers.is_empty());
+    assert!(document.grids.is_empty());
+    assert_eq!(gpu.download_rgba32f(xray.xray.as_ref().unwrap()).len(), 36);
+}
+
+#[test]
 fn first_below_layer_switches_draft_hq_source_and_matches_cold_reference() {
     let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
     // Crossing the Draft width cap makes a stale Draft source observable in HQ.
@@ -107,23 +158,24 @@ fn first_below_layer_switches_draft_hq_source_and_matches_cold_reference() {
         let mut req = request();
         req.mode = mode;
         let output = document.render(&inputs(&settings), &req);
-        let entry = &document.layers[&1];
-        assert_eq!(entry.input_mode, Some(mode));
-        assert_eq!(entry.stages.source_is_working, mode == RenderMode::Draft);
-        let expected_size = if mode == RenderMode::Draft {
-            document.geometry.working_size(mode)
-        } else { (1501, 1) };
-        assert_eq!((entry.stages.source.width(), entry.stages.source.height()), expected_size);
-        if let Some(previous) = previous {
-            assert_ne!(entry.input_generation, previous, "mode switch must rebuild Below source");
+        if mode == RenderMode::Draft {
+            let entry = &document.layers[&1];
+            assert_eq!(entry.input_mode, Some(mode));
+            assert!(entry.stages.source_is_working);
+            assert_eq!((entry.stages.source.width(), entry.stages.source.height()), document.geometry.working_size(mode));
+            if let Some(previous) = previous {
+                assert_ne!(entry.input_generation, previous, "mode switch must rebuild Below source");
+            }
+            previous = Some(entry.input_generation);
+            assert!(document.grids.iter().all(|grid| grid.input == 0 || grid.input == entry.input_generation));
+        } else {
+            assert!(document.layers.is_empty());
+            assert!(document.grids.is_empty());
         }
-        previous = Some(entry.input_generation);
-        assert!(document.grids.iter().all(|grid| grid.input == 0 || grid.input == entry.input_generation),
-            "mode switch must remove the stale Below grid");
 
-        let mut reference = Document::new(gpu.clone(), gpu.copy(&document.source), Depth::Eight);
+        let mut reference = Document::new(gpu.clone(), document.source.as_ref().clone(), Depth::Eight);
         let cold = reference.render(&inputs(&settings), &req);
-        assert_eq!(gpu.download_rgba32f(&output.composite), gpu.download_rgba32f(&cold.composite));
+        assert_eq!(gpu.download_rgba32f(output.composite.as_ref().unwrap()), gpu.download_rgba32f(cold.composite.as_ref().unwrap()));
     }
 }
 
@@ -211,7 +263,7 @@ fn document_budget_counts_shared_grids_stages_and_masks_and_evicts_across_layers
     let per_layer: Vec<_> = document.layers.values().map(|layer| layer.stages.retained_bytes()).collect();
     let total = document.retained_bytes();
     assert_eq!(total, per_layer.iter().sum::<u64>() - shared_grid + masks,
-        "shared working images and aliased stage images count once; copied layer masks count separately");
+        "shared working images and aliased stage images count once; mutable mask snapshots count separately");
 
     // Both layers fit separately. Only a document-wide budget must evict here.
     document.budget = total - 1;
@@ -279,7 +331,7 @@ fn benchmark_three_layer_fx_draft_cold_and_top_layer_edit() {
     let req = request();
     let cold = Instant::now();
     let output = document.render(&inputs(&settings), &req);
-    let pixels = gpu.download_rgba32f(&output.composite);
+    let pixels = gpu.download_rgba32f(output.composite.as_ref().unwrap());
     let cold = cold.elapsed();
     assert_eq!(pixels.len(), 512 * 512 * 4);
     assert!(pixels.iter().all(|value| value.is_finite()));
@@ -287,7 +339,7 @@ fn benchmark_three_layer_fx_draft_cold_and_top_layer_edit() {
     settings[2].params.threshold += 0.1;
     let edit = Instant::now();
     let output = document.render(&inputs(&settings), &req);
-    let pixels = gpu.download_rgba32f(&output.composite);
+    let pixels = gpu.download_rgba32f(output.composite.as_ref().unwrap());
     let edit = edit.elapsed();
     assert_eq!(pixels.len(), 512 * 512 * 4);
     assert!(pixels.iter().all(|value| value.is_finite()));

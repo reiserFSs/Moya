@@ -366,7 +366,9 @@ impl App {
                             ("Outlines", MaskKind::Outlines, "Build from image edges"),
                         ] {
                             if ui.button(name).on_hover_text(tip).clicked() {
-                                if let Some(pic) = &self.picture { self.layers[index].mask.build(pic, kind); }
+                                if let Some(renderer) = &self.renderer {
+                                    self.layers[index].mask.build(&self.gpu, renderer.source(), kind);
+                                }
                             }
                         }
                         if ui.button("Load image…").on_hover_text("Load an image as a mask, resampled to the current image size").clicked() {

@@ -6,6 +6,13 @@
 //! vibrance, colorize and Highlights Flatten are calibrated approximations.
 //! Depth conversions use explicit sRGB.
 //! Operation-specialized pipelines are compiled once per device; dropping images recycles their textures.
+//! Image clones share immutable storage; only the last alias returns its texture.
+//! `trim_idle` releases oldest pooled textures, while `memory_stats` reports
+//! texture payload and a resettable texture-plus-explicit-buffer high-water mark.
+//! Opaque upload staging, the 16-byte dummy and driver overhead are excluded from the high-water mark.
+//! `download_rows` reuses at most 256 rows of staging; `download_row_range` supports
+//! pull-based encoders. Gray u16 transfers preserve CPU mask quantization exactly.
+//! Source masks reproduce CPU luminosity, alpha and four-neighbor outline math.
 //! Long-span motion fuses up to four Hillis-Steele scan passes, retaining each
 //! f32 addition's original operands and order; flags skip unused final stages.
 //! Set `MOYA_PROFILE_OPS` before the first operation to profile each dispatch's
@@ -15,6 +22,9 @@
 //! Stderr records: `MOYA_PROFILE_OPS op=<u32> w=<u32> h=<u32> ms=<decimal>`.
 pub use wgpu;
 pub mod reference;
+mod masks;
+pub use masks::MaskSourceKind;
+mod transfers;
 use parking_lot::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
@@ -52,6 +62,16 @@ pub struct GradientStop {
     pub pos: f32,
     pub rgb: [f32; 3],
 }
+/// Logical RGBA32F texture payload; excludes staging buffers and driver overhead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuMemoryStats {
+    pub live_bytes: u64,
+    pub idle_bytes: u64,
+    pub live_count: u64,
+    pub idle_count: u64,
+    /// High-water live texture + explicit buffer bytes; excludes opaque driver/upload staging.
+    pub peak_live_bytes: u64,
+}
 /// Idle RGBA32F textures retain at most 64 times the largest requested texture,
 /// with a 512 MiB floor and 2 GiB ceiling; live images are never evicted.
 struct TexturePool {
@@ -59,6 +79,10 @@ struct TexturePool {
     bytes: u64,
     budget: u64,
     clock: u64,
+    live_bytes: u64,
+    live_count: u64,
+    buffer_bytes: u64,
+    peak_live_bytes: u64,
 }
 impl TexturePool {
     fn new(budget: u64) -> Self {
@@ -67,6 +91,10 @@ impl TexturePool {
             bytes: 0,
             budget,
             clock: 0,
+            live_bytes: 0,
+            live_count: 0,
+            buffer_bytes: 0,
+            peak_live_bytes: 0,
         }
     }
     fn grow_budget(&mut self, w: u32, h: u32) {
@@ -79,21 +107,7 @@ impl TexturePool {
         if bytes > self.budget {
             return;
         }
-        while self.bytes > self.budget - bytes {
-            // ponytail: scan size buckets on eviction; index ages if this becomes hot.
-            let oldest = *self
-                .by_size
-                .iter()
-                .min_by_key(|(_, textures)| textures.front().unwrap().0)
-                .unwrap()
-                .0;
-            let textures = self.by_size.get_mut(&oldest).unwrap();
-            textures.pop_front();
-            self.bytes -= u64::from(oldest.0) * u64::from(oldest.1) * 16;
-            if textures.is_empty() {
-                self.by_size.remove(&oldest);
-            }
-        }
+        self.trim(self.budget - bytes);
         self.clock += 1;
         self.by_size
             .entry(size)
@@ -110,10 +124,38 @@ impl TexturePool {
         }
         Some(texture)
     }
+    fn trim(&mut self, keep_bytes: u64) {
+        while self.bytes > keep_bytes {
+            // ponytail: scan size buckets on eviction; index ages if this becomes hot.
+            let oldest = *self.by_size.iter()
+                .min_by_key(|(_, textures)| textures.front().unwrap().0).unwrap().0;
+            let textures = self.by_size.get_mut(&oldest).unwrap();
+            textures.pop_front();
+            self.bytes -= u64::from(oldest.0) * u64::from(oldest.1) * 16;
+            if textures.is_empty() { self.by_size.remove(&oldest); }
+        }
+    }
 }
 type Pool = Mutex<TexturePool>;
+#[derive(Clone)]
+struct TrackedBuffer(Arc<BufferLease>);
+struct BufferLease {
+    buffer: wgpu::Buffer,
+    pool: Weak<Pool>,
+}
+impl std::ops::Deref for TrackedBuffer {
+    type Target = wgpu::Buffer;
+    fn deref(&self) -> &Self::Target { &self.0.buffer }
+}
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.lock().buffer_bytes -= self.buffer.size();
+        }
+    }
+}
 struct Producer {
-    uniform: wgpu::Buffer,
+    uniform: TrackedBuffer,
     generation: u64,
     epoch: u64,
     rounded: bool,
@@ -130,11 +172,14 @@ struct Pending {
     generation: u64,
     epoch: u64,
     profile: Option<Profile>,
+    buffers: Vec<TrackedBuffer>,
+    transient_textures: Vec<(wgpu::Texture, u64)>,
 }
 pub struct Image {
     texture: wgpu::Texture,
     pool: Weak<Pool>,
     producer: Option<Producer>,
+    lease: Arc<ImageLease>,
 }
 impl Image {
     pub fn width(&self) -> u32 {
@@ -146,12 +191,26 @@ impl Image {
     pub fn texture(&self) -> &wgpu::Texture {
         &self.texture
     }
+    /// Stable identity shared by aliases of the same live texture.
+    pub fn storage_id(&self) -> usize { Arc::as_ptr(&self.lease) as usize }
 }
-impl Drop for Image {
+struct ImageLease {
+    texture: wgpu::Texture,
+    pool: Weak<Pool>,
+}
+impl Drop for ImageLease {
     fn drop(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
-            pool.lock().insert(self.texture.clone());
+            let mut pool = pool.lock();
+            pool.live_bytes -= u64::from(self.texture.width()) * u64::from(self.texture.height()) * 16;
+            pool.live_count -= 1;
+            pool.insert(self.texture.clone());
         }
+    }
+}
+impl Clone for Image {
+    fn clone(&self) -> Self {
+        Self { texture: self.texture.clone(), pool: self.pool.clone(), producer: None, lease: self.lease.clone() }
     }
 }
 /// Reuses byte-identical Gaussian reductions of one immutable source.
@@ -196,6 +255,7 @@ pub struct Gpu {
     pipelines: [wgpu::ComputePipeline; 35],
     display: wgpu::ComputePipeline,
     gray_upload: OnceLock<wgpu::ComputePipeline>,
+    mask_source: OnceLock<wgpu::ComputePipeline>,
     layout: wgpu::BindGroupLayout,
     display_layout: wgpu::BindGroupLayout,
     dummy: wgpu::Texture,
@@ -346,6 +406,7 @@ impl Gpu {
             pipelines,
             display,
             gray_upload: OnceLock::new(),
+            mask_source: OnceLock::new(),
             layout,
             display_layout,
             dummy,
@@ -357,6 +418,30 @@ impl Gpu {
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
+    /// Release idle textures oldest-first without evicting live images or changing the pool budget.
+    pub fn trim_idle(&self, keep_bytes: u64) {
+        self.pool.lock().trim(keep_bytes);
+    }
+    pub fn memory_stats(&self) -> GpuMemoryStats {
+        let pool = self.pool.lock();
+        GpuMemoryStats {
+            live_bytes: pool.live_bytes, live_count: pool.live_count,
+            idle_bytes: pool.bytes,
+            idle_count: pool.by_size.values().map(|v| v.len() as u64).sum(),
+            peak_live_bytes: pool.peak_live_bytes,
+        }
+    }
+    /// Reset the high-water mark to the currently live payload, not zero.
+    pub fn reset_peak(&self) {
+        let mut pool = self.pool.lock();
+        pool.peak_live_bytes = pool.live_bytes + pool.buffer_bytes;
+    }
+    fn track_buffer(&self, buffer: wgpu::Buffer) -> TrackedBuffer {
+        let mut pool = self.pool.lock();
+        pool.buffer_bytes += buffer.size();
+        pool.peak_live_bytes = pool.peak_live_bytes.max(pool.live_bytes + pool.buffer_bytes);
+        TrackedBuffer(Arc::new(BufferLease { buffer, pool: Arc::downgrade(&self.pool) }))
+    }
     pub fn flush(&self) {
         let mut pending = self.pending.lock();
         self.complete_profile(&mut pending);
@@ -366,6 +451,16 @@ impl Gpu {
         if let Some(encoder) = pending.encoder.take() {
             self.queue.submit([encoder.finish()]);
             pending.epoch += 1;
+            let buffers = std::mem::take(&mut pending.buffers);
+            let textures = std::mem::take(&mut pending.transient_textures);
+            let pool = Arc::downgrade(&self.pool);
+            self.queue.on_submitted_work_done(move || {
+                if let Some(pool) = pool.upgrade() {
+                    pool.lock().buffer_bytes -= textures.iter().map(|(_, bytes)| bytes).sum::<u64>();
+                }
+                drop(textures);
+            });
+            self.queue.on_submitted_work_done(move || drop(buffers));
         }
     }
     fn complete_profile(&self, pending: &mut Pending) {
@@ -404,9 +499,13 @@ impl Gpu {
         let texture = {
             let mut pool = self.pool.lock();
             pool.grow_budget(w, h);
+            pool.live_bytes += u64::from(w) * u64::from(h) * 16;
+            pool.live_count += 1;
+            pool.peak_live_bytes = pool.peak_live_bytes.max(pool.live_bytes + pool.buffer_bytes);
             pool.take((w, h))
         }.unwrap_or_else(|| Self::texture_new(&self.device, w, h));
         Image {
+            lease: Arc::new(ImageLease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) }),
             texture,
             pool: Arc::downgrade(&self.pool),
             producer: None,
@@ -417,6 +516,12 @@ impl Gpu {
         profile: Option<Profile>,
         f: impl FnOnce(&mut wgpu::CommandEncoder),
     ) -> (u64, u64) {
+        self.record_buffers(profile, &[], f)
+    }
+    fn record_buffers(&self, profile: Option<Profile>, buffers: &[TrackedBuffer], f: impl FnOnce(&mut wgpu::CommandEncoder)) -> (u64, u64) {
+        self.record_resources(profile, buffers, &[], f)
+    }
+    fn record_resources(&self, profile: Option<Profile>, buffers: &[TrackedBuffer], textures: &[(wgpu::Texture, u64)], f: impl FnOnce(&mut wgpu::CommandEncoder)) -> (u64, u64) {
         let mut pending = self.pending.lock();
         self.complete_profile(&mut pending);
         let encoder = pending.encoder.get_or_insert_with(|| {
@@ -428,6 +533,8 @@ impl Gpu {
         f(encoder);
         pending.generation += 1;
         pending.profile = profile;
+        pending.buffers.extend_from_slice(buffers);
+        pending.transient_textures.extend_from_slice(textures);
         (pending.generation, pending.epoch)
     }
     /// Upload straight-alpha RGBA32F using staging bands bounded by the device buffer limit.
@@ -487,6 +594,12 @@ impl Gpu {
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
+        let source_bytes = u64::from(w) * u64::from(h) * 4;
+        {
+            let mut pool = self.pool.lock();
+            pool.buffer_bytes += source_bytes;
+            pool.peak_live_bytes = pool.peak_live_bytes.max(pool.live_bytes + pool.buffer_bytes);
+        }
         self.upload_bands(source.as_image_copy(), source.size(), 4, gray, cap);
         let image = self.image(w, h);
         let pipeline = self.gray_upload.get_or_init(|| {
@@ -538,7 +651,7 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&target_view) },
             ],
         });
-        self.record(None, |encoder| {
+        self.record_resources(None, &[], &[(source.clone(), source_bytes)], |encoder| {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &group, &[]);
@@ -568,47 +681,12 @@ impl Gpu {
         self.download_rgba32f_capped(img, self.device.limits().max_buffer_size)
     }
     fn download_rgba32f_capped(&self, img: &Image, cap: u64) -> Vec<f32> {
-        let pitch = (img.width() * 16).div_ceil(256) * 256;
-        let rows = Self::transfer_rows(img.width(), 16, cap.min(self.device.limits().max_buffer_size));
+        let rows = Self::transfer_rows(img.width(), 16, cap.min(self.device.limits().max_buffer_size)).min(256);
         let mut result = Vec::with_capacity(img.width() as usize * img.height() as usize * 4);
-        for y in (0..img.height()).step_by(rows as usize) {
-            let height = rows.min(img.height() - y);
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Moya readback band"),
-                size: u64::from(pitch) * u64::from(height),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            self.record(None, |e| {
-                let mut source = img.texture.as_image_copy();
-                source.origin.y = y;
-                e.copy_texture_to_buffer(
-                    source,
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(pitch),
-                            rows_per_image: Some(height),
-                        },
-                    },
-                    wgpu::Extent3d { width: img.width(), height, depth_or_array_layers: 1 },
-                )
-            });
-            self.flush();
-            let (tx, rx) = std::sync::mpsc::channel();
-            buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-            self.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU polling failed");
-            rx.recv().unwrap().expect("GPU readback failed");
-            let bytes = buffer.slice(..).get_mapped_range().expect("mapped readback range");
-            for row in bytes.chunks_exact(pitch as usize) {
-                result.extend_from_slice(bytemuck::cast_slice(&row[..img.width() as usize * 16]));
-            }
-            drop(bytes);
-            buffer.unmap();
-        }
+        self.download_rows(img, rows, |_, _, rgba| {
+            result.extend_from_slice(rgba);
+            Ok(())
+        }).expect("GPU readback failed");
         result
     }
     pub fn write_display_rgba8(&self, img: &Image, target: &wgpu::Texture) {
@@ -665,20 +743,16 @@ impl Gpu {
             });
         let mut params = [0f32; 32];
         params[4..4 + args.len()].copy_from_slice(args);
-        let uniform = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let uniform = self.track_buffer(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&params),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let storage = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            }));
+        let storage = self.track_buffer(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(if stops.is_empty() { &[[0.; 4]] } else { stops }),
                 usage: wgpu::BufferUsages::STORAGE,
-            });
+            }));
         let views: Vec<_> = (0..3)
             .map(|i| {
                 inputs
@@ -715,7 +789,7 @@ impl Gpu {
             layout: &self.layout,
             entries: &entries,
         });
-        let (generation, epoch) = self.record(start.map(|start| Profile { start, op, w, h }), |e| {
+        let (generation, epoch) = self.record_buffers(start.map(|start| Profile { start, op, w, h }), &[uniform.clone(), storage], |e| {
             let mut pass = e.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.pipelines[op as usize]);
             pass.set_bind_group(0, &group, &[]);
@@ -1097,7 +1171,7 @@ impl Gpu {
         }
         {
             let pending = self.pending.lock();
-            if img.pool.as_ptr() == Arc::as_ptr(&self.pool) {
+            if img.pool.as_ptr() == Arc::as_ptr(&self.pool) && Arc::strong_count(&img.lease) == 1 {
                 if let Some(producer) = &mut img.producer {
                     if producer.generation == pending.generation
                         && producer.epoch == pending.epoch

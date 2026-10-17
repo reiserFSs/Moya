@@ -3,7 +3,7 @@ use crate::{App, bridge, layers, workers};
 use eframe::egui;
 use moya_core::{LayerBlend, RenderMode};
 use moya_gpu::{Depth, Gpu, Image};
-use moya_io::{Picture, SampleDepth};
+use moya_io::SampleDepth;
 use moya_pipeline::{LayerInputs, RenderRequest, ViewFlags};
 
 impl App {
@@ -18,6 +18,7 @@ impl App {
         self.session_ready = false;
         self.send_pending = false;
         self.sending = None;
+        self.trim_idle();
         self.loader.invalidate();
         self.loading = None;
     }
@@ -44,6 +45,7 @@ impl App {
                 self.status = "Sending to Photoshop…".into();
             }
             Err(error) => {
+                self.trim_idle();
                 self.status = format!("Send failed: {error:#}");
                 self.bridge_reply(serde_json::json!({"type":"error","id":session.id,"message":self.status}));
             }
@@ -70,18 +72,21 @@ impl App {
             view: ViewFlags { xray: false, solo: false, host_is_float: session.document.depth == 32 },
             selected: Some(self.selected),
             solo_layer: None,
+            want_composite: session.return_mode == bridge::ReturnMode::Composite,
+            want_glow_composite: false,
             want_layer_glows: session.return_mode == bridge::ReturnMode::Layers,
             want_xray: false,
         };
         let output = renderer.render(&bridge_inputs(&settings, &self.layers), &request);
         let stem = session.source.file_stem().unwrap_or_default().to_string_lossy();
-        let mut pictures = Vec::with_capacity(self.layers.len().max(1));
+        let mut images = Vec::with_capacity(self.layers.len().max(1));
         let mut returned = Vec::with_capacity(self.layers.len());
         let composite = if session.return_mode == bridge::ReturnMode::Composite {
             let path = session.source.with_file_name(format!("{stem}.moya.tif"));
             let from = if !settings.iter().any(|layer| layer.visible) { target }
                 else if session.document.depth == 32 { Depth::Float } else { Depth::Eight };
-            pictures.push((path.clone(), bridge_picture(&self.gpu, &output.composite, from, target, depth, false, &icc)));
+            let image = output.composite.as_ref().ok_or_else(|| anyhow::anyhow!("Missing rendered composite"))?;
+            images.push((path.clone(), bridge_image(&self.gpu, image, from, target, depth, false, &icc)));
             Some(path)
         } else {
             for (index, layer) in self.layers.iter().enumerate() {
@@ -96,7 +101,7 @@ impl App {
                     hidden.layer_glows.iter().find(|(id, _)| *id == layer.settings.id).map(|(_, image)| image)
                 }.ok_or_else(|| anyhow::anyhow!("Missing rendered glow for layer {}", layer.settings.id))?;
                 let path = session.source.with_file_name(format!("{stem}.moya-layer-{}.tif", index + 1));
-                pictures.push((path.clone(), bridge_picture(&self.gpu, glow, Depth::Eight, target, depth, true, &icc)));
+                images.push((path.clone(), bridge_image(&self.gpu, glow, Depth::Eight, target, depth, true, &icc)));
                 returned.push(bridge::ResultLayer {
                     path, name: layer.settings.name.clone(),
                     blend: match layer.settings.blend {
@@ -118,7 +123,7 @@ impl App {
         result.validate()?;
         let mut message = serde_json::to_value(result)?;
         message["type"] = serde_json::json!("result");
-        Ok((workers::SendBatch::new(self.egui_ctx.clone(), pictures, depth, project_path, project), message))
+        Ok((workers::SendBatch::new(self.egui_ctx.clone(), self.gpu.clone(), images, project_path, project), message))
     }
 
     pub(super) fn poll_bridge(&mut self) {
@@ -153,11 +158,13 @@ impl App {
                     if self.session.as_ref().is_some_and(|session| session.id == id) {
                         if let Some((batch, _)) = self.sending.take() { batch.keep_output(); }
                         self.status = "Placed in Photoshop".into();
+                        self.trim_idle();
                     }
                 }
                 bridge::Event::Error { id, message } => {
                     if self.session.as_ref().is_some_and(|session| session.id == id) {
                         self.sending = None;
+                        self.trim_idle();
                         self.status = format!("Photoshop: {message}");
                     }
                 }
@@ -183,20 +190,14 @@ impl App {
                     }
                 }
             }
+            self.trim_idle();
         }
     }
 }
 
-fn bridge_picture(gpu: &Gpu, image: &Image, from: Depth, to: Depth, depth: SampleDepth, opaque: bool, icc: &Option<Vec<u8>>) -> Picture {
-    let converted = (from != to).then(|| gpu.convert_depth(image, from, to));
-    let image = converted.as_ref().unwrap_or(image);
-    let mut rgba = gpu.download_rgba32f(image);
-    if opaque {
-        for pixel in rgba.chunks_exact_mut(4) {
-            pixel[0] *= pixel[3]; pixel[1] *= pixel[3]; pixel[2] *= pixel[3]; pixel[3] = 1.0;
-        }
-    }
-    Picture { width: image.width(), height: image.height(), depth, rgba, icc_profile: icc.clone() }
+fn bridge_image(gpu: &Gpu, image: &Image, from: Depth, to: Depth, depth: SampleDepth, opaque: bool, icc: &Option<Vec<u8>>) -> workers::ExportImage {
+    let image = if from != to { gpu.convert_depth(image, from, to) } else { image.clone() };
+    workers::ExportImage { image, depth, opaque, icc_profile: icc.clone() }
 }
 
 fn bridge_inputs<'a>(settings: &'a [moya_core::LayerSettings], layers: &'a [layers::Layer]) -> Vec<LayerInputs<'a>> {

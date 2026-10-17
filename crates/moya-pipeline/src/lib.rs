@@ -3,7 +3,7 @@
 //! Draft caches a bilinear 1500-wide/1300-tall working copy; HQ caps the long side
 //! at 4000 and returns original-size layers. Glow copies are blurred and merged
 //! one at a time. Depth switches include sRGB transfer and Photoshop quantization.
-//! Latest-stage caches are byte-bounded; checkpoint renders replay every stage.
+//! Draft stage caches are byte-bounded; HQ releases stages as soon as consumed.
 //! Stage keys omit ignored extraction sliders and key glow's glare side effects
 //! by their activation conditions, not by the glare-only slider magnitudes.
 //! Auto-update is a UI scheduling gate: callers decide whether to invoke `render`.
@@ -19,6 +19,8 @@ struct RenderOutput {
     /// Heat map at full opacity; the view applies its 80% layer opacity.
     pub xray: Image,
     pub composite: Image,
+    pub working_glow: Image,
+    pub generation: u64,
 }
 #[derive(Clone, Copy)]
 pub struct ViewFlags { pub xray: bool, pub solo: bool, pub host_is_float: bool }
@@ -61,7 +63,7 @@ stage_key!(ToneParams { tonemap:bool, exposure:f32, gamma:f32, colorize:bool, sa
 struct ToneKey { params: ToneParams, glare: u64 }
 stage_key!(CaKey { hdr32:bool, ca_on:bool, ca_distance:f32, rays_center:[f32;2], ca_channels:CaChannels, ca_direction:f32, ca_type:CaType, ca_blur:f32, ca_mix:bool, ca_intensity:f32 });
 #[derive(PartialEq)]
-struct OutputKey { ca:u64, heatmap:u64, mode:RenderMode, unmult:bool, hdr32:bool, xray:bool, solo:bool, host_is_float:bool, detail:bool }
+struct OutputKey { ca:u64, heatmap:u64, mode:RenderMode, unmult:bool, hdr32:bool, xray:bool, solo:bool, host_is_float:bool, detail:bool, want_composite:bool, want_xray:bool }
 /// Latest result per stage, with upstream generations rather than whole-Params keys.
 struct LayerStages {
     gpu: Arc<Gpu>, source: Arc<Image>, host_depth: Depth, geometry: DocGeometry,
@@ -90,9 +92,9 @@ impl LayerStages {
     #[cfg(test)]
     fn retained_bytes(&self)->u64 {
         // At most 18 image slots; avoid allocating a set on the render path.
-        let mut seen=[std::ptr::null::<Image>();18]; let mut count=0; let mut bytes=0;
+        let mut seen=[0usize;18]; let mut count=0; let mut bytes=0;
         let mut account=|image:&Image| {
-            let identity=image as *const Image;
+            let identity=image.storage_id();
             if !seen[..count].contains(&identity) {
                 seen[count]=identity; count+=1; bytes+=image_bytes(image);
             }
@@ -240,7 +242,15 @@ impl LayerStages {
     }
     /// Render with borrowed native-depth stages. The ordinary render uses an
     /// inlined no-op closure, so it performs no readbacks or checkpoint copies.
+    #[cfg(test)]
     pub fn render_with_checkpoints(&mut self,params:&Params,mode:RenderMode,view:&ViewFlags,mut checkpoint:impl FnMut(&str,&Image,Depth))->RenderOutput {
+        self.render_selected(params,mode,view,true,true,&mut checkpoint)
+    }
+    fn render_selected(&mut self,params:&Params,mode:RenderMode,view:&ViewFlags,want_composite:bool,want_xray:bool,mut checkpoint:impl FnMut(&str,&Image,Depth))->RenderOutput {
+        let hq=mode==RenderMode::Hq;
+        // Draft retains the same complete output cache across stack/view requests.
+        let (want_composite,want_xray)=if hq {(want_composite,want_xray)} else {(true,true)};
+        if hq {self.clear_stage_cache();}
         let mut p=params.clone(); p.sanitize(); self.prepare(&p,mode);
         let g=self.gpu.clone(); let working=self.working.as_ref().unwrap().clone();
         let extraction_generation=self.ensure_extraction(&p);
@@ -269,6 +279,8 @@ impl LayerStages {
         checkpoint("exposure_depth",&exposure.images[2],depth);
         let exposure_generation=exposure.generation;
         let exposure_v=exposure.images[0].clone(); let exposure_core=exposure.images[1].clone();
+        drop(extraction);
+        if hq {self.extraction_cache=None; self.exposure_cache=None;}
         let glare_key=GlareKey::new(exposure_generation,&p);
         if !self.glare_cache.as_ref().is_some_and(|c|c.key==glare_key) {
             self.glare_cache=None; self.tone_cache=None; self.ca_cache=None; self.output_cache=None;
@@ -324,6 +336,8 @@ impl LayerStages {
         checkpoint("merged_glow",&merged.images[0],depth);
         let tone_key=ToneKey{params:ToneParams::new(merged.generation,&p),glare:glare_generation};
         let merged_glow=merged.images[0].clone(); let merged_core=merged.images[1].clone();
+        drop(exposure_v); drop(exposure_core);
+        if hq {self.glow_cache=None; self.glare_cache=None;}
         if !self.tone_cache.as_ref().is_some_and(|c|c.key==tone_key) {
         self.tone_cache=None; self.ca_cache=None; self.output_cache=None;
         let mut glow=merged_glow; let mut core=merged_core;
@@ -392,6 +406,7 @@ impl LayerStages {
         checkpoint("glare_composite",&tone.images[2],tone.depths[2]);
         checkpoint("final_glow",&tone.images[0],Depth::Eight);
         let ca_key=CaKey::new(tone.generation,&p); let bp=tone.images[0].clone();
+        if hq {self.tone_cache=None;}
         if !self.ca_cache.as_ref().is_some_and(|c|c.key==ca_key) {
             self.ca_cache=None; self.output_cache=None;
             let ca=self.ca(&bp,&p,mode);
@@ -400,16 +415,23 @@ impl LayerStages {
         let ca=self.ca_cache.as_ref().unwrap();
         checkpoint("ca",&ca.images[0],ca.depths[0]);
         let output_key=OutputKey{ca:ca.generation,heatmap:heatmap_generation,mode,unmult:p.unmult,hdr32:p.hdr32,
-            xray:view.xray,solo:view.solo,host_is_float:view.host_is_float,detail:p.glare_on&&p.glare_detail>0.};
+            xray:view.xray,solo:view.solo,host_is_float:view.host_is_float,detail:p.glare_on&&p.glare_detail>0.,want_composite,want_xray};
         let ca_image=ca.images[0].clone();
+        drop(bp);
+        if hq {self.ca_cache=None; self.heatmap_cache=None;}
+        let working_source=if hq {self.source.as_ref().clone()} else {working.source.clone()};
+        if hq {self.working=None;}
+        drop(working);
         if !self.output_cache.as_ref().is_some_and(|c|c.key==output_key) {
             self.output_cache=None;
-            let output=self.finish(&p,mode,view,&ca_image,&heatmap,&working.source);
+            let output=self.finish(&p,mode,view,&ca_image,&heatmap,&working_source,want_composite,want_xray);
             self.output_cache=Some(self.cached(output_key,output,vec![]));
         }
         let output=self.output_cache.as_ref().unwrap();
         checkpoint("output",&output.images[0],Depth::Eight);
-        let output=RenderOutput{glow:g.copy(&output.images[0]),xray:g.copy(&output.images[1]),composite:g.copy(&output.images[2])};
+        let output=RenderOutput{glow:output.images[0].as_ref().clone(),xray:output.images[1].as_ref().clone(),composite:output.images[2].as_ref().clone(),
+            working_glow:output.images[3].as_ref().clone(),generation:output.generation};
+        if hq {self.clear_stage_cache();self.working=None;}
         output
     }
     fn blur_layer(&self,v:&Image,p:&Params,mode:RenderMode,i:usize,blur_source:&mut moya_gpu::BlurSource)->Image {
@@ -554,7 +576,7 @@ impl LayerStages {
         }
         image
     }
-    fn finish(&self,p:&Params,mode:RenderMode,view:&ViewFlags,ca:&Image,heatmap:&Arc<Image>,working_source:&Image)->Vec<Arc<Image>> {
+    fn finish(&self,p:&Params,mode:RenderMode,view:&ViewFlags,ca:&Image,heatmap:&Arc<Image>,working_source:&Image,want_composite:bool,want_xray:bool)->Vec<Arc<Image>> {
         let g=&self.gpu;
         let depth=if p.hdr32 {Depth::Float} else {Depth::Sixteen};
         let glow=if p.unmult && (view.solo || mode==RenderMode::Hq) {
@@ -564,7 +586,7 @@ impl LayerStages {
         } else {g.convert_depth(ca,depth,Depth::Eight)};
         let working_glow=Arc::new(glow);
         let mut glow=working_glow.clone();
-        let xray=self.output_heatmap(heatmap,p,mode);
+        let xray=if want_xray || (want_composite && view.xray) {self.output_heatmap(heatmap,p,mode)} else {working_glow.clone()};
         let source=if mode==RenderMode::Hq {self.source.as_ref()} else {working_source};
         // HQ returns original document dimensions even when the 4000px working cap applies.
         if mode==RenderMode::Hq && (glow.width(),glow.height())!=(self.geometry.orig_w,self.geometry.orig_h) {
@@ -573,9 +595,9 @@ impl LayerStages {
         // HQ hides the source inside the element, but the host composites that
         // element over the original document. Solo is the only source-free view.
         let hidden=view.solo;
-        let transparent=hidden.then(||g.fill(glow.width(),glow.height(),[0.;4]));
+        let transparent=(want_composite && hidden).then(||g.fill(glow.width(),glow.height(),[0.;4]));
         let base=transparent.as_ref().unwrap_or(source);
-        let composite=if view.xray {
+        let composite=if !want_composite {glow.as_ref().clone()} else if view.xray {
             let base=g.convert_depth(&base,self.host_depth,Depth::Eight);
             g.blend(&base,&xray,B::Normal,0.8,1.,Depth::Eight)
         } else if view.host_is_float && !hidden {
@@ -623,10 +645,22 @@ mod tests {
         assert_eq!(renderer.retained_bytes(),0);
     }
     #[test]
+    fn hq_releases_stage_caches_and_shares_selected_output() {
+        let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
+        let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Eight);
+        let p=Params{radius:2.,glow_iterations:1.,..Params::default()};
+        let view=ViewFlags{xray:false,solo:false,host_is_float:false};
+        let selected=renderer.render_selected(&p,RenderMode::Hq,&view,true,false,|_,_,_| {});
+        assert_eq!(renderer.retained_bytes(),0);
+        let all=renderer.render(&p,RenderMode::Hq,&view);
+        assert_eq!(renderer.retained_bytes(),0);
+        assert_eq!(gpu.download_rgba32f(&selected.composite),gpu.download_rgba32f(&all.composite));
+    }
+    #[test]
     fn inactive_slider_changes_reuse_stage_generations() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
         let view=ViewFlags{xray:false,solo:false,host_is_float:false};
-        for mode in [RenderMode::Draft,RenderMode::Hq] {
+        for mode in [RenderMode::Draft] {
             for hdr32 in [false,true] {
                 for glare_on in [false,true] {
                     let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Float);
@@ -652,7 +686,7 @@ mod tests {
     fn ignored_extraction_sliders_reuse_stage_generations() {
         let gpu=Arc::new(Gpu::new_blocking().expect("headless GPU"));
         let view=ViewFlags{xray:false,solo:false,host_is_float:false};
-        for mode in [RenderMode::Draft,RenderMode::Hq] {
+        for mode in [RenderMode::Draft] {
             for colorize in [false,true] {
                 let mut renderer=LayerStages::new(gpu.clone(),gpu.fill(3,3,[0.25,0.5,0.8,1.]),Depth::Float);
                 let mut p=Params{radius:2.,glow_iterations:1.,colorize,..Params::default()};

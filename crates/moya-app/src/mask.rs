@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, VecDeque}, path::Path, time::{Duration, Instant}};
 use eframe::egui::{self, Color32, TextureHandle};
-use moya_gpu::{Gpu, Image};
+use moya_gpu::{Gpu, Image, MaskSourceKind};
 use moya_io::Picture;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,13 +24,14 @@ impl HistoryEntry {
         }
     }
 }
-struct Stroke { erase: bool, last: Option<[f32; 2]>, pixels: HashMap<u32, (f32, f32)> }
+struct Stroke { erase: bool, last: Option<[f32; 2]>, pixels: HashMap<u32, (u16, f32)> }
 
+/// Editable pixels and undo share exact normalized u16 values; float conversion is transient.
 pub struct Mask {
     pub enabled: bool, pub tool: Tool, pub brush: BrushSettings, pub view: MaskView,
     pub overlay_opacity: f32, pub combine: Combine, pub lum_range: [f32; 2],
     pub feather: f32, pub grow: f32,
-    w: u32, h: u32, data: Vec<f32>, sum: f64, fingerprint: u64, dirty: Option<[u32; 4]>,
+    w: u32, h: u32, data: Vec<u16>, sum: u64, fingerprint: u64, dirty: Option<[u32; 4]>,
     image: Option<Image>, overlay: Option<TextureHandle>, thumb: Option<TextureHandle>, gpu_generation: u64,
     stroke: Option<Stroke>, past: VecDeque<HistoryEntry>, future: Vec<HistoryEntry>,
     history_bytes: usize, history_limit: usize, steps: usize, evicted: usize,
@@ -40,7 +41,7 @@ pub struct Mask {
 impl Default for Mask {
     fn default() -> Self {
         Self { enabled: false, tool: Tool::None, brush: BrushSettings { size: 30.0, hardness: 0.75, opacity: 1.0 }, view: MaskView::Overlay, overlay_opacity: 0.4, combine: Combine::Replace, lum_range: [0.0, 1.0], feather: 5.0, grow: 5.0,
-            w: 0, h: 0, data: Vec::new(), sum: 0.0, fingerprint: 0, dirty: None, image: None, overlay: None, thumb: None, gpu_generation: 0,
+            w: 0, h: 0, data: Vec::new(), sum: 0, fingerprint: 0, dirty: None, image: None, overlay: None, thumb: None, gpu_generation: 0,
             stroke: None, past: VecDeque::new(), future: Vec::new(), history_bytes: 0, history_limit: 256 * 1024 * 1024, steps: 0, evicted: 0,
             committed: false, preview_pending: false, last_preview: Instant::now() - Duration::from_secs(1), appearance: (MaskView::Overlay, 0.4), was_enabled: false }
     }
@@ -49,18 +50,16 @@ impl Mask {
     pub fn reset(&mut self, w: u32, h: u32) {
         let generation = self.gpu_generation;
         *self = Self::default(); self.w = w; self.h = h; self.gpu_generation = generation;
-        self.data = vec![0.0; w as usize * h as usize]; self.mark_all(); self.committed = true;
+        self.data = vec![0; w as usize * h as usize]; self.mark_all(); self.committed = true;
     }
     fn mark_all(&mut self) { if self.w > 0 && self.h > 0 { self.dirty = Some([0, 0, self.w, self.h]); } }
     fn mark(&mut self, x: u32, y: u32) {
         self.dirty = Some(match self.dirty { Some([a,b,c,d]) => [a.min(x), b.min(y), c.max(x+1), d.max(y+1)], None => [x,y,x+1,y+1] });
     }
-    fn put(&mut self, index: usize, value: f32) {
-        // Store the same 16-bit precision as history, so undo restores exact values, including zero.
-        let value = quantize(value) as f32 / 65535.0;
+    fn put(&mut self, index: usize, value: u16) {
         if self.data[index] != value {
-            self.fingerprint ^= pixel_hash(index, quantize(self.data[index])) ^ pixel_hash(index, quantize(value));
-            self.sum += value as f64 - self.data[index] as f64;
+            self.fingerprint ^= pixel_hash(index, self.data[index]) ^ pixel_hash(index, value);
+            self.sum = self.sum - u64::from(self.data[index]) + u64::from(value);
             self.data[index] = value; self.mark(index as u32 % self.w, index as u32 / self.w);
         }
     }
@@ -94,15 +93,16 @@ impl Mask {
             let index = y*self.w+x;
             let entry = stroke.pixels.entry(index).or_insert((self.data[index as usize], 0.0));
             entry.1 = entry.1.max(coverage);
-            let value = if stroke.erase { entry.0 * (1.0-entry.1) } else { entry.0 + (1.0-entry.0)*entry.1 };
-            self.put(index as usize, value);
+            let before = entry.0 as f32 / 65535.0;
+            let value = if stroke.erase { before * (1.0-entry.1) } else { before + (1.0-before)*entry.1 };
+            self.put(index as usize, quantize(value));
         }}
         self.preview_pending |= self.dirty.is_some();
     }
     pub fn end_stroke(&mut self) {
         let Some(stroke) = self.stroke.take() else { return; };
         let changes = stroke.pixels.into_iter().filter_map(|(index,(before,_))| {
-            let (before, after) = (quantize(before), quantize(self.data[index as usize]));
+            let after = self.data[index as usize];
             (before != after).then_some(Change { index, before, after })
         }).collect::<Vec<_>>();
         if !changes.is_empty() { self.commit(HistoryEntry::Diff(changes)); }
@@ -117,55 +117,58 @@ impl Mask {
         }
         self.committed = true;
     }
-    fn replace(&mut self, values: Vec<f32>) {
+    fn replace(&mut self, values: Vec<u16>) {
         self.end_stroke();
         assert_eq!(values.len(), self.data.len());
-        let count = values.iter().zip(&self.data).filter(|(after, before)| quantize(**after) != quantize(**before)).count();
+        let count = values.iter().zip(&self.data).filter(|(after, before)| after != before).count();
         if count == 0 { return; }
         let entry = if self.data.len() * std::mem::size_of::<u16>() < count * std::mem::size_of::<Change>() {
-            HistoryEntry::Snapshot(self.data.iter().map(|&v| quantize(v)).collect())
+            HistoryEntry::Snapshot(self.data.clone())
         } else {
             HistoryEntry::Diff(values.iter().zip(&self.data).enumerate().filter_map(|(index, (&after, &before))| {
-                let (before, after) = (quantize(before), quantize(after));
                 (before != after).then_some(Change { index: index as u32, before, after })
             }).collect())
         };
         for (index, value) in values.into_iter().enumerate() { self.put(index, value); }
         self.commit(entry);
     }
-    fn combine_values(&mut self, values: Vec<f32>) {
-        let values = values.into_iter().zip(&self.data).map(|(v,&old)| combine(old,v,self.combine)).collect(); self.replace(values); self.enabled = true;
+    fn combine_values(&mut self, mut values: Vec<u16>) {
+        for (value, &old) in values.iter_mut().zip(&self.data) {
+            *value = match self.combine {
+                Combine::Replace => *value, Combine::Add => old.saturating_add(*value),
+                Combine::Subtract => old.saturating_sub(*value), Combine::Intersect => old.min(*value),
+            };
+        }
+        self.replace(values); self.enabled = true;
     }
-    pub fn build(&mut self, pic: &Picture, kind: MaskKind) {
-        let mut values = vec![0.0; pic.width as usize * pic.height as usize];
-        for y in 0..pic.height { for x in 0..pic.width {
-            let i = (y*pic.width+x) as usize; let p = &pic.rgba[i*4..i*4+4];
-            values[i] = match kind {
-                MaskKind::Luminosity => luminosity(p[0].max(p[1]).max(p[2]), self.lum_range) * p[3],
-                MaskKind::Transparency => p[3],
-                MaskKind::Outlines => {
-                    let mut lo = p[3]; let mut hi = p[3];
-                    for (dx,dy) in [(0,-1),(-1,0),(1,0),(0,1)] {
-                        let (nx,ny) = (x as i64+dx,y as i64+dy);
-                        let a = if nx>=0 && ny>=0 && nx<pic.width as i64 && ny<pic.height as i64 { pic.rgba[((ny as u32*pic.width+nx as u32)*4+3) as usize] } else { 0.0 };
-                        lo=lo.min(a); hi=hi.max(a);
-                    } hi-lo
-                }
-            }.clamp(0.0,1.0);
-        }}
-        self.combine_values(resample(&values, pic.width, pic.height, self.w, self.h));
+    fn combine_float_values(&mut self, values: Vec<f32>) {
+        let values=values.into_iter().zip(&self.data).map(|(value,&old)| {
+            quantize(combine(old as f32/65535.0,value,self.combine))
+        }).collect();
+        self.replace(values);self.enabled=true;
+    }
+    pub fn build(&mut self, gpu: &Gpu, source: &Image, kind: MaskKind) {
+        let kind = match kind {
+            MaskKind::Luminosity => MaskSourceKind::Luminosity { low: self.lum_range[0], high: self.lum_range[1] },
+            MaskKind::Transparency => MaskSourceKind::Transparency,
+            MaskKind::Outlines => MaskSourceKind::Outlines,
+        };
+        let image = gpu.mask_from_source(source, kind);
+        let values = gpu.download_gray_u16(&image);
+        if (source.width(), source.height()) == (self.w, self.h) { self.combine_values(values); }
+        else { self.combine_float_values(resample(&values, source.width(), source.height(), self.w, self.h,65535.0)); }
     }
     pub fn load_image(&mut self, pic: &Picture) {
         let gray: Vec<f32> = pic.rgba.chunks_exact(4).map(|p| (0.2126*p[0]+0.7152*p[1]+0.0722*p[2])*p[3]).collect();
-        self.combine_values(resample(&gray,pic.width,pic.height,self.w,self.h));
+        self.combine_float_values(resample(&gray,pic.width,pic.height,self.w,self.h,1.0));
     }
-    pub fn invert(&mut self) { self.replace(self.data.iter().map(|v| 1.0-v).collect()); }
-    pub fn clear(&mut self) { self.replace(vec![0.0; self.data.len()]); }
+    pub fn invert(&mut self) { self.replace(self.data.iter().map(|v| u16::MAX-v).collect()); }
+    pub fn clear(&mut self) { self.replace(vec![0; self.data.len()]); }
     pub fn apply_feather(&mut self, gpu: &Gpu) {
-        if self.feather <= 0.0 || self.data.is_empty() { return; }
-        let image = gpu.upload_gray32f(self.w,self.h,&self.data);
+        if self.feather <= 0.0 || self.is_empty() { return; }
+        let image = gpu.upload_gray_u16(self.w,self.h,&self.data);
         let blurred = gpu.gaussian_blur(&image,self.feather);
-        self.replace(gpu.download_rgba32f(&blurred).chunks_exact(4).map(|p| p[0]).collect());
+        self.replace(gpu.download_gray_u16(&blurred));
     }
     pub fn apply_grow(&mut self, _gpu: &Gpu) {
         // Square grayscale morphology, separable exact max/min; fractional radii blend adjacent radii.
@@ -174,19 +177,22 @@ impl Mask {
         let a = morphology(&self.data,self.w as usize,self.h as usize,lo,self.grow>0.0);
         let result = if radius.fract() > 0.0 {
             let b = morphology(&self.data,self.w as usize,self.h as usize,lo+1,self.grow>0.0);
-            a.into_iter().zip(b).map(|(a,b)| a+(b-a)*radius.fract()).collect()
+            a.into_iter().zip(b).map(|(a,b)| {
+                let (a,b)=(a as f32/65535.0,b as f32/65535.0);
+                quantize(a+(b-a)*radius.fract())
+            }).collect()
         } else { a };
         self.replace(result);
     }
     fn restore(&mut self, entry: &mut HistoryEntry, redo: bool) {
         match entry {
             HistoryEntry::Diff(changes) => for c in changes {
-                self.put(c.index as usize, if redo { c.after } else { c.before } as f32 / 65535.0);
+                self.put(c.index as usize, if redo { c.after } else { c.before });
             },
             // A snapshot holds the opposite state; swapping supports both undo and redo.
             HistoryEntry::Snapshot(values) => for (index, value) in values.iter_mut().enumerate() {
-                let current = quantize(self.data[index]);
-                self.put(index, *value as f32 / 65535.0);
+                let current = self.data[index];
+                self.put(index, *value);
                 *value = current;
             },
         }
@@ -211,7 +217,7 @@ impl Mask {
         if !self.future.is_empty() { self.history_bytes -= self.future.remove(0).bytes(); }
     }
     pub fn history_bytes(&self) -> usize { self.history_bytes }
-    pub fn retained_bytes(&self) -> usize { self.data.capacity() * std::mem::size_of::<f32>() + self.history_bytes }
+    pub fn retained_bytes(&self) -> usize { self.data.capacity() * std::mem::size_of::<u16>() + self.history_bytes }
     pub fn release_gpu(&mut self) { self.image = None; self.overlay = None; self.thumb = None; self.mark_all(); }
     pub fn drop_oldest_history(&mut self) -> bool {
         let Some(entry) = self.past.pop_front() else { return false; };
@@ -220,16 +226,15 @@ impl Mask {
     pub fn export(&self) -> Option<moya_project::MaskData> {
         (self.w > 0 && self.h > 0 && (self.enabled || !self.is_empty())).then(|| moya_project::MaskData {
             width: self.w, height: self.h, enabled: self.enabled,
-            data: self.data.iter().map(|&v| quantize(v)).collect(),
+            data: self.data.clone(),
         })
     }
     pub fn import(mask: &moya_project::MaskData, width: u32, height: u32) -> anyhow::Result<Self> {
         anyhow::ensure!(mask.width > 0 && mask.height > 0 && mask.width <= 16384 && mask.height <= 16384, "invalid mask dimensions");
         anyhow::ensure!(mask.data.len() == mask.width as usize * mask.height as usize, "invalid mask pixel count");
         anyhow::ensure!(width > 0 && height > 0 && width <= 16384 && height <= 16384, "invalid source dimensions");
-        let values: Vec<_> = mask.data.iter().map(|&v| v as f32 / 65535.0).collect();
-        let values = if (mask.width, mask.height) == (width, height) { values }
-            else { resample(&values, mask.width, mask.height, width, height) };
+        let values = if (mask.width, mask.height) == (width, height) { mask.data.clone() }
+            else { resample(&mask.data, mask.width, mask.height, width, height,65535.0).into_iter().map(quantize).collect() };
         let mut result = Self::default(); result.reset(width, height); result.enabled = mask.enabled;
         for (index, value) in values.into_iter().enumerate() { result.put(index, value); }
         Ok(result)
@@ -244,13 +249,16 @@ impl Mask {
         result.feather = self.feather; result.grow = self.grow;
         result.mark_all(); result.committed = true; result
     }
-    pub fn coverage(&self) -> f32 { if self.data.is_empty() { 0.0 } else { (self.sum/self.data.len() as f64).clamp(0.0,1.0) as f32 } }
-    pub fn is_empty(&self) -> bool { self.sum <= 0.0 }
+    pub fn coverage(&self) -> f32 { if self.data.is_empty() { 0.0 } else { (self.sum as f64/(self.data.len() as f64*65535.0)).clamp(0.0,1.0) as f32 } }
+    pub fn is_empty(&self) -> bool { self.sum == 0 }
     pub fn save_png(&self, path: &Path) -> anyhow::Result<()> {
-        let gray: Vec<u8> = self.data.iter().map(|v| (v.clamp(0.0,1.0)*255.0).round() as u8).collect();
+        let gray: Vec<u8> = self.data.iter().map(|&v| (v as f32/65535.0*255.0).round() as u8).collect();
         moya_io::save_gray_png(path,self.w,self.h,&gray)
     }
     pub fn gpu_image(&self) -> Option<&Image> { if self.enabled && !self.is_empty() { self.image.as_ref() } else { None } }
+    fn needs_gpu_upload(&self, pixels_changed: bool) -> bool {
+        self.enabled && !self.is_empty() && (pixels_changed || self.image.is_none())
+    }
     pub fn overlay_texture(&self) -> Option<&TextureHandle> { self.overlay.as_ref() }
     pub fn thumbnail(&self) -> Option<&TextureHandle> { self.thumb.as_ref() }
     pub fn sync(&mut self, ctx: &egui::Context, gpu: &Gpu) -> MaskSync {
@@ -258,8 +266,11 @@ impl Mask {
         let enabled_changed = self.was_enabled != self.enabled;
         self.was_enabled = self.enabled;
         let dirty = self.dirty.take();
+        if (!self.enabled || self.is_empty()) && self.image.take().is_some() {
+            self.gpu_generation = self.gpu_generation.wrapping_add(1);
+        }
         if appearance_changed { self.appearance = (self.view,self.overlay_opacity); }
-        if let Some(rect) = if appearance_changed { Some([0,0,self.w,self.h]) } else { dirty } {
+        if let Some(rect) = if appearance_changed || self.needs_gpu_upload(false) { Some([0,0,self.w,self.h]) } else { dirty } {
             self.upload(ctx,gpu,rect,dirty.is_some());
             self.preview_pending |= dirty.is_some();
         }
@@ -275,12 +286,12 @@ impl Mask {
         if self.w==0 || self.h==0 { return; }
         if self.image.is_none() { rect=[0,0,self.w,self.h]; }
         let [x0,y0,x1,y1]=rect;
-        if pixels_changed || self.image.is_none() {
+        if self.needs_gpu_upload(pixels_changed) {
             if self.image.is_none() || rect == [0,0,self.w,self.h] {
-                self.image=Some(gpu.upload_gray32f(self.w,self.h,&self.data));
+                self.image=Some(gpu.upload_gray_u16(self.w,self.h,&self.data));
             } else if let Some(image)=&self.image {
                 let mut rgba=Vec::with_capacity(((x1-x0)*(y1-y0)*4) as usize);
-                for y in y0..y1 { for x in x0..x1 { let v=self.data[(y*self.w+x) as usize]; rgba.extend_from_slice(&[v,v,v,1.0]); }}
+                for y in y0..y1 { for x in x0..x1 { let v=self.data[(y*self.w+x) as usize] as f32/65535.0; rgba.extend_from_slice(&[v,v,v,1.0]); }}
                 gpu.write_region(image,x0,y0,x1-x0,y1-y0,&rgba);
             }
             self.gpu_generation = self.gpu_generation.wrapping_add(1);
@@ -294,14 +305,14 @@ impl Mask {
              ((x1 as f32*ow as f32/self.w as f32).ceil() as u32+1).min(ow),((y1 as f32*oh as f32/self.h as f32).ceil() as u32+1).min(oh)) };
         let mut pixels=Vec::with_capacity(((c-a)*(d-b)) as usize);
         for y in b..d { for x in a..c {
-            let v=sample(&self.data,self.w,self.h,(x as f32+0.5)*self.w as f32/ow as f32-0.5,(y as f32+0.5)*self.h as f32/oh as f32-0.5);
+            let v=sample(&self.data,self.w,self.h,(x as f32+0.5)*self.w as f32/ow as f32-0.5,(y as f32+0.5)*self.h as f32/oh as f32-0.5,65535.0);
             pixels.push(if self.view==MaskView::MaskOnly { Color32::from_gray((v*255.0).round() as u8) } else { Color32::from_rgba_unmultiplied(255,0,190,(v*self.overlay_opacity.clamp(0.0,1.0)*255.0).round() as u8) });
         }}
         let image=egui::ColorImage::new([(c-a) as usize,(d-b) as usize],pixels);
         if let Some(texture)=&mut self.overlay { texture.set_partial([a as usize,b as usize],image,egui::TextureOptions::LINEAR); }
         else { self.overlay=Some(ctx.load_texture("Mask overlay",image,egui::TextureOptions::LINEAR)); }
         let (tw,th)=((self.w as f32*96.0/self.w.max(self.h) as f32).round().max(1.0) as u32,(self.h as f32*96.0/self.w.max(self.h) as f32).round().max(1.0) as u32);
-        let pixels=resample(&self.data,self.w,self.h,tw,th).into_iter().map(|v| Color32::from_gray((v*255.0).round() as u8)).collect();
+        let pixels=resample(&self.data,self.w,self.h,tw,th,65535.0).into_iter().map(|v| Color32::from_gray((v*255.0).round() as u8)).collect();
         let image=egui::ColorImage::new([tw as usize,th as usize],pixels);
         if let Some(t)=&mut self.thumb { t.set(image,egui::TextureOptions::LINEAR); } else { self.thumb=Some(ctx.load_texture("Mask thumbnail",image,egui::TextureOptions::LINEAR)); }
     }
@@ -314,23 +325,21 @@ fn pixel_hash(index: usize, value: u16) -> u64 {
     x ^ (x >> 31)
 }
 fn quantize(v:f32)->u16 { (v.clamp(0.0,1.0)*65535.0).round() as u16 }
-fn falloff(d:f32,hardness:f32)->f32 { let h=hardness.clamp(0.0,1.0); if d>=1.0 { 0.0 } else if d<=h { 1.0 } else { let t=(d-h)/(1.0-h); 1.0-t*t*(3.0-2.0*t) } }
-// Linear ramp: the default [0, 1] range leaves max(R,G,B) unchanged.
-fn luminosity(v:f32,range:[f32;2])->f32 { let lo=range[0].min(range[1]); let hi=range[0].max(range[1]); if hi<=lo { return if v>=hi {1.0} else {0.0}; } ((v-lo)/(hi-lo)).clamp(0.0,1.0) }
 fn combine(old:f32,new:f32,mode:Combine)->f32 { match mode { Combine::Replace=>new,Combine::Add=>old+new,Combine::Subtract=>old-new,Combine::Intersect=>old.min(new) }.clamp(0.0,1.0) }
-fn sample(data:&[f32],w:u32,h:u32,x:f32,y:f32)->f32 {
+fn falloff(d:f32,hardness:f32)->f32 { let h=hardness.clamp(0.0,1.0); if d>=1.0 { 0.0 } else if d<=h { 1.0 } else { let t=(d-h)/(1.0-h); 1.0-t*t*(3.0-2.0*t) } }
+fn sample<T: Copy + Into<f32>>(data:&[T],w:u32,h:u32,x:f32,y:f32,scale:f32)->f32 {
     let x=x.clamp(0.0,(w-1) as f32); let y=y.clamp(0.0,(h-1) as f32);
     let (a,b)=(x.floor() as u32,y.floor() as u32); let (c,d)=((a+1).min(w-1),(b+1).min(h-1));
-    let (tx,ty)=(x-a as f32,y-b as f32); let p=|x,y| data[(y*w+x) as usize];
+    let (tx,ty)=(x-a as f32,y-b as f32); let p=|x,y| -> f32 { data[(y*w+x) as usize].into()/scale };
     (p(a,b)*(1.0-tx)+p(c,b)*tx)*(1.0-ty)+(p(a,d)*(1.0-tx)+p(c,d)*tx)*ty
 }
-fn resample(data:&[f32],w:u32,h:u32,nw:u32,nh:u32)->Vec<f32> {
-    if w==nw && h==nh { return data.to_vec(); }
+fn resample<T: Copy + Into<f32>>(data:&[T],w:u32,h:u32,nw:u32,nh:u32,scale:f32)->Vec<f32> {
+    if w==nw && h==nh { return data.iter().map(|&v| v.into()/scale).collect(); }
     if w==0 || h==0 { return vec![0.0;nw as usize*nh as usize]; }
-    (0..nh).flat_map(|y| (0..nw).map(move |x| sample(data,w,h,(x as f32+0.5)*w as f32/nw as f32-0.5,(y as f32+0.5)*h as f32/nh as f32-0.5))).collect()
+    (0..nh).flat_map(|y| (0..nw).map(move |x| sample(data,w,h,(x as f32+0.5)*w as f32/nw as f32-0.5,(y as f32+0.5)*h as f32/nh as f32-0.5,scale))).collect()
 }
-fn morphology(data:&[f32],w:usize,h:usize,radius:usize,grow:bool)->Vec<f32> {
-    fn pass(src:&[f32],dst:&mut[f32],length:usize,lines:usize,stride:usize,line_stride:usize,r:usize,grow:bool) {
+fn morphology(data:&[u16],w:usize,h:usize,radius:usize,grow:bool)->Vec<u16> {
+    fn pass(src:&[u16],dst:&mut[u16],length:usize,lines:usize,stride:usize,line_stride:usize,r:usize,grow:bool) {
         for line in 0..lines { let mut deque:VecDeque<usize>=VecDeque::new(); let mut next=0;
             for i in 0..length { let end=i.saturating_add(r).min(length-1);
                 while next<=end { let value=src[line*line_stride+next*stride]; while deque.back().is_some_and(|&j| if grow {src[line*line_stride+j*stride]<=value} else {src[line*line_stride+j*stride]>=value}) {deque.pop_back();} deque.push_back(next); next+=1; }
@@ -339,34 +348,56 @@ fn morphology(data:&[f32],w:usize,h:usize,radius:usize,grow:bool)->Vec<f32> {
             }
         }
     }
-    let mut tmp=vec![0.0;data.len()]; let mut out=vec![0.0;data.len()];
+    let mut tmp=vec![0;data.len()]; let mut out=vec![0;data.len()];
     pass(data,&mut tmp,w,h,1,w,radius,grow); pass(&tmp,&mut out,h,w,w,1,radius,grow); out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn fractional_paths_preserve_normalized_float_ordering() {
+        let values=vec![0u16,1,1234,32767,32768,65534,65535];
+        let normalized:Vec<f32>=values.iter().map(|&v| v as f32/65535.0).collect();
+        for width in [3,11,29] {
+            assert_eq!(resample(&values,7,1,width,1,65535.0),resample(&normalized,7,1,width,1,1.0));
+        }
+        let mut m=Mask::default();m.reset(7,1);
+        for mode in [Combine::Replace,Combine::Add,Combine::Subtract,Combine::Intersect] {
+            for offset in [-0.00000001,0.0,0.00000001] {
+                let incoming:Vec<f32>=values.iter().map(|&v| (v as f32+0.5)/65535.0+offset).collect();
+                let expected:Vec<u16>=normalized.iter().zip(&incoming).map(|(&old,&new)| quantize(combine(old,new,mode))).collect();
+                m.replace(values.clone());m.combine=mode;m.combine_float_values(incoming);
+                assert_eq!(m.data,expected);
+            }
+        }
+        for &old in &values { for &new in &values {
+            assert_eq!(old.saturating_add(new),quantize(combine(old as f32/65535.0,new as f32/65535.0,Combine::Add)));
+            assert_eq!(old.saturating_sub(new),quantize(combine(old as f32/65535.0,new as f32/65535.0,Combine::Subtract)));
+            assert_eq!(65535-old,quantize(1.0-old as f32/65535.0));
+        }}
+    }
     #[test] fn brush_falloff_and_opacity_cap() {
         assert_eq!(falloff(0.2,0.5),1.0); assert_eq!(falloff(1.0,0.5),0.0); assert!((falloff(0.75,0.5)-0.5).abs()<1e-6);
         let mut m=Mask::default(); m.reset(16,16); m.brush.size=5.0; m.brush.hardness=1.0; m.brush.opacity=0.4;
         m.begin_stroke(false); for _ in 0..10 {m.stroke_to([8.5,8.5]);} m.end_stroke();
-        assert!((m.data[8*16+8]-0.4).abs()<1e-6); assert!(m.undo()); assert!(m.is_empty()); assert!(m.redo()); assert!((m.data[8*16+8]-0.4).abs()<2e-5);
+        assert_eq!(m.data[8*16+8],quantize(0.4)); assert!(m.undo()); assert!(m.is_empty()); assert!(m.redo()); assert_eq!(m.data[8*16+8],quantize(0.4));
     }
-    #[test] fn combination_and_luminosity_range() {
-        assert_eq!(combine(0.6,0.5,Combine::Replace),0.5); assert_eq!(combine(0.6,0.5,Combine::Add),1.0);
-        assert!((combine(0.6,0.5,Combine::Subtract)-0.1).abs()<1e-6); assert_eq!(combine(0.6,0.5,Combine::Intersect),0.5);
-        assert_eq!(luminosity(0.1,[0.2,0.8]),0.0); assert!((luminosity(0.35,[0.2,0.8])-0.25).abs()<1e-6); assert_eq!(luminosity(0.9,[0.2,0.8]),1.0);
+    #[test] fn combination_uses_saturating_u16_arithmetic() {
+        let mut m=Mask::default();m.reset(1,1);
+        for (mode,expected) in [(Combine::Replace,30000),(Combine::Add,65535),(Combine::Subtract,10000),(Combine::Intersect,30000)] {
+            m.replace(vec![40000]);m.combine=mode;m.combine_values(vec![30000]);assert_eq!(m.data,vec![expected]);
+        }
     }
     #[test] fn memory_cap_evicts_oldest_and_keeps_redo_bounded() {
         let mut m=Mask::default();m.reset(2,1);m.history_limit=std::mem::size_of::<HistoryEntry>() + 2*std::mem::size_of::<u16>();
-        m.replace(vec![1.0,0.0]);m.replace(vec![1.0,1.0]); assert_eq!(m.past.len(),1);assert_eq!(m.evicted,1);
-        assert!(m.undo());assert_eq!(m.data,vec![1.0,0.0]);assert!(!m.undo());assert!(m.redo());assert!(m.history_bytes<=m.history_limit);
+        m.replace(vec![65535,0]);m.replace(vec![65535,65535]); assert_eq!(m.past.len(),1);assert_eq!(m.evicted,1);
+        assert!(m.undo());assert_eq!(m.data,vec![65535,0]);assert!(!m.undo());assert!(m.redo());assert!(m.history_bytes<=m.history_limit);
     }
     #[test] fn history_bytes_ignore_spare_capacity_and_clear_redo_exactly() {
         let mut m=Mask::default();m.reset(8,1);
         let mut changes=Vec::with_capacity(128);
         changes.push(Change { index:0,before:0,after:65535 });
-        m.put(0,1.0);m.commit(HistoryEntry::Diff(changes));
+        m.put(0,65535);m.commit(HistoryEntry::Diff(changes));
         let bytes=std::mem::size_of::<HistoryEntry>()+std::mem::size_of::<Change>();
         assert_eq!(m.history_bytes,bytes);
         assert!(m.undo());assert_eq!(m.history_bytes,bytes);
@@ -374,7 +405,7 @@ mod tests {
     }
     #[test] fn newest_oversized_snapshot_is_retained_and_swaps_exactly() {
         let mut m=Mask::default();m.reset(8,1);m.history_limit=1;
-        m.replace(vec![0.25;8]);
+        m.replace(vec![quantize(0.25);8]);
         let before=m.data.clone();m.invert();let after=m.data.clone();
         assert_eq!(m.past.len(),1);assert_eq!(m.take_history_steps(),(2,1));
         assert!(matches!(m.past.back(),Some(HistoryEntry::Snapshot(values)) if values.len()==8));
@@ -385,7 +416,7 @@ mod tests {
     }
     #[test] fn sparse_replacement_chooses_diff_and_new_edit_discards_snapshot_redo() {
         let mut m=Mask::default();m.reset(8,1);
-        let mut values=vec![0.0;8];values[3]=0.5;m.replace(values);
+        let mut values=vec![0;8];values[3]=quantize(0.5);m.replace(values);
         assert!(matches!(m.past.back(),Some(HistoryEntry::Diff(changes)) if changes.len()==1));
         let before=m.data.clone();m.invert();assert!(m.undo());assert_eq!(m.data,before);
         assert!(matches!(m.future.last(),Some(HistoryEntry::Snapshot(_))));
@@ -395,21 +426,52 @@ mod tests {
         assert!(m.undo());assert_eq!(m.data,before);
     }
     #[test] fn built_masks_and_clear_preserve_zero() {
-        let pic=Picture { width:2,height:1,depth:moya_io::SampleDepth::U8,rgba:vec![0.2,0.8,0.4,0.5,1.0,0.0,0.0,0.0],icc_profile:None };
+        let gpu=Gpu::new_blocking().expect("GPU is mandatory for mask build tests");
+        let source=gpu.upload_rgba32f(2,1,&[0.2,0.8,0.4,0.5,1.0,0.0,0.0,0.0]);
         let mut m=Mask::default();m.reset(2,1);
-        m.build(&pic,MaskKind::Transparency);assert!((m.data[0]-0.5).abs()<2e-5);assert_eq!(m.data[1],0.0);
-        // Default range: max(R,G,B) * alpha.
-        m.build(&pic,MaskKind::Luminosity);assert!((m.data[0]-0.8*0.5).abs()<2e-5);
-        m.replace(vec![1e-7,0.5]);m.clear();assert!(m.is_empty());assert_eq!(m.data,vec![0.0;2]);
-        m.build(&pic,MaskKind::Outlines);assert!((m.data[0]-0.5).abs()<2e-5);assert!((m.data[1]-0.5).abs()<2e-5);
+        m.build(&gpu,&source,MaskKind::Transparency);assert_eq!(m.data,vec![quantize(0.5),0]);
+        m.build(&gpu,&source,MaskKind::Luminosity);assert_eq!(m.data,vec![quantize(0.8*0.5),0]);
+        m.lum_range=[0.2,0.8];m.build(&gpu,&source,MaskKind::Luminosity);assert_eq!(m.data,vec![quantize(0.5),0]);
+        m.replace(vec![quantize(1e-7),quantize(0.5)]);m.clear();assert!(m.is_empty());assert_eq!(m.data,vec![0;2]);
+        m.build(&gpu,&source,MaskKind::Outlines);assert_eq!(m.data,vec![quantize(0.5);2]);
+    }
+    #[test] fn u16_storage_import_and_history_are_exact() {
+        let values=vec![0,1,32767,32768,65534,65535];
+        let saved=moya_project::MaskData { width:6,height:1,enabled:false,data:values.clone() };
+        let mut m=Mask::import(&saved,6,1).unwrap();
+        assert_eq!(std::mem::size_of_val(m.data.as_slice()),12);
+        assert_eq!(m.retained_bytes(),m.data.capacity()*2);
+        assert_eq!(m.export().unwrap(),saved);
+        let original=m.fingerprint();m.invert();
+        assert_eq!(m.data,values.iter().map(|v| 65535-v).collect::<Vec<_>>());
+        assert!(m.undo());assert_eq!(m.data,values);assert_eq!(m.fingerprint(),original);
+        assert!(m.redo());assert!(m.undo());
+        let mut duplicate=m.duplicate();duplicate.clear();assert_eq!(m.data,values);
+    }
+    #[test] fn disabled_and_empty_masks_never_upload_and_enabling_uploads_once() {
+        let gpu=Gpu::new_blocking().expect("GPU is mandatory for mask upload tests");
+        let ctx=egui::Context::default();
+        let mut m=Mask::default();m.reset(2,1);
+        let generation=m.gpu_generation;
+        m.sync(&ctx,&gpu);assert_eq!(m.gpu_generation,generation);assert!(m.image.is_none());assert!(m.gpu_image().is_none());
+        m.enabled=true;m.sync(&ctx,&gpu);assert_eq!(m.gpu_generation,generation);assert!(m.image.is_none());
+        m.enabled=false;m.replace(vec![1,65535]);m.sync(&ctx,&gpu);
+        assert_eq!(m.gpu_generation,generation);assert!(m.image.is_none());assert!(m.gpu_image().is_none());
+        m.enabled=true;m.sync(&ctx,&gpu);assert_eq!(m.gpu_generation,generation+1);assert!(m.gpu_image().is_some());
+        assert_eq!(gpu.download_gray_u16(m.gpu_image().unwrap()),m.data);
+        m.sync(&ctx,&gpu);m.overlay_opacity=0.7;m.sync(&ctx,&gpu);assert_eq!(m.gpu_generation,generation+1);
+        m.enabled=false;m.sync(&ctx,&gpu);assert_eq!(m.gpu_generation,generation+2);assert!(m.image.is_none());assert!(m.gpu_image().is_none());
+        m.enabled=true;m.sync(&ctx,&gpu);assert_eq!(m.gpu_generation,generation+3);
+        m.clear();m.sync(&ctx,&gpu);assert_eq!(m.gpu_generation,generation+4);assert!(m.image.is_none());assert!(m.gpu_image().is_none());
+        assert!(m.undo());m.sync(&ctx,&gpu);assert_eq!(m.gpu_generation,generation+5);assert!(m.gpu_image().is_some());
     }
     #[test] fn multi_dab_stroke_over_built_mask_undoes_once() {
         let mut m=Mask::default();m.reset(64,64);m.brush.size=3.0;
-        m.replace((0..4096).map(|i| if i>3000 {0.5} else {0.0}).collect());
+        m.replace((0..4096).map(|i| if i>3000 {quantize(0.5)} else {0}).collect());
         let before=m.data.clone();m.take_history_steps();
         for x in 10..40 { m.begin_stroke(false);m.stroke_to([x as f32,20.0]); }
         m.end_stroke();assert_eq!(m.take_history_steps().0,1);
         assert!(m.undo());assert_eq!(m.data,before);assert!(m.redo());assert_ne!(m.data,before);
     }
-    #[test] fn morphology_grows_and_contracts() { assert_eq!(morphology(&[0.0,1.0,0.0],3,1,1,true),vec![1.0;3]);assert_eq!(morphology(&[1.0,0.0,1.0],3,1,1,false),vec![0.0;3]); }
+    #[test] fn morphology_grows_and_contracts() { assert_eq!(morphology(&[0,65535,0],3,1,1,true),vec![65535;3]);assert_eq!(morphology(&[65535,0,65535],3,1,1,false),vec![0;3]); }
 }

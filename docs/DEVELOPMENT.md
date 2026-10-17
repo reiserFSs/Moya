@@ -58,26 +58,39 @@ cargo test -p moya-app --test bridge_protocol -- --ignored --test-threads=1
 
 ## Masks and preview
 
-Painting updates only the changed rectangle on the GPU. The preview re-renders at most about every 63 ms during a stroke and immediately when it ends. Mask edits remain full resolution; the overlay is capped at a 2048-pixel long side. Mask uploads use `Gpu::upload_gray32f` (single channel, expanded to RGBA on the GPU). Undo stores each mask step as sparse 16-bit diffs or a compact 16-bit snapshot, whichever is smaller. History is bounded by exact bytes (256 MiB) and 200 steps, and the newest step is always kept even if it alone exceeds the budget. It shares one timeline with parameter edits.
+Painting updates only the changed rectangle on the GPU. The preview re-renders at most about every 63 ms during a stroke and immediately when it ends. Mask edits remain full resolution and are stored on the CPU as u16 (0..65535); the overlay is capped at a 2048-pixel long side. A disabled or empty mask is never uploaded (the pipeline gets `None`); enabled masks upload through `Gpu::upload_gray_u16`. Luminosity/Transparency/Outlines masks are built on the GPU from the source texture (`Gpu::mask_from_source`, bit-identical to the former CPU builder), so the app drops the decoded CPU pixels right after upload and keeps only dimensions, depth and ICC. Undo stores each mask step as sparse 16-bit diffs or a compact 16-bit snapshot, whichever is smaller. History is bounded by exact bytes (256 MiB) and 200 steps, and the newest step is always kept even if it alone exceeds the budget. It shares one timeline with parameter edits.
 
 `moya_pipeline::Document` renders a bottom-to-top stack of borrowed `LayerInputs` and a `RenderRequest`. Each input supplies settings, an optional GPU mask, and its mask generation. Original-input layers extract from the shared source; Below-input layers extract from the visible composite beneath them. Blend mode and opacity apply when compositing, while requested `layer_glows` retain each layer's uncomposited glow, including unmult alpha. X-Ray computes only extraction and the heatmap for the selected layer. Draft working grids are bounded to a 1500-pixel long side for landscape or 1300 for portrait. HQ uses up to 4000 pixels and resamples to original dimensions.
 
 ## Robustness limits
 
 - **Decoding:** `moya_io::load` checks header dimensions and the decoded size before allocating. Defaults are at most 16384 px per side and 4 GiB of RGBA-f32 storage; `load_with_limits(LoadLimits { .. })` overrides them. PSD/PSB files are streamed: the layer data is skipped by seeking, and only the composite section is read, after a budget check. 16/32-bit PSDs read the merged-transparency count from the global `Lr16`/`Lr32` blocks.
-- **Saving:** `moya_io::save` encodes into a sibling temp file, syncs it, and then renames it over the destination. A failed save leaves the existing file untouched. TIFFs switch to BigTIFF near the 4 GiB offset ceiling.
+- **Saving:** `moya_io::save` and `save_streaming` encode into a sibling temp file, sync it, and then rename it over the destination; failures, including streaming pixel callbacks, preserve the existing file. `save_streaming(path, width, height, depth, icc, fill)` pulls RGBA-f32 rows/strips/blocks instead of retaining a full-image f32 readback. PNG uses a temporary compressed spool to preserve the existing encoder's byte framing with bounded RAM; TIFF keeps its existing strips and BigTIFF threshold near the 4 GiB offset ceiling. JPEG still buffers RGB8 for its whole-image encoder. EXR uses canonical tile order in both APIs: pixels are unchanged from the former parallel encoder, whose completion-order tile emission made its file bytes nondeterministic.
 - **GPU size limits:** long-span motion blur processes minor-axis strips of at most min(device limit, 4096) px, with overlap, so intermediates always fit the device. The output is bit-identical to the unstripped path. Uploads, region writes and readback are split into bands within `max_buffer_size`, so any image up to `max_texture_dimension_2d` per side round-trips. Resizers reject zero-sized targets.
 - **Non-finite input:** the motion-blur prefix scan zeroes non-finite channels first, so a stray inf/NaN only affects its own kernel window. Float exposure handles ±inf without NaN.
 
 ## Profiling and performance
 
 `bench` reports the median of nine cold renders by default, after an untimed warmup. Timings include `Document::clear_stage_caches` and synchronized composite readback, but exclude image loading and GPU setup. Prepared input remains warm; `clear_caches` also removes prepared working grids. `--iters` changes the sample count.
+The idle texture pool stays warm between benchmark iterations: inter-iteration trimming adds texture-allocation work to later timings, changing what the benchmark measures. CLI file exports instead trim idle textures to three Draft working images before encoding and after readback completes.
 
 `--interactive` measures individual edits to gamma, hue, CA distance, glare length, and threshold. Each iteration restores/renders the base outside the timer, then times the changed value including readback. Enable CA and glare in the input parameters to exercise them. Hue and threshold also report paired cold controls, rendering the same changed parameters after clearing caches.
 
-Each layer retains extraction/heatmap, exposure, glow, glare, tone/spectrum, CA, and output stages keyed by parameters and upstream generations. Mask generations invalidate extraction; changes below a Below-input layer invalidate that layer's upstream input. Layer blend/opacity edits reuse its effect stages. Retained stages and shared prepared working textures use a document-wide **384 MiB unique-image budget**, evicted downstream first. This is not a total GPU-memory limit: inputs, in-progress intermediates, and caller-owned outputs are excluded. Gaussian glow uses a **96 MiB transient reduction DAG** for shared downsampled images; full-resolution blurs are streamed, not retained as a layer stack.
+Each layer retains extraction/heatmap, exposure, glow, glare, tone/spectrum, CA, and output stages keyed by parameters and upstream generations — **Draft only**. Mask generations invalidate extraction; changes below a Below-input layer invalidate that layer's upstream input. Layer blend/opacity edits reuse its effect stages. Retained stages and shared prepared working textures use a document-wide **384 MiB unique-image budget**, evicted downstream first. This is not a total GPU-memory limit: inputs, in-progress intermediates, and caller-owned outputs are excluded. Gaussian glow uses a **96 MiB transient reduction DAG** for shared downsampled images; full-resolution blurs are streamed, not retained as a layer stack.
 
-Idle GPU textures are pooled by size, bounded to **max(512 MiB, 64 × the largest requested texture), at most 2 GiB**, with least-recently-used eviction.
+**HQ renders are transient:** they don't populate stage caches, release each stage as soon as it's consumed, and share immutable textures between outputs instead of copying them. `RenderRequest` selects which outputs to produce (`want_composite`, `want_glow_composite`, `want_layer_glows`, `want_xray`), so an export builds only what it writes. Exports read back through `Gpu::download_row_range` / `download_rows` (bounded, reused staging) into `moya_io::save_streaming`, so no full-image float buffer exists on the CPU.
+
+Idle GPU textures are pooled by size, bounded to **max(512 MiB, 64 × the largest requested texture), at most 2 GiB**, with least-recently-used eviction, which keeps HQ renders from re-allocating mid-render. The app and CLI then call `Gpu::trim_idle` down to three Draft working images after an HQ export or Photoshop send completes, and the app does the same after ~5 s without rendering. `Gpu::memory_stats()` reports live/idle bytes and counts plus `peak_live_bytes` (reset with `reset_peak()`); it covers pooled textures and explicitly owned buffers, not driver/queue staging.
+
+Memory before → after these policies (release, physical footprint; ciel2 = 8313×11084 JPEG, FX parameters):
+
+| Scenario | Before | After |
+|---|---:|---:|
+| CLI ciel2 HQ export, peak | 22.7 GB | 9.5 GB |
+| ciel2 HQ peak live GPU payload | 17.6 GB | 5.0 GB |
+| App, Embers 1086×1448, 1 layer idle | 877 MB | 708 MB |
+| App, Embers, 3 layers idle | 1.32 GB | 884 MB |
+| App, ciel2, 1 layer idle | 6.51 GB | 2.19 GB |
 
 Historical measurements on Apple M4 Pro (20 GPU cores), release, 1086×1448 input, seven timed renders after warmup including readback:
 

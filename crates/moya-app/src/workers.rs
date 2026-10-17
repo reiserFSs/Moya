@@ -1,5 +1,6 @@
 //! Background decode and cancellable, exclusively-owned bridge output.
 use eframe::egui;
+use moya_gpu::{Gpu, Image};
 use moya_io::{Picture, SampleDepth};
 use parking_lot::{Condvar, Mutex};
 use std::{
@@ -98,6 +99,34 @@ where F: FnMut(&Path) -> anyhow::Result<Picture> {
     queue.current(generation).then_some((generation, path, result))
 }
 
+/// GPU-backed export; only the encoder's current band is downloaded to the CPU.
+pub struct ExportImage {
+    pub image: Image,
+    pub depth: SampleDepth,
+    pub icc_profile: Option<Vec<u8>>,
+    pub opaque: bool,
+}
+impl ExportImage {
+    pub fn save(&self, gpu: &Gpu, path: &Path) -> anyhow::Result<()> {
+        moya_io::save_streaming(
+            path, self.image.width(), self.image.height(), self.depth,
+            self.icc_profile.as_deref(),
+            |y0, rows, rgba| {
+                gpu.download_row_range(&self.image, y0, rows, rgba)?;
+                if self.opaque {
+                    for pixel in rgba.chunks_exact_mut(4) {
+                        pixel[0] *= pixel[3];
+                        pixel[1] *= pixel[3];
+                        pixel[2] *= pixel[3];
+                        pixel[3] = 1.0;
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+}
+
 #[derive(Default)]
 struct OutputState {
     cancelled: bool,
@@ -124,8 +153,8 @@ pub struct SendWriter {
     completed: Cell<bool>,
 }
 impl SendWriter {
-    pub fn new(ctx: egui::Context, path: PathBuf, picture: Picture, depth: SampleDepth) -> Self {
-        Self::with_writer(ctx, path, move |staging| moya_io::save(staging, &picture, depth))
+    pub fn new(ctx: egui::Context, gpu: Arc<Gpu>, path: PathBuf, image: ExportImage) -> Self {
+        Self::with_writer(ctx, path, move |staging| image.save(&gpu, staging))
     }
     fn with_writer<F>(ctx: egui::Context, path: PathBuf, write: F) -> Self
     where F: FnOnce(&Path) -> anyhow::Result<()> + Send + 'static {
@@ -174,14 +203,14 @@ pub struct SendBatch {
 impl SendBatch {
     pub fn new(
         ctx: egui::Context,
-        pictures: Vec<(PathBuf, Picture)>,
-        depth: SampleDepth,
+        gpu: Arc<Gpu>,
+        images: Vec<(PathBuf, ExportImage)>,
         project_path: PathBuf,
         project: moya_project::Project,
     ) -> Self {
-        let mut writers = Vec::with_capacity(pictures.len() + 1);
-        for (path, picture) in pictures {
-            writers.push(SendWriter::new(ctx.clone(), path, picture, depth));
+        let mut writers = Vec::with_capacity(images.len() + 1);
+        for (path, image) in images {
+            writers.push(SendWriter::new(ctx.clone(), gpu.clone(), path, image));
         }
         writers.push(SendWriter::with_writer(ctx, project_path, move |staging| {
             moya_project::save(staging, &project)
@@ -294,6 +323,44 @@ mod tests {
     fn test_path() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!("moya-writer-test-{}-{}.tif", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+    }
+    #[test]
+    fn streaming_export_matches_legacy_pixels_and_icc() {
+        let gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
+        let pixels = [
+            -0.25, 0.5, 2.0, 0.25, 0.75, 0.125, 0.5, 0.0,
+            0.5, 0.25, 0.75, 1.0, 2.0, -1.0, 0.5, 0.5,
+            0.125, 0.875, 0.25, 0.75, 0.0, 1.0, 0.5, 1.0,
+        ];
+        let image = gpu.upload_rgba32f(3, 2, &pixels);
+        let icc = Some(b"test opaque ICC profile payload".to_vec());
+        for depth in [SampleDepth::U8, SampleDepth::U16, SampleDepth::F32] {
+            for opaque in [false, true] {
+                let streamed = test_path();
+                let legacy = test_path();
+                let export = ExportImage { image: image.clone(), depth, opaque, icc_profile: icc.clone() };
+                export.save(&gpu, &streamed).unwrap();
+                let mut rgba = gpu.download_rgba32f(&image);
+                if opaque {
+                    for pixel in rgba.chunks_exact_mut(4) {
+                        pixel[0] *= pixel[3];
+                        pixel[1] *= pixel[3];
+                        pixel[2] *= pixel[3];
+                        pixel[3] = 1.0;
+                    }
+                }
+                let picture = Picture { width: 3, height: 2, depth, rgba, icc_profile: icc.clone() };
+                moya_io::save(&legacy, &picture, depth).unwrap();
+                assert_eq!(std::fs::read(&streamed).unwrap(), std::fs::read(&legacy).unwrap(), "{depth:?}, opaque={opaque}");
+                let actual = moya_io::load(&streamed).unwrap();
+                let expected = moya_io::load(&legacy).unwrap();
+                assert_eq!((actual.width, actual.height, actual.depth), (3, 2, depth));
+                assert_eq!(actual.icc_profile, icc);
+                assert_eq!(actual.rgba, expected.rgba, "{depth:?}, opaque={opaque}");
+                std::fs::remove_file(streamed).unwrap();
+                std::fs::remove_file(legacy).unwrap();
+            }
+        }
     }
     #[test]
     fn cancelled_before_and_during_write_cleans_only_owned_files() {

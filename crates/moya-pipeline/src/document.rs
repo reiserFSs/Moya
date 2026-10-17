@@ -1,3 +1,7 @@
+//! Requested outputs share GPU image storage instead of copying textures.
+//! Draft renders retain bounded reusable grids and stages; HQ renders release
+//! all document caches, including Below inputs, before returning owned outputs.
+
 use super::*;
 
 pub struct LayerInputs<'a> {
@@ -11,13 +15,15 @@ pub struct RenderRequest {
     pub view: ViewFlags,
     pub selected: Option<u64>,
     pub solo_layer: Option<u64>,
+    pub want_composite: bool,
+    pub want_glow_composite: bool,
     pub want_layer_glows: bool,
     pub want_xray: bool,
 }
 
 pub struct DocumentOutput {
-    pub composite: Image,
-    pub glow_composite: Image,
+    pub composite: Option<Image>,
+    pub glow_composite: Option<Image>,
     pub layer_glows: Vec<(u64, Image)>,
     pub xray: Option<Image>,
 }
@@ -51,6 +57,8 @@ impl Document {
         Self { gpu, source: Arc::new(source), host_depth, geometry, layers: HashMap::new(), grids: Vec::new(), generation: 0, budget: CACHE_BYTES }
     }
 
+    pub fn source(&self) -> &Image { &self.source }
+
     pub fn clear_caches(&mut self) {
         self.layers.clear();
         self.grids.clear();
@@ -68,39 +76,44 @@ impl Document {
     /// Checkpoints retain their historical names on single-layer documents.
     pub fn render_with_checkpoints(&mut self, layers: &[LayerInputs<'_>], req: &RenderRequest,
         mut checkpoint: impl FnMut(&str, &Image, Depth)) -> DocumentOutput {
+        if req.mode == RenderMode::Hq { self.clear_caches(); }
         self.layers.retain(|id, _| layers.iter().any(|l| l.settings.id == *id));
         let single=layers.iter().filter(|l|l.settings.visible).count()==1;
-        let needs_below=layers.iter().any(|l|l.settings.visible && l.settings.input==LayerInput::Below);
+        let last_below=layers.iter().rposition(|l|l.settings.visible && l.settings.input==LayerInput::Below);
+        let xray_view=req.want_composite && req.view.xray
+            && layers.iter().any(|l|l.settings.visible && req.selected==Some(l.settings.id));
         let (w,h) = if req.mode == RenderMode::Hq { (self.geometry.orig_w,self.geometry.orig_h) }
             else { self.geometry.working_size(req.mode) };
         let g = self.gpu.clone();
-        let source = if (w,h)==(self.source.width(),self.source.height()) { g.copy(&self.source) }
+        let source = if (w,h)==(self.source.width(),self.source.height()) { self.source.as_ref().clone() }
             else if let Some(grid)=self.grids.iter().find(|grid|grid.input==0 && grid.working.key.mode==req.mode) {
-                g.copy(&grid.working.source)
+                grid.working.source.clone()
             } else {
                 let mut preparer=LayerStages::shared(g.clone(),self.source.clone(),self.host_depth);
                 preparer.prepare(&Params::default(),req.mode);
                 self.generation+=1;
                 Arc::get_mut(preparer.working.as_mut().unwrap()).unwrap().generation=self.generation;
                 let working=preparer.working.take().unwrap();
-                let source=g.copy(&working.source);
-                self.grids.push(Grid{input:0,working});
+                let source=working.source.clone();
+                if req.mode == RenderMode::Draft { self.grids.push(Grid{input:0,working}); }
                 source
             };
-        let mut below = source;
+        let mut below = source.clone();
         let working_size=self.geometry.working_size(req.mode);
-        let mut below_working=if needs_below && working_size!=(w,h) {
+        let mut below_working=if last_below.is_some() && working_size!=(w,h) {
             let mut preparer=LayerStages::shared(g.clone(),self.source.clone(),self.host_depth);
             preparer.prepare(&Params::default(),req.mode);
-            Some(g.copy(&preparer.working.as_ref().unwrap().source))
+            Some(preparer.working.as_ref().unwrap().source.clone())
         } else {None};
-        let mut composite = if req.view.solo { g.fill(w,h,[0.;4]) } else { g.copy(&below) };
-        let xray_base=(req.want_xray && req.view.xray).then(||g.copy(&composite));
-        let mut glow_composite = g.fill(w,h,[0.,0.,0.,1.]);
+        let xray_base=xray_view.then(|| {
+            if req.view.solo { g.fill(w,h,[0.;4]) } else { below.clone() }
+        });
+        let mut composite = None;
+        let mut glow_composite = None;
         let mut layer_glows = Vec::new();
         let mut xray = None;
         let mut stamps = Vec::new();
-        for input in layers {
+        for (index,input) in layers.iter().enumerate() {
             let mut settings=input.settings.clone(); settings.sanitize();
             if !settings.visible { continue; }
             let id=settings.id;
@@ -115,13 +128,14 @@ impl Document {
                 entry.input=signature;
                 entry.input_mode=Some(req.mode);
                 entry.stages.source_is_working=settings.input==LayerInput::Below && req.mode==RenderMode::Draft;
-                entry.stages.source=if settings.input==LayerInput::Below {Arc::new(g.copy(&below))} else {self.source.clone()};
+                entry.stages.source=if settings.input==LayerInput::Below {Arc::new(below.clone())} else {self.source.clone()};
                 entry.stages.working=None;
                 entry.stages.clear_stage_cache();
             }
             let has_mask=input.mask.is_some();
             if entry.stages.mask_generation!=input.mask_generation || entry.has_mask!=has_mask {
-                entry.stages.mask=input.mask.map(|m|g.copy(m));
+                // Brush textures are mutable; cached masks must remain snapshots.
+                entry.stages.mask=input.mask.map(|mask|g.copy(mask));
                 entry.stages.mask_generation=input.mask_generation;
                 entry.has_mask=has_mask;
                 entry.stages.clear_stage_cache();
@@ -133,7 +147,7 @@ impl Document {
                 entry.stages.working=None;
                 if settings.input==LayerInput::Below {
                     if let Some(below)=&below_working {
-                        let mut preparer=LayerStages::shared(g.clone(),Arc::new(g.copy(below)),self.host_depth);
+                        let mut preparer=LayerStages::shared(g.clone(),Arc::new(below.clone()),self.host_depth);
                         preparer.geometry=DocGeometry{orig_w:self.geometry.orig_w,orig_h:self.geometry.orig_h};
                         preparer.source_is_working=true;
                         preparer.prepare(&settings.params,req.mode);
@@ -143,20 +157,28 @@ impl Document {
                 self.generation+=1;
                 let working=Arc::get_mut(entry.stages.working.as_mut().unwrap()).expect("new working grid");
                 working.generation=self.generation;
-                self.grids.push(Grid{input:entry.input_generation,working:entry.stages.working.as_ref().unwrap().clone()});
+                if req.mode == RenderMode::Draft {
+                    self.grids.push(Grid{input:entry.input_generation,working:entry.stages.working.as_ref().unwrap().clone()});
+                }
             }
-            if req.view.xray && !req.want_layer_glows && req.selected==Some(id) {
+            let want_xray=req.selected==Some(id) && (req.want_xray || (req.want_composite && req.view.xray));
+            if req.view.xray && want_xray && !req.want_layer_glows && !req.want_glow_composite {
                 entry.stages.ensure_extraction(&settings.params);
                 let heatmap=entry.stages.output_heatmap(&entry.stages.heatmap_cache.as_ref().unwrap().images[0],&settings.params,req.mode);
-                let base=g.convert_depth(xray_base.as_ref().unwrap_or(&composite),self.host_depth,Depth::Eight);
-                let preview=g.blend(&base,&heatmap,B::Normal,0.8,1.,Depth::Eight);
-                let xray=req.want_xray.then(||g.copy(&heatmap));
-                self.trim_cache();
-                return DocumentOutput{composite:preview,glow_composite,layer_glows,xray};
+                let composite=xray_base.as_ref().map(|base| {
+                    let base=g.convert_depth(base,self.host_depth,Depth::Eight);
+                    g.blend(&base,&heatmap,B::Normal,0.8,1.,Depth::Eight)
+                });
+                let xray=req.want_xray.then(||heatmap.as_ref().clone());
+                if req.mode == RenderMode::Hq { self.clear_caches(); } else { self.trim_cache(); }
+                return DocumentOutput{composite,glow_composite,layer_glows,xray};
             }
+            let fast_composite=req.want_composite && single && req.solo_layer.is_none_or(|solo|solo==id)
+                && settings.input==LayerInput::Original && settings.blend==LayerBlend::Auto && settings.opacity==1.
+                && !xray_view;
             let view=ViewFlags{xray:false,solo:req.view.solo,host_is_float:req.view.host_is_float};
-            let output=entry.stages.render_with_checkpoints(&settings.params,req.mode,&view,&mut checkpoint);
-            let output_generation=entry.stages.output_cache.as_ref().unwrap().generation;
+            let output=entry.stages.render_selected(&settings.params,req.mode,&view,fast_composite,want_xray,&mut checkpoint);
+            let output_generation=output.generation;
             let included=req.solo_layer.is_none_or(|solo|solo==id);
             let blend=match settings.blend {
                 LayerBlend::Auto if req.view.host_is_float && !req.view.solo=>B::LinearDodge,
@@ -168,41 +190,58 @@ impl Document {
             let depth=if req.view.host_is_float && !req.view.solo {Depth::Float} else {Depth::Eight};
             let linear_glow=(depth==Depth::Float).then(||g.convert_depth(&output.glow,Depth::Eight,Depth::Float));
             let glow=linear_glow.as_ref().unwrap_or(&output.glow);
-            if needs_below {below=g.blend(&below,glow,blend,settings.opacity,1.,depth);}
-            if let Some(base)=below_working.as_mut() {
-                let small=&entry.stages.output_cache.as_ref().unwrap().images[3];
-                let linear=(depth==Depth::Float).then(||g.convert_depth(small,Depth::Eight,Depth::Float));
-                *base=g.blend(base,linear.as_ref().unwrap_or(small),blend,settings.opacity,1.,depth);
+            if last_below.is_some_and(|last|index<last) {
+                below=g.blend(&below,glow,blend,settings.opacity,1.,depth);
+                if let Some(base)=below_working.as_mut() {
+                    let small=&output.working_glow;
+                    let linear=(depth==Depth::Float).then(||g.convert_depth(small,Depth::Eight,Depth::Float));
+                    *base=g.blend(base,linear.as_ref().unwrap_or(small),blend,settings.opacity,1.,depth);
+                }
             }
             if included {
-                composite=if single && settings.input==LayerInput::Original && settings.blend==LayerBlend::Auto && settings.opacity==1. {
-                    output.composite
-                } else {g.blend(&composite,glow,blend,settings.opacity,1.,depth)};
-                glow_composite=g.blend(&glow_composite,glow,blend,settings.opacity,1.,depth);
+                if req.want_composite && !xray_view {
+                    composite=Some(if fast_composite { output.composite } else {
+                        let base=composite.get_or_insert_with(|| {
+                            if req.view.solo {g.fill(w,h,[0.;4])} else {source.clone()}
+                        });
+                        g.blend(base,glow,blend,settings.opacity,1.,depth)
+                    });
+                }
+                if req.want_glow_composite {
+                    let base=glow_composite.get_or_insert_with(||g.fill(w,h,[0.,0.,0.,1.]));
+                    glow_composite=Some(g.blend(base,glow,blend,settings.opacity,1.,depth));
+                }
                 if req.want_layer_glows {layer_glows.push((id,output.glow));}
             }
-            if req.want_xray && req.selected==Some(id) {xray=Some(output.xray);}
+            if want_xray {xray=Some(output.xray);}
             stamps.push(Stamp{id,generation:output_generation,opacity:settings.opacity.to_bits(),blend:settings.blend});
             // Render one layer at a time and reclaim cached descendants before the next HQ layer.
-            self.trim_cache();
+            if req.mode == RenderMode::Hq { self.layers.remove(&id); } else { self.trim_cache(); }
         }
-        if req.view.xray {
+        if req.want_composite && req.view.xray {
             if let Some(heatmap)=&xray {
                 let base=g.convert_depth(xray_base.as_ref().unwrap(),self.host_depth,Depth::Eight);
-                composite=g.blend(&base,heatmap,B::Normal,0.8,1.,Depth::Eight);
+                composite=Some(g.blend(&base,heatmap,B::Normal,0.8,1.,Depth::Eight));
             }
         }
-        if req.view.host_is_float && !req.view.solo {
-            glow_composite=g.convert_depth(&glow_composite,Depth::Float,Depth::Eight);
+        if req.want_composite && composite.is_none() {
+            composite=Some(if req.view.solo {g.fill(w,h,[0.;4])} else {source});
         }
-        self.trim_cache();
+        if req.want_glow_composite && glow_composite.is_none() {
+            glow_composite=Some(g.fill(w,h,[0.,0.,0.,1.]));
+        }
+        if req.view.host_is_float && !req.view.solo {
+            glow_composite=glow_composite.map(|image|g.convert_depth(&image,Depth::Float,Depth::Eight));
+        }
+        if !req.want_xray { xray=None; }
+        if req.mode == RenderMode::Hq { self.clear_caches(); } else { self.trim_cache(); }
         DocumentOutput{composite,glow_composite,layer_glows,xray}
     }
 
     fn retained_bytes(&self)->u64 {
         let mut images=std::collections::HashSet::new();
         let mut bytes=0;
-        let mut account=|image:&Image| {if images.insert(image as *const Image) {bytes+=image_bytes(image);}};
+        let mut account=|image:&Image| {if images.insert(image.storage_id()) {bytes+=image_bytes(image);}};
         for grid in &self.grids {account(&grid.working.source);account(&grid.working.color);account(&grid.working.luminance);}
         for layer in self.layers.values() {
             let s=&layer.stages;
