@@ -25,6 +25,8 @@ pub mod reference;
 mod masks;
 pub use masks::MaskSourceKind;
 mod transfers;
+mod region;
+pub use region::{Filter, Region, ViewMap};
 use parking_lot::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
@@ -252,7 +254,7 @@ pub struct Gpu {
     queue: wgpu::Queue,
     pool: Arc<Pool>,
     pending: Mutex<Pending>,
-    pipelines: [wgpu::ComputePipeline; 35],
+    pipelines: [wgpu::ComputePipeline; 36],
     display: wgpu::ComputePipeline,
     gray_upload: OnceLock<wgpu::ComputePipeline>,
     mask_source: OnceLock<wgpu::ComputePipeline>,

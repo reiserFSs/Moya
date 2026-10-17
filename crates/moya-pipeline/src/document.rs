@@ -3,6 +3,8 @@
 //! all document caches, including Below inputs, before returning owned outputs.
 
 use super::*;
+mod region;
+pub use region::{ViewRegion, RegionQuality, RefineState};
 
 pub struct LayerInputs<'a> {
     pub settings: &'a LayerSettings,
@@ -49,12 +51,13 @@ pub struct Document {
     grids: Vec<Grid>,
     generation: u64,
     budget: u64,
+    refined: HashMap<u64, region::RefinedLayer>,
 }
 
 impl Document {
     pub fn new(gpu: Arc<Gpu>, source: Image, host_depth: Depth) -> Self {
         let geometry = DocGeometry { orig_w: source.width(), orig_h: source.height() };
-        Self { gpu, source: Arc::new(source), host_depth, geometry, layers: HashMap::new(), grids: Vec::new(), generation: 0, budget: CACHE_BYTES }
+        Self { gpu, source: Arc::new(source), host_depth, geometry, layers: HashMap::new(), grids: Vec::new(), generation: 0, budget: CACHE_BYTES, refined: HashMap::new() }
     }
 
     pub fn source(&self) -> &Image { &self.source }
@@ -62,6 +65,7 @@ impl Document {
     pub fn clear_caches(&mut self) {
         self.layers.clear();
         self.grids.clear();
+        self.refined.clear();
     }
 
     /// Cold-stage benchmark/reset, retaining the shared prepared document grids.
@@ -77,6 +81,7 @@ impl Document {
     pub fn render_with_checkpoints(&mut self, layers: &[LayerInputs<'_>], req: &RenderRequest,
         mut checkpoint: impl FnMut(&str, &Image, Depth)) -> DocumentOutput {
         if req.mode == RenderMode::Hq { self.clear_caches(); }
+        if req.mode == RenderMode::Draft { self.invalidate_refine(layers, &req.view); }
         self.layers.retain(|id, _| layers.iter().any(|l| l.settings.id == *id));
         let single=layers.iter().filter(|l|l.settings.visible).count()==1;
         let last_below=layers.iter().rposition(|l|l.settings.visible && l.settings.input==LayerInput::Below);

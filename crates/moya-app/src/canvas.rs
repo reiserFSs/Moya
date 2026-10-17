@@ -1,6 +1,15 @@
 use crate::{App, Preview, mask::{BrushSettings, MaskView, Tool}};
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use moya_gpu::wgpu;
+use moya_gpu::{Depth, Filter, Image, ViewMap};
+use moya_pipeline::{LayerInputs, RefineState, RegionQuality, ViewRegion};
+use std::time::{Duration, Instant};
+
+struct Viewport {
+    result: Preview,
+    source: Option<Preview>,
+    quality: RegionQuality,
+}
 
 pub(super) struct CanvasState {
     pub(super) zoom: f32,
@@ -12,6 +21,11 @@ pub(super) struct CanvasState {
     source_dirty: bool,
     stroke_active: bool,
     stroke_layer: Option<u64>,
+    viewport: Option<Viewport>,
+    viewport_key: Option<[u32; 13]>,
+    last_interaction: Instant,
+    refine: RefineState,
+    magnified: bool,
 }
 
 impl Default for CanvasState {
@@ -26,6 +40,11 @@ impl Default for CanvasState {
             source_dirty: true,
             stroke_active: false,
             stroke_layer: None,
+            viewport: None,
+            viewport_key: None,
+            last_interaction: Instant::now(),
+            refine: RefineState::Idle,
+            magnified: false,
         }
     }
 }
@@ -37,6 +56,12 @@ impl CanvasState {
         self.source_dirty = true;
         self.stroke_active = false;
         self.stroke_layer = None;
+        self.invalidate();
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.viewport_key = None;
+        self.last_interaction = Instant::now();
     }
 
     fn zoom_at(&mut self, factor: f32, cursor: Pos2, center: Pos2) {
@@ -49,6 +74,148 @@ impl CanvasState {
 }
 
 impl App {
+    fn viewport_texture(&self, image: &Image, label: &str, old: Option<Preview>) -> Preview {
+        let size = [image.width(), image.height()];
+        if let Some(old) = old {
+            if old.size == size {
+                self.gpu.write_display_rgba8(image, &old.texture);
+                return old;
+            }
+            self.render_state.renderer.write().free_texture(&old.id);
+        }
+        let texture = self.gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let id = self.render_state.renderer.write().register_native_texture(
+            self.gpu.device(), &view, wgpu::FilterMode::Nearest,
+        );
+        self.gpu.write_display_rgba8(image, &texture);
+        Preview { texture, id, size }
+    }
+
+    fn clear_viewport(&mut self) {
+        if let Some(viewport) = self.canvas.viewport.take() {
+            let mut renderer = self.render_state.renderer.write();
+            renderer.free_texture(&viewport.result.id);
+            if let Some(source) = viewport.source { renderer.free_texture(&source.id); }
+        }
+        self.canvas.viewport_key = None;
+    }
+
+    /// Only the visible original-pixel bounds are composited; the full source stays on the GPU.
+    fn canvas_viewport(&mut self, ui: &egui::Ui, rect: Rect, area: Rect, show_source: bool) -> Option<Rect> {
+        let source = self.source_preview.as_ref()?;
+        let pic = self.picture.as_ref()?;
+        let width = pic.width;
+        let height = pic.height;
+        let host_depth = pic.depth;
+        let magnified = self.canvas.zoom > source.width() as f32 / width as f32;
+        if !magnified {
+            if self.canvas.magnified {
+                self.clear_viewport();
+                if let Some(document) = self.renderer.as_mut() { document.drop_refine(); }
+                self.trim_idle();
+            }
+            self.canvas.magnified = false;
+            self.canvas.refine = RefineState::Idle;
+            return None;
+        }
+        if !self.canvas.magnified {
+            self.canvas.last_interaction = Instant::now();
+        }
+        self.canvas.magnified = true;
+        let clipped = rect.intersect(area);
+        if !clipped.is_positive() { return None; }
+        let region = visible_region(rect, clipped, width, height);
+        let native = self.canvas.zoom >= 1.0;
+        let mut key = [region.x, region.y, region.w, region.h, 0, 0,
+            self.canvas.zoom.to_bits(), self.export_depth as u32, self.glow_only as u32, 0,
+            rect.min.x.to_bits(), rect.min.y.to_bits(), show_source as u32];
+        if self.canvas.viewport_key.is_some_and(|previous| previous[..4] != key[..4]
+            || previous[6..9] != key[6..9] || previous[10..] != key[10..])
+            || self.dirty || ui.input(|i| i.pointer.any_down()) {
+            self.canvas.last_interaction = Instant::now();
+        }
+        let flags = self.flags();
+        let mut request = crate::preview_request(flags, self.selected, self.solo_layer);
+        if self.glow_only {
+            request.want_composite = false;
+            request.want_glow_composite = true;
+        }
+        let hover = self.hover_params.as_ref().map(|params| {
+            let mut settings = self.layers[self.selected_index()].settings.clone();
+            settings.params = params.clone();
+            settings
+        });
+        let inputs: Vec<_> = self.layers.iter().map(|layer| LayerInputs {
+            settings: hover.as_ref().filter(|settings| settings.id == layer.settings.id).unwrap_or(&layer.settings),
+            mask: layer.mask.gpu_image(), mask_generation: layer.mask.generation(),
+        }).collect();
+        let document = self.renderer.as_mut()?;
+        self.canvas.refine = document.refine_state(&inputs, &flags);
+        let elapsed = self.canvas.last_interaction.elapsed();
+        if !self.dirty && !self.busy && self.hover_params.is_none() && elapsed >= Duration::from_millis(500)
+            && !matches!(self.canvas.refine, RefineState::Ready) {
+            self.canvas.refine = document.refine_step(&inputs, &flags);
+            ui.ctx().request_repaint();
+        } else if elapsed < Duration::from_millis(500) {
+            ui.ctx().request_repaint_after(Duration::from_millis(500) - elapsed);
+        }
+        key[9] = matches!(self.canvas.refine, RefineState::Ready) as u32;
+        let exact = native && key[9] != 0 && !flags.xray;
+        let out_w = if exact { region.w } else { (region.w as f32 * self.canvas.zoom).ceil() as u32 }.max(1);
+        let out_h = if exact { region.h } else { (region.h as f32 * self.canvas.zoom).ceil() as u32 }.max(1);
+        key[4] = out_w;
+        key[5] = out_h;
+        if self.canvas.viewport_key != Some(key) {
+            let depth = [Depth::Eight, Depth::Sixteen, Depth::Float][self.export_depth];
+            let (image, quality) = document.render_region(&inputs, &request, region, out_w, out_h, depth);
+            let display = if matches!(quality, RegionQuality::Exact) && depth != Depth::Eight {
+                self.gpu.convert_depth(&image, depth, Depth::Eight)
+            } else { image };
+            let original = show_source.then(|| {
+                let original = self.gpu.sample_view(document.source(), ViewMap {
+                    origin_x: region.x as f64, origin_y: region.y as f64,
+                    src_per_dst: region.w as f64 / out_w as f64,
+                }, out_w, out_h, if exact { Filter::Nearest } else { Filter::Bilinear });
+                let from = match host_depth {
+                    crate::SampleDepth::F32 => Depth::Float,
+                    crate::SampleDepth::U16 => Depth::Sixteen,
+                    _ => Depth::Eight,
+                };
+                if from != Depth::Eight {
+                    self.gpu.convert_depth(&original, from, Depth::Eight)
+                } else { original }
+            });
+            let (old_result, old_source) = self.canvas.viewport.take()
+                .map(|viewport| (Some(viewport.result), viewport.source)).unwrap_or_default();
+            let result = self.viewport_texture(&display, "Moya viewport result", old_result);
+            let source = match original {
+                Some(image) => Some(self.viewport_texture(&image, "Moya viewport original", old_source)),
+                None => old_source,
+            };
+            self.gpu.flush();
+            self.canvas.viewport = Some(Viewport {
+                result, source, quality: if exact { quality } else { RegionQuality::Preview },
+            });
+            self.canvas.viewport_key = Some(key);
+        }
+        Some(Rect::from_min_size(
+            rect.min + egui::vec2(region.x as f32 / width as f32 * rect.width(),
+                region.y as f32 / height as f32 * rect.height()),
+            egui::vec2(region.w as f32 / width as f32 * rect.width(),
+                region.h as f32 / height as f32 * rect.height()),
+        ))
+    }
+
     fn canvas_source(&mut self) {
         if !self.canvas.source_dirty {
             return;
@@ -207,12 +374,19 @@ impl App {
             }
         }
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        let source_id = self.canvas.source.as_ref().map(|p| p.id).unwrap_or(self.preview.as_ref().unwrap().id);
-        painter.image(if original { source_id } else { self.preview.as_ref().unwrap().id }, rect, uv, Color32::WHITE);
+        let viewport_rect = self.canvas_viewport(ui, rect, area, original || self.canvas.split);
+        let (result_id, source_id, image_rect) = if let Some((viewport, draw_rect)) =
+            self.canvas.viewport.as_ref().zip(viewport_rect) {
+            (viewport.result.id, viewport.source.as_ref().map_or(viewport.result.id, |source| source.id), draw_rect)
+        } else {
+            (self.preview.as_ref().unwrap().id,
+                self.canvas.source.as_ref().map(|p| p.id).unwrap_or(self.preview.as_ref().unwrap().id), rect)
+        };
+        painter.image(if original { source_id } else { result_id }, image_rect, uv, Color32::WHITE);
         if self.canvas.split && !original {
             let x = rect.left() + rect.width() * self.canvas.divider;
             painter.with_clip_rect(area.intersect(Rect::from_min_max(area.min, Pos2::new(x, area.bottom()))))
-                .image(source_id, rect, uv, Color32::WHITE);
+                .image(source_id, image_rect, uv, Color32::WHITE);
             painter.line_segment([Pos2::new(x, clipped.top()), Pos2::new(x, clipped.bottom())],
                 egui::Stroke::new(2.0, Color32::WHITE));
             painter.circle_filled(Pos2::new(x, clipped.center().y), 5.0, Color32::WHITE);
@@ -282,7 +456,7 @@ impl App {
                 painter.circle_filled(pos, 1.5, color);
             }
         }
-        let overlay = Rect::from_min_size(area.left_bottom() + Vec2::new(12.0, -44.0), Vec2::new(300.0, 32.0));
+        let overlay = Rect::from_min_size(area.left_bottom() + Vec2::new(12.0, -44.0), Vec2::new(460.0, 32.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(overlay), |ui| {
             egui::Frame::new().fill(Color32::from_black_alpha(220)).corner_radius(5.0).inner_margin(5.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -296,11 +470,37 @@ impl App {
                         self.canvas.pan = Vec2::ZERO;
                     }
                     ui.label(format!("{:.0}%", self.canvas.zoom * 100.0));
+                    // (label, tooltip, colour): grey Preview, amber Refining, green Exact.
+                    let preview = Color32::from_gray(150);
+                    let (label, explanation, color) = if self.canvas.magnified {
+                        match self.canvas.refine {
+                            RefineState::Pending { done, total } if self.canvas.last_interaction.elapsed() >= Duration::from_millis(500) =>
+                                (format!("Refining {done}/{total}"), "Computing export-quality glows, one layer per frame. Editing pauses refinement.", Color32::from_rgb(232, 166, 74)),
+                            _ if self.canvas.viewport.as_ref().is_some_and(|v| matches!(v.quality, RegionQuality::Exact)) =>
+                                ("Exact".into(), "Native image pixels, export-quality glows and the selected export depth: identical to the export. Nearest-neighbour display.", Color32::from_rgb(92, 196, 137)),
+                            _ => ("Preview".into(), "Full-resolution source with Draft glows. After a short pause, glows refine to export quality; 100% or above shows exact export pixels.", preview),
+                        }
+                    } else {
+                        ("Preview".into(), "Draft preview at fit scale. Zoom in for full-resolution source detail and automatic glow refinement.", preview)
+                    };
+                    let text = egui::RichText::new(label).size(11.0).color(color);
+                    egui::Frame::new().stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.7))).corner_radius(8.0)
+                        .inner_margin(egui::Margin::symmetric(7, 1))
+                        .show(ui, |ui| { ui.label(text); })
+                        .response.on_hover_text(explanation);
                     ui.toggle_value(&mut self.canvas.split, "Split").on_hover_text("Compare original and result; hold Space for original");
                 });
             });
         });
     }
+}
+
+fn visible_region(rect: Rect, clipped: Rect, width: u32, height: u32) -> ViewRegion {
+    let x = (((clipped.left() - rect.left()) / rect.width() * width as f32).floor() as u32).min(width - 1);
+    let y = (((clipped.top() - rect.top()) / rect.height() * height as f32).floor() as u32).min(height - 1);
+    let right = (((clipped.right() - rect.left()) / rect.width() * width as f32).ceil() as u32).clamp(x + 1, width);
+    let bottom = (((clipped.bottom() - rect.top()) / rect.height() * height as f32).ceil() as u32).clamp(y + 1, height);
+    ViewRegion { x, y, w: right - x, h: bottom - y }
 }
 
 fn adjust_brush(brush: &mut BrushSettings, increase: bool, hardness: bool) {
@@ -319,6 +519,16 @@ fn normalized_position(rect: Rect, pos: Pos2) -> [f32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn visible_bounds_cover_partial_pixels_and_clamp_image_edges() {
+        let rect = Rect::from_min_size(egui::pos2(-10.5, -20.25), egui::vec2(100.0, 50.0));
+        let clipped = rect.intersect(Rect::from_min_max(Pos2::ZERO, egui::pos2(70.0, 60.0)));
+        let region = visible_region(rect, clipped, 1000, 500);
+        assert_eq!((region.x, region.y, region.w, region.h), (105, 202, 700, 298));
+        let full = visible_region(rect, rect, 1000, 500);
+        assert_eq!((full.x, full.y, full.w, full.h), (0, 0, 1000, 500));
+    }
+
 
     #[test]
     fn brush_shortcuts_scale_size_and_clamp_hardness() {

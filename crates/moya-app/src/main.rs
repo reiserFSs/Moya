@@ -384,10 +384,15 @@ impl App {
         let inputs: Vec<_> = self.layers.iter().map(|layer| LayerInputs {
             settings: &layer.settings, mask: layer.mask.gpu_image(), mask_generation: layer.mask.generation(),
         }).collect();
-        let request = preview_request(flags, self.selected, self.solo_layer);
+        let mut request = preview_request(flags, self.selected, self.solo_layer);
+        if self.glow_only {
+            request.want_composite = false;
+            request.want_glow_composite = true;
+        }
         let output = self.renderer.as_mut().unwrap().render(&inputs, &request);
         if let Some(params) = original { self.layers[index].settings.params = params; }
-        self.display(output.xray.as_ref().or(output.composite.as_ref()).expect("requested preview"));
+        self.display(output.xray.as_ref().or(output.composite.as_ref()).or(output.glow_composite.as_ref()).expect("requested preview"));
+        self.canvas.invalidate();
         self.dirty = false;
         self.force = false;
     }
@@ -497,7 +502,7 @@ impl eframe::App for App {
         }
         let before: Vec<_> = self.layers.iter().map(|layer| layer.settings.clone()).collect();
         let old_hover = self.hover_params.clone();
-        let old_view = (self.xray, self.solo, self.solo_layer, self.selected);
+        let old_view = (self.xray, self.solo, self.solo_layer, self.selected, self.glow_only, self.export_depth);
         let ctx = ui.ctx().clone();
         self.handle_project_close(&ctx);
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
@@ -550,7 +555,7 @@ impl eframe::App for App {
                     self.restore_history(true);
                 }
                 ui.checkbox(&mut self.glow_only, "Glow only")
-                    .on_hover_text("Export the visible layers' glow composite without the source");
+                    .on_hover_text("Preview and export the visible layers' glow composite without the source");
                 egui::ComboBox::from_id_salt("save depth")
                     .selected_text(["8 bit", "16 bit", "32 bit"][self.export_depth])
                     .show_ui(ui, |ui| {
@@ -656,14 +661,17 @@ impl eframe::App for App {
         for layer in &mut self.layers { layer.settings.sanitize(); }
         if old_hover != self.hover_params {
             self.dirty = true;
+            self.canvas.invalidate();
             self.force = true;
         }
         if !self.layers.iter().map(|layer| &layer.settings).eq(before.iter()) {
             self.dirty = true;
+            self.canvas.invalidate();
             self.status.clear();
         }
-        if old_view != (self.xray, self.solo, self.solo_layer, self.selected) {
+        if old_view != (self.xray, self.solo, self.solo_layer, self.selected, self.glow_only, self.export_depth) {
             self.dirty = true;
+            self.canvas.invalidate();
             self.force = true;
         }
         egui::CentralPanel::default().show(ui, |ui| self.canvas_ui(ui));

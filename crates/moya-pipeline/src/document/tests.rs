@@ -345,3 +345,204 @@ fn benchmark_three_layer_fx_draft_cold_and_top_layer_edit() {
     assert!(pixels.iter().all(|value| value.is_finite()));
     eprintln!("3-layer fx Draft generated 512x512, composite readback included: cold={cold:?}, top-layer threshold edit={edit:?}");
 }
+
+fn region_random(seed: &mut u64) -> u32 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (*seed >> 32) as u32
+}
+
+fn finish_refine(document: &mut Document, layers: &[LayerInputs<'_>], view: &ViewFlags) {
+    let total = layers.iter().filter(|input| input.settings.visible).count();
+    let mut done = match document.refine_state(layers, view) {
+        RefineState::Ready => return,
+        RefineState::Idle => 0,
+        RefineState::Pending { done, total: actual } => {
+            assert_eq!(actual, total);
+            done
+        }
+    };
+    while done < total {
+        done += 1;
+        let expected = if done == total { RefineState::Ready }
+            else { RefineState::Pending { done, total } };
+        assert_eq!(document.refine_step(layers, view), expected,
+            "one call must refine exactly one visible layer");
+        assert_eq!(document.refine_state(layers, view), expected);
+    }
+    assert_eq!(document.refine_step(layers, view), RefineState::Ready);
+}
+
+#[test]
+fn refined_regions_match_hq_export_bits_randomized_stacks_and_capped_edges() {
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let mut seed = 0xa153_0fed_93b7_4621;
+    for host_depth in [Depth::Eight, Depth::Sixteen, Depth::Float] {
+        // The thin image crosses the HQ 4000px bicubic cap without a huge fixture.
+        for (width, height) in [(19, 13), (4003, 3)] {
+            let scale = match host_depth {
+                Depth::Eight => 255.,
+                Depth::Sixteen => 32768.,
+                Depth::Float => 0.,
+            };
+            let pixels: Vec<f32> = (0..width * height).flat_map(|_| {
+                let mut pixel = [0.; 4];
+                for value in &mut pixel {
+                    *value = (region_random(&mut seed) % 10001) as f32 / 10000.;
+                    if scale != 0. { *value = (*value * scale).round() / scale; }
+                }
+                if host_depth == Depth::Float { pixel[0] *= 1.5; }
+                pixel
+            }).collect();
+            let source = gpu.upload_rgba32f(width, height, &pixels);
+            let mask_pixels: Vec<f32> = (0..width * height).flat_map(|index| {
+                let value = if index % 7 == 0 { 0. } else {
+                    (region_random(&mut seed) % 256) as f32 / 255.
+                };
+                [value, value, value, 1.]
+            }).collect();
+            let mask = gpu.upload_rgba32f(width, height, &mask_pixels);
+            let mut settings: Vec<_> = (1..=6).map(layer).collect();
+            for (index, blend) in [LayerBlend::Auto, LayerBlend::Screen,
+                LayerBlend::LinearDodge, LayerBlend::Lighten, LayerBlend::Normal,
+                LayerBlend::Screen].into_iter().enumerate() {
+                let settings = &mut settings[index];
+                settings.blend = blend;
+                settings.opacity = 0.2 + (region_random(&mut seed) % 801) as f32 / 1000.;
+                settings.params.threshold = 0.15 + (region_random(&mut seed) % 400) as f32 / 1000.;
+                settings.params.radius = 1. + (region_random(&mut seed) % 3) as f32;
+                settings.params.exposure = (region_random(&mut seed) % 100) as f32 / 100.;
+                settings.params.hdr32 = host_depth == Depth::Float;
+                settings.params.unmult = index % 2 == 0;
+                settings.input = if index == 2 || index == 4 { LayerInput::Below }
+                    else { LayerInput::Original };
+            }
+            settings[5].visible = false;
+            let layers: Vec<_> = settings.iter().enumerate().map(|(index, settings)| LayerInputs {
+                settings, mask: (index % 2 == 0).then_some(&mask), mask_generation: 1,
+            }).collect();
+            let mut document = Document::new(gpu.clone(), source.clone(), host_depth);
+            let mut oracle = Document::new(gpu.clone(), source, host_depth);
+            let mut regions = vec![
+                ViewRegion { x: 0, y: 0, w: width, h: height },
+                ViewRegion { x: 0, y: 0, w: 1, h: 1 },
+                ViewRegion { x: width - 1, y: 0, w: 1, h: 1 },
+                ViewRegion { x: 0, y: height - 1, w: 1, h: 1 },
+                ViewRegion { x: width - 1, y: height - 1, w: 1, h: 1 },
+                ViewRegion { x: width - 7, y: 0, w: 7, h: height },
+            ];
+            for _ in 0..3 {
+                let x = region_random(&mut seed) % width;
+                let y = region_random(&mut seed) % height;
+                regions.push(ViewRegion { x, y,
+                    w: 1 + region_random(&mut seed) % (width - x),
+                    h: 1 + region_random(&mut seed) % (height - y) });
+            }
+            for solo in [false, true] {
+                for solo_layer in [None, Some(3), Some(6)] {
+                    let mut req = request();
+                    req.mode = RenderMode::Hq;
+                    req.view.host_is_float = host_depth == Depth::Float;
+                    req.view.solo = solo;
+                    req.solo_layer = solo_layer;
+                    req.want_glow_composite = true;
+                    finish_refine(&mut document, &layers, &req.view);
+                    // HQ intentionally releases caches, so use a separate legacy oracle.
+                    let legacy = oracle.render(&layers, &req);
+                    for glow_only in [false, true] {
+                        req.want_composite = !glow_only;
+                        let legacy_image = if glow_only { legacy.glow_composite.as_ref().unwrap() }
+                            else { legacy.composite.as_ref().unwrap() };
+                        // Same conversion as app export; source-free solo composites are Eight.
+                        let from = if !glow_only && req.view.host_is_float && !solo {
+                            Depth::Float
+                        } else { Depth::Eight };
+                        for export_depth in [Depth::Eight, Depth::Sixteen, Depth::Float] {
+                            let expected = if from != export_depth {
+                                gpu.convert_depth(legacy_image, from, export_depth)
+                            } else { legacy_image.clone() };
+                            let expected_bits: Vec<_> = gpu.download_rgba32f(&expected)
+                                .into_iter().map(f32::to_bits).collect();
+                            for region in &regions {
+                                let (actual, quality) = document.render_region(&layers, &req,
+                                    *region, region.w, region.h, export_depth);
+                                assert_eq!(quality, RegionQuality::Exact);
+                                assert_eq!((actual.width(), actual.height()), (region.w, region.h));
+                                let actual_bits: Vec<_> = gpu.download_rgba32f(&actual)
+                                    .into_iter().map(f32::to_bits).collect();
+                                let crop_bits: Vec<_> = (region.y..region.y + region.h)
+                                    .flat_map(|y| {
+                                        let start = ((y * width + region.x) * 4) as usize;
+                                        expected_bits[start..start + (region.w * 4) as usize].iter().copied()
+                                    }).collect();
+                                assert_eq!(actual_bits, crop_bits,
+                                    "HQ export bit mismatch: host={host_depth:?}, export={export_depth:?}, size={width}x{height}, solo={solo}, solo_layer={solo_layer:?}, glow={glow_only}, region={region:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn refinement_is_incremental_invalidates_dependents_and_survives_draft() {
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let mut document = Document::new(gpu.clone(), gpu.fill(7, 5, [0.8, 0.4, 0.2, 0.7]), Depth::Eight);
+    let mask = gpu.fill(7, 5, [0.5, 0.5, 0.5, 1.]);
+    let mut settings = [layer(1), layer(2), layer(3), layer(4), layer(5)];
+    settings[3].input = LayerInput::Below;
+    settings[4].visible = false;
+    let mut req = request();
+    req.solo_layer = Some(1);
+    assert_eq!(document.refine_state(&inputs(&settings), &req.view), RefineState::Idle);
+    finish_refine(&mut document, &inputs(&settings), &req.view);
+    let bytes = document.refine_bytes();
+    assert!(bytes > 0);
+    document.render(&inputs(&settings), &req);
+    document.clear_stage_caches();
+    assert_eq!(document.refine_state(&inputs(&settings), &req.view), RefineState::Ready);
+    assert_eq!(document.refine_bytes(), bytes, "Draft must not evict independently retained HQ glows");
+
+    // Editing one Original invalidates it and the later Below, not independent Originals.
+    settings[1].params.threshold += 0.2;
+    assert_eq!(document.refine_state(&inputs(&settings), &req.view),
+        RefineState::Pending { done: 2, total: 4 });
+    finish_refine(&mut document, &inputs(&settings), &req.view);
+    settings[1].opacity = 0.3;
+    settings[1].blend = LayerBlend::Normal;
+    assert_eq!(document.refine_state(&inputs(&settings), &req.view),
+        RefineState::Pending { done: 3, total: 4 });
+    finish_refine(&mut document, &inputs(&settings), &req.view);
+
+    for generation in [1, 2] {
+        let masked: Vec<_> = settings.iter().enumerate().map(|(index, settings)| LayerInputs {
+            settings, mask: (index == 1).then_some(&mask),
+            mask_generation: if index == 1 { generation } else { 0 },
+        }).collect();
+        assert_eq!(document.refine_state(&masked, &req.view),
+            RefineState::Pending { done: 2, total: 4 });
+        finish_refine(&mut document, &masked, &req.view);
+    }
+    finish_refine(&mut document, &inputs(&settings), &req.view);
+    settings[4].visible = true;
+    assert_eq!(document.refine_state(&inputs(&settings), &req.view),
+        RefineState::Pending { done: 4, total: 5 });
+    finish_refine(&mut document, &inputs(&settings), &req.view);
+    let region = ViewRegion { x: 1, y: 1, w: 3, h: 2 };
+    let (_, quality) = document.render_region(&inputs(&settings), &req, region, 3, 2, Depth::Eight);
+    assert_eq!(quality, RegionQuality::Exact);
+    let (_, quality) = document.render_region(&inputs(&settings), &req, region, 6, 4, Depth::Eight);
+    assert_eq!(quality, RegionQuality::Preview);
+    req.view.xray = true;
+    req.selected = Some(1);
+    let (_, quality) = document.render_region(&inputs(&settings), &req, region, 3, 2, Depth::Eight);
+    assert_eq!(quality, RegionQuality::Preview);
+    document.drop_refine();
+    assert_eq!(document.refine_bytes(), 0);
+    assert_eq!(document.refine_state(&inputs(&settings), &req.view), RefineState::Idle);
+    settings.iter_mut().for_each(|settings| settings.visible = false);
+    assert_eq!(document.refine_state(&inputs(&settings), &req.view), RefineState::Ready);
+}

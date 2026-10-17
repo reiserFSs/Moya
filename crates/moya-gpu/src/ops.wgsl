@@ -8,6 +8,12 @@ struct Params { head:vec4<f32>, p:array<vec4<f32>,7> }
 @group(0) @binding(5) var<storage,read> stops:array<vec4<f32>>;
 fn arg(i:u32)->f32{return u.p[i/4u][i%4u];}
 fn load(t:texture_2d<f32>,p:vec2<i32>)->vec4<f32>{return textureLoad(t,clamp(p,vec2(0),vec2<i32>(textureDimensions(t))-1),0);}
+// Region pointwise inputs may already be cropped; resamplers always read their source grid.
+fn region_load(t:texture_2d<f32>,p:vec2<i32>)->vec4<f32>{
+ var q=p;
+ if(arg(24)>0. && all(textureDimensions(t)==vec2<u32>(u32(arg(24)),u32(arg(25))))){q+=vec2<i32>(i32(arg(26)),i32(arg(27)));}
+ return load(t,q);
+}
 fn linear(t:texture_2d<f32>,p:vec2<f32>)->vec4<f32>{let v=vec2<i32>(floor(p));let f=fract(p);return mix(mix(load(t,v),load(t,v+vec2(1,0)),f.x),mix(load(t,v+vec2(0,1)),load(t,v+vec2(1,1)),f.x),f.y);}
 fn cubic(x:f32)->f32{let v=abs(x);if(v<1.){return (1.5*v-2.5)*v*v+1.;}if(v<2.){return ((-.5*v+2.5)*v-4.)*v+2.;}return 0.;}
 fn bicubic(p:vec2<f32>)->vec4<f32>{let origin=vec2<i32>(floor(p));var sum=vec4(0.);for(var y=-1;y<=2;y++){for(var x=-1;x<=2;x++){let q=origin+vec2(x,y);sum+=load(a,q)*cubic(p.x-f32(q.x))*cubic(p.y-f32(q.y));}}return sum;}
@@ -70,7 +76,7 @@ fn satmap(s:f32,amount:f32)->f32{if(amount<=0.){return s*(1.+amount);}if(amount>
 fn hash(v:u32)->u32{var x=v;x=(x^(x>>16u))*0x7feb352du;x=(x^(x>>15u))*0x846ca68bu;return x^(x>>16u);}
 fn random(v:u32)->f32{return f32(hash(v)&0x00ffffffu)/16777216.;}
 @compute @workgroup_size(16,16)
-fn main(@builtin(global_invocation_id) id:vec3<u32>){let size=textureDimensions(dst);if(any(id.xy>=size)){return;}let p=vec2<i32>(id.xy);let fp=vec2<f32>(id.xy);let op=operation;let source=vec2<f32>(textureDimensions(a));var c=load(a,p);var out=c;
+fn main(@builtin(global_invocation_id) id:vec3<u32>){let local_size=textureDimensions(dst);if(any(id.xy>=local_size)){return;}let region=arg(24)>0.;let size=select(local_size,vec2<u32>(u32(arg(24)),u32(arg(25))),region);let p=vec2<i32>(id.xy);let fp=vec2<f32>(id.xy)+select(vec2(0.),vec2(arg(26),arg(27)),region);let op=operation;let source=vec2<f32>(textureDimensions(a));var c=region_load(a,p);var out=c;
 switch op {
 case 0u:{}
 case 1u:{out=vec4(arg(0),arg(1),arg(2),arg(3));}
@@ -380,7 +386,7 @@ case 24u:{
 }
 // PS combines ordinary Fill and Opacity into one rounded 8-bit coverage, at every depth.
 case 25u:{
- let top=load(b,p);let mode=u32(arg(0));let opacity=clamp(arg(1),0.,1.);let fill=clamp(arg(2),0.,1.);
+ let top=region_load(b,p);let mode=u32(arg(0));let opacity=clamp(arg(1),0.,1.);let fill=clamp(arg(2),0.,1.);
  var src=top.rgb;var coverage=top.a*opacity;
  if(mode==2u||mode==3u){src*=fill;if(arg(3)==255.){src=floor(src*255.+.5)/255.;}}
  else{coverage=top.a*floor(opacity*fill*255.+.5)/255.;}
@@ -399,6 +405,10 @@ case 30u:{out=mix(c,load(b,p),load(mask,p).r);}
 // Measured SDR→Float passes through Photoshop's 15-bit-plus-one integer grid.
 // PS downconversion to Eight adds spatial dither; this models its undithered mean.
 case 31u:{var rgb=c.rgb;for(var i=0u;i<3u;i++){if(arg(0)>0.&&arg(1)==0.){rgb[i]=decode(floor(clamp(rgb[i],0.,1.)*32768.+.5)/32768.);}if(arg(0)==0.&&arg(1)>0.){rgb[i]=encode(rgb[i]);}}out=vec4(rgb,c.a);if(arg(1)>0.){out=floor(clamp(out,vec4(0.),vec4(1.))*arg(1)+.5)/arg(1);}}
+case 35u:{
+ let q=vec2(arg(0),arg(1))+(vec2<f32>(id.xy)+.5)*arg(2)-.5;
+ if(arg(3)>0.){out=linear(a,q);}else{out=load(a,vec2<i32>(floor(q+.5)));}
+}
 case 32u:{
  // Forward shear, with enough transverse guard pixels for inverse cubic taps.
  let vertical=arg(1)>0.;let major=select(p.x,p.y,vertical);let minor=select(p.y,p.x,vertical);

@@ -12,7 +12,7 @@ use std::{collections::HashMap, sync::Arc};
 use moya_core::{CaChannels, CaType, DocGeometry, GlareBlend, GlareRays, Highlights, LayerBlend, LayerInput, LayerSettings, Params, RenderMode, SpectrumBlend, Transition};
 use moya_gpu::{BlendMode as B, Depth, Gpu, GradientStop, Image, RadialQuality};
 mod document;
-pub use document::{Document, DocumentOutput, LayerInputs, RenderRequest};
+pub use document::{Document, DocumentOutput, LayerInputs, RenderRequest, ViewRegion, RegionQuality, RefineState};
 
 struct RenderOutput {
     pub glow: Image,
@@ -246,7 +246,10 @@ impl LayerStages {
     pub fn render_with_checkpoints(&mut self,params:&Params,mode:RenderMode,view:&ViewFlags,mut checkpoint:impl FnMut(&str,&Image,Depth))->RenderOutput {
         self.render_selected(params,mode,view,true,true,&mut checkpoint)
     }
-    fn render_selected(&mut self,params:&Params,mode:RenderMode,view:&ViewFlags,want_composite:bool,want_xray:bool,mut checkpoint:impl FnMut(&str,&Image,Depth))->RenderOutput {
+    fn render_selected(&mut self,params:&Params,mode:RenderMode,view:&ViewFlags,want_composite:bool,want_xray:bool,checkpoint:impl FnMut(&str,&Image,Depth))->RenderOutput {
+        self.render_selected_impl(params,mode,view,want_composite,want_xray,true,checkpoint)
+    }
+    fn render_selected_impl(&mut self,params:&Params,mode:RenderMode,view:&ViewFlags,want_composite:bool,want_xray:bool,expand_glow:bool,mut checkpoint:impl FnMut(&str,&Image,Depth))->RenderOutput {
         let hq=mode==RenderMode::Hq;
         // Draft retains the same complete output cache across stack/view requests.
         let (want_composite,want_xray)=if hq {(want_composite,want_xray)} else {(true,true)};
@@ -424,7 +427,7 @@ impl LayerStages {
         drop(working);
         if !self.output_cache.as_ref().is_some_and(|c|c.key==output_key) {
             self.output_cache=None;
-            let output=self.finish(&p,mode,view,&ca_image,&heatmap,&working_source,want_composite,want_xray);
+            let output=self.finish(&p,mode,view,&ca_image,&heatmap,&working_source,want_composite,want_xray,expand_glow);
             self.output_cache=Some(self.cached(output_key,output,vec![]));
         }
         let output=self.output_cache.as_ref().unwrap();
@@ -576,7 +579,7 @@ impl LayerStages {
         }
         image
     }
-    fn finish(&self,p:&Params,mode:RenderMode,view:&ViewFlags,ca:&Image,heatmap:&Arc<Image>,working_source:&Image,want_composite:bool,want_xray:bool)->Vec<Arc<Image>> {
+    fn finish(&self,p:&Params,mode:RenderMode,view:&ViewFlags,ca:&Image,heatmap:&Arc<Image>,working_source:&Image,want_composite:bool,want_xray:bool,expand_glow:bool)->Vec<Arc<Image>> {
         let g=&self.gpu;
         let depth=if p.hdr32 {Depth::Float} else {Depth::Sixteen};
         let glow=if p.unmult && (view.solo || mode==RenderMode::Hq) {
@@ -589,7 +592,7 @@ impl LayerStages {
         let xray=if want_xray || (want_composite && view.xray) {self.output_heatmap(heatmap,p,mode)} else {working_glow.clone()};
         let source=if mode==RenderMode::Hq {self.source.as_ref()} else {working_source};
         // HQ returns original document dimensions even when the 4000px working cap applies.
-        if mode==RenderMode::Hq && (glow.width(),glow.height())!=(self.geometry.orig_w,self.geometry.orig_h) {
+        if expand_glow && mode==RenderMode::Hq && (glow.width(),glow.height())!=(self.geometry.orig_w,self.geometry.orig_h) {
             glow=Arc::new(g.resize_bicubic(&glow,self.geometry.orig_w,self.geometry.orig_h));
         }
         // HQ hides the source inside the element, but the host composites that
