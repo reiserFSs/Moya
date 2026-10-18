@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and checksum archives without creating a release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos-arm64
+          - os: windows-latest
+            platform: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate release version
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          if ($manifest -notmatch '(?ms)^\[workspace\.package\]\s*\r?\nversion\s*=\s*"([^"]+)"') { throw 'Missing workspace version' }
+          $version = $Matches[1]
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -cne "v$version") {
+            throw "Tag must be v$version, got $env:REF_NAME"
+          }
+          if ($env:EVENT_NAME -eq 'workflow_dispatch' -and $env:DRY_RUN -eq 'false' -and $env:REF_TYPE -ne 'tag') {
+            throw 'Publishing requires a version tag'
+          }
+          "MOYA_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: sh scripts/package-release.sh
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/package-windows.ps1
+          & "./target/release-dist/Moya-$env:MOYA_VERSION-windows-x64/Install Moya.ps1" -DryRun
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: target/release-dist/Moya-${{ env.MOYA_VERSION }}-${{ matrix.platform }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Compute SHA-256 release notes
+        working-directory: dist
+        run: |
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
+          printf '## SHA-256\n\n```text\n' > ../release-notes.md
+          sha256sum *.zip | tee -a ../release-notes.md
+          printf '```\n' >> ../release-notes.md
+          cat ../release-notes.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-checksums
+          path: release-notes.md
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag' && (github.event_name == 'push' || !inputs.dry_run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/*.zip --verify-tag --title "Moya $RELEASE_TAG" --notes-file release-notes.md

@@ -38,10 +38,13 @@ fn large_motion_and_integer_guards_fit_device() {
     ] {
         let image = gpu.fill(w, h, [0.25, 0.5, 0.75, 1.]);
         let actual = gpu.download_rgba32f(&gpu.motion_blur(&image, angle, distance, d));
-        for pixel in actual.chunks_exact(4) {
-            for (value, expected) in pixel.iter().zip([0.25, 0.5, 0.75, 1.]) {
-                assert!(value.is_finite() && (value - expected).abs() < 0.01);
-            }
+        let bad = actual.chunks_exact(4).enumerate().find(|(_, pixel)| {
+            pixel.iter().zip([0.25, 0.5, 0.75, 1.]).any(|(v, e)| !(v.is_finite() && (v - e).abs() < 0.01))
+        });
+        if let Some((index, pixel)) = bad {
+            let limits = gpu.device.limits();
+            panic!("{w}x{h} angle {angle} distance {distance} {d:?}: pixel ({}, {}) = {pixel:?} (max texture {}, max buffer {})",
+                index as u32 % w, index as u32 / w, limits.max_texture_dimension_2d, limits.max_buffer_size);
         }
     }
 }

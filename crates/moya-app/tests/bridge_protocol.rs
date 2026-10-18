@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tungstenite::{Message, WebSocket};
+#[path = "../src/platform_paths.rs"]
+mod platform_paths;
 
 const ADDRESS: &str = "127.0.0.1:47811";
 const WAIT: Duration = Duration::from_secs(90);
@@ -143,13 +145,12 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
     let reservation = TcpListener::bind(ADDRESS).with_context(|| {
         format!("bridge acceptance test needs {ADDRESS} free; quit the existing Moya/server yourself (the test will not kill it)")
     })?;
-    let home = std::env::var_os("HOME").context("HOME is required to find Moya bridge discovery")?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let temp = std::env::temp_dir().join(format!("moya-bridge-{}-{nonce}", std::process::id()));
     fs::create_dir(&temp)?;
     let mut app = TestApp {
         child: None,
-        discovery: PathBuf::from(home).join("Library/Application Support/Moya/bridge.json"),
+        discovery: platform_paths::bridge_discovery_path()?,
         temp,
     };
     let depths = [(8, SampleDepth::U8), (16, SampleDepth::U16), (32, SampleDepth::F32)];

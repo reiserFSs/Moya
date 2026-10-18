@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --workspace --release -- --nocapture
+      # windows-latest has no GPU: wgpu runs on WARP (software D3D12). Many test devices
+      # allocating multi-GB textures at once crash WARP natively (STATUS_ACCESS_VIOLATION);
+      # the same tests pass single-threaded. The app itself uses one device.
+      - name: Test (Windows, WARP)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --release -- --nocapture --test-threads=1
+      - name: Check Photoshop plugin
+        if: runner.os == 'macOS'
+        run: node ps-plugin/check.cjs
+      - name: Parse PowerShell scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts/*.ps1 | ForEach-Object {
+            $errors = $null
+            $tokens = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }

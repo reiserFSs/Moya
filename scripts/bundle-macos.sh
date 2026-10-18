@@ -30,6 +30,36 @@ cat > "$contents/Info.plist" <<PLIST
     <string>$version</string>
     <key>CFBundleVersion</key>
     <string>$version</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>Moya Project</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Owner</string>
+            <key>CFBundleTypeIconFile</key><string>Moya.icns</string>
+            <key>LSItemContentTypes</key><array><string>local.moya.project</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Image</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.png</string><string>public.jpeg</string><string>public.tiff</string>
+                <string>com.ilm.openexr-image</string><string>com.adobe.photoshop-image</string>
+            </array>
+        </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>local.moya.project</string>
+            <key>UTTypeDescription</key><string>Moya Project</string>
+            <key>UTTypeConformsTo</key><array><string>public.data</string><string>public.content</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>moya</string></array></dict>
+        </dict>
+    </array>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

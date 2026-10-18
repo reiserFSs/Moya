@@ -23,6 +23,24 @@ GPU-powered glow and light effects, with a standalone macOS app and a Photoshop 
 
 For manual installation, copy **Moya.app** to `/Applications` or `~/Applications`, then double-click **Moya Photoshop Plugin.ccx** and approve installation in Creative Cloud. The plugin discovers either app location; its **Settings** panel also accepts an explicit app path.
 
+### Windows x64
+
+Windows builds are available as **Moya-&lt;version&gt;-windows-x64.zip** from the same release page. They require an x64 Windows PC with a working GPU driver; the optional plugin requires Photoshop 2024 or later and Creative Cloud. **Real Windows desktop/GPU and Photoshop behavior is not yet verified.**
+
+1. Extract the whole ZIP, then quit Moya and Photoshop.
+2. Double-click **Install Moya.cmd**. No administrator rights are required: it copies `Moya.exe` to `%LOCALAPPDATA%\Programs\Moya`, adds a Start Menu shortcut, and registers `.moya` projects for your user.
+3. Approve the plugin installation in Creative Cloud if prompted. If Photoshop was running, the app still installs but the plugin is skipped; quit Photoshop and rerun the installer.
+4. Launch **Moya** from Start. For the plugin, open **Plugins › Moya** in Photoshop. Only approve Windows security warnings for a release you trust. If another app is already the user-selected `.moya` default, choose Moya in **Settings › Apps › Default apps**.
+
+To preview without changing files, registry, shortcuts, or launching Adobe, run `"Install Moya.cmd" --dry-run` from Command Prompt in the extracted folder. The installer uses Adobe's Unified Plugin Installer when present, otherwise opens the `.ccx` with Creative Cloud. The archive contains the standalone app, not the CLI.
+
+Windows settings and bridge discovery/token use `%APPDATA%\Moya` with inherited user-profile ACLs, not Unix `0600` permissions. Accept this only if the directory is private to your account, SYSTEM, and administrators; other processes running as you are still trusted. Do not share `bridge.json` or grant other users access.
+
+Standard Windows profiles are supported. If Photoshop's UXP runtime does not expose environment variables, plugin discovery falls back to `AppData\Roaming` and `AppData\Local` under your home directory; redirected AppData locations may not be discovered. The plugin's **Settings** app-path override remains available, but does not relocate bridge discovery.
+
+**Uninstall:** quit Moya and Photoshop; remove the plugin in Creative Cloud; delete `%LOCALAPPDATA%\Programs\Moya` and `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Moya.lnk`. In Registry Editor remove `HKEY_CURRENT_USER\Software\Classes\Moya.Project`, and remove `HKEY_CURRENT_USER\Software\Classes\.moya` only if its default still equals `Moya.Project`. Optionally delete `%APPDATA%\Moya` for settings/presets; keep your saved projects and exports. Reset any separate user-selected default through Windows Settings, not by deleting protected `UserChoice` keys. The archive's `README.txt` repeats these instructions; see the [Windows smoke checklist](docs/DEVELOPMENT.md#windows-packaging-and-smoke-checklist) before treating the port as validated.
+
+
 ## Using Moya
 
 1. **Open or drop an image or project.** Use **Cmd+O**, or drop a supported image or `.moya` file anywhere in the window.
@@ -32,6 +50,8 @@ For manual installation, copy **Moya.app** to `/Applications` or `~/Applications
 5. **Use presets.** Hover a preset to preview it; click to apply. Right-click to rename, duplicate, or delete. Import/export supports the `Oniric_Presets.json` / `userPresets` array format. No factory presets are bundled; import your own or save settings you create.
 6. **Save the project.** **Cmd+S** saves editable layers and masks to `.moya`; **Cmd+Shift+S** saves a copy under a new name. Enable **Embed source** to include the original image for a portable project; otherwise keep the referenced source image available. The title shows the project name and an asterisk for unsaved edits. Opening another image/project or quitting offers Save, Discard, or Cancel.
 7. **Export.** **Cmd+E** saves a full-quality PNG, TIFF, or EXR, with a choice of full composite or glow only. HQ works at up to a 4000-pixel long side and resamples to the original image dimensions.
+
+On macOS, double-click a `.moya` project in Finder (or drag it onto Moya's Dock icon) to open it in the running app, with the same unsaved-changes prompt.
 
 Window size, the last selected layer's parameters, and the last open folder are remembered. Opening a new standalone image or a Photoshop session without a saved project starts with one effect layer using those parameters, without painted masks; only opening a saved project restores a layer stack. User presets are stored in the platform config directory (`~/Library/Application Support/Moya/userPresets.json` on macOS).
 

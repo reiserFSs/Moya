@@ -399,7 +399,8 @@ case 25u:{
 }
 case 26u:{var src=load(b,p).rgb;if(arg(2)>0.){src=1.-src;}let f=blendfn(c.rgb,src,u32(arg(0)),arg(3));out=vec4(mix(c.rgb,f,arg(1)),c.a);}
 case 27u:{out=vec4(vec3(c[u32(arg(0))]),1.);}
-case 28u:{let channel=u32(arg(0));let f=blendfn(vec3(c[channel]),vec3(load(b,p).r),u32(arg(1)),0.);out[channel]=mix(c[channel],f.x,arg(2));}
+// Per-component select, not out[channel]=...: DX12's FXC rejects writes at a runtime index (X3500).
+case 28u:{let channel=u32(arg(0));let f=blendfn(vec3(c[channel]),vec3(load(b,p).r),u32(arg(1)),0.);out=select(out,vec4(mix(c[channel],f.x,arg(2))),vec4<u32>(0u,1u,2u,3u)==vec4(channel));}
 case 29u:{out.a=c.a*load(b,p).r;}
 case 30u:{out=mix(c,load(b,p),load(mask,p).r);}
 // Measured SDR→Float passes through Photoshop's 15-bit-plus-one integer grid.

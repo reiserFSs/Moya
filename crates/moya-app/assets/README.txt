@@ -31,6 +31,7 @@ Files
 source.png: supplied original (1254x1254 RGB).
 icon-1024.png: macOS-grid app artwork, 1024x1024 RGBA; 1,109,449 bytes.
 window-icon-256.png: matching viewport icon, 256x256 RGBA; 59,494 bytes.
+Moya.ico: Windows ICO containing window-icon-256.png verbatim as a 256x256 PNG entry.
 header-logo-64.png: transparent ring-only toolbar logo, 64x64 RGBA; 6,180 bytes.
 header-logo-128.png: transparent ring-only toolbar logo, 128x128 RGBA; 22,241 bytes.
 ps-plugin/icons/panel-23.png: panel icon @1x, 23x23 RGBA; 1,153 bytes.

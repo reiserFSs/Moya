@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod bridge;
 mod canvas;
 mod data;
@@ -8,6 +10,9 @@ mod workers;
 mod layers;
 mod projects;
 mod bridge_session;
+mod platform_paths;
+#[cfg(target_os = "macos")]
+mod macos_open;
 
 use eframe::{
     egui,
@@ -23,8 +28,13 @@ use std::{
 };
 
 fn main() -> eframe::Result {
+    #[cfg(target_os = "macos")]
+    let (open_handler, open_documents) = macos_open::install();
     let path = std::env::args_os().skip(1)
-        .find(|arg| !arg.to_string_lossy().starts_with("--"))
+        .find(|arg| {
+            let arg = arg.to_string_lossy();
+            !arg.starts_with("--") && !arg.starts_with("-psn_")
+        })
         .map(PathBuf::from);
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default()
         .with_surface_config(egui_wgpu::SurfaceConfig::LOW_LATENCY);
@@ -48,7 +58,19 @@ fn main() -> eframe::Result {
             persist_window: true,
             ..Default::default()
         },
-        Box::new(move |cc| Ok(Box::new(App::new(cc, path)))),
+        Box::new(move |cc| {
+            #[cfg(target_os = "macos")]
+            open_handler.set_context(cc.egui_ctx.clone());
+            let app = App::new(cc, path);
+            #[cfg(target_os = "macos")]
+            let app = {
+                let mut app = app;
+                app.open_documents = Some(open_documents);
+                app.open_handler = Some(open_handler);
+                app
+            };
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -104,6 +126,10 @@ struct App {
     send_pending: bool,
     sending: Option<(workers::SendBatch, Option<serde_json::Value>)>,
     bridge_test_auto_send: bool,
+    #[cfg(target_os = "macos")]
+    open_documents: Option<mpsc::Receiver<PathBuf>>,
+    #[cfg(target_os = "macos")]
+    open_handler: Option<macos_open::OpenDocuments>,
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
@@ -175,6 +201,10 @@ impl App {
             send_pending: false,
             sending: None,
             bridge_test_auto_send: std::env::args().any(|arg| arg == "--bridge-test-auto-send"),
+            #[cfg(target_os = "macos")]
+            open_documents: None,
+            #[cfg(target_os = "macos")]
+            open_handler: None,
         };
         match bridge::Bridge::start(cc.egui_ctx.clone()) {
             Ok(bridge) => app.bridge = Some(bridge),
@@ -485,6 +515,10 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        while let Some(path) = self.open_documents.as_ref().and_then(|receiver| receiver.try_recv().ok()) {
+            self.open(&path);
+        }
         self.poll_bridge();
         self.poll_loading();
         if let Some(rx) = &self.saving {

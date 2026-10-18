@@ -962,7 +962,11 @@ impl Gpu {
         let grid = depth(d);
         // Each strip retains the full major axis, preserving the prefix addition
         // tree exactly. Four overlapping rows cover every inverse cubic tap.
-        let strip_limit = limit.min(4096);
+        // Cap each strip texture (RGBA32F, major x rows) at 256 MiB: GPUs with less memory
+        // headroom (e.g. virtualized Metal) silently produce zeros for ~1 GiB strips. Strip
+        // height doesn't change results, only how many strips run.
+        let budget_rows = ((256u64 << 20) / (major as u64 * 16)).clamp(8, u32::MAX as u64) as u32;
+        let strip_limit = limit.min(4096).min(budget_rows);
         let core = strip_limit - 4;
         let mut output = self.image(img.width(), img.height());
         let mut start = 0;

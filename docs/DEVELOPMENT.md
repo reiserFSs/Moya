@@ -28,11 +28,102 @@ Project input renders the complete bottom-to-top layer stack, including masks an
 
 Project loading rejects unsupported versions, duplicate layer identities, unsafe ZIP names/symlinks, more than 4096 entries, more than 1 GiB of uncompressed archive content or decoded masks, and JSON larger than 4 MiB. Masks share the source decoder's 16384-pixel per-side ceiling. Unknown JSON fields are ignored for forward compatibility. The in-memory `from_bytes` API preserves source references without checking local file existence, for Photoshop's source-replacement round trip.
 
+## CI and releases
+
+GitHub Actions builds and tests the full workspace in release mode on Apple Silicon
+`macos-14` and `windows-latest`, using stable Rust and a Cargo cache. The macOS job
+also runs `node ps-plugin/check.cjs`; Windows parses the PowerShell scripts.
+Test output is visible with `--nocapture`. GPU tests require an adapter and fail
+if none is available; they are not silently skipped on headless runners.
+
+Pushing a `v*` tag packages both platforms and publishes their ZIPs in a GitHub
+release with SHA-256 checksums in the release notes. The tag must exactly match
+`v<workspace.package.version>` in `Cargo.toml`. Packaging uses
+`sh scripts/package-release.sh` and `pwsh -File scripts/package-windows.ps1`.
+The Release workflow's manual `dry_run` input defaults to true: it builds both
+ZIP artifacts and a checksum artifact/summary without creating a public release.
+Manual publication requires selecting a matching version tag and disabling
+`dry_run`. Release notes can be edited afterward without changing the archives.
+
 ## App assets and bundles
 
 `sh scripts/bundle-macos.sh [destination/Moya.app]` builds the release app. The default destination is `~/Applications/Moya.app`; the bundle ID is `local.moya.app`. Source artwork lives in `assets/`; packaged icons and their provenance are in `crates/moya-app/assets/`.
 
 `sh scripts/install-ps-plugin.sh` installs the development UXP plugin `local.moya.bridge`. Quit Photoshop first. It backs up Photoshop's plugin registration file before changing it and preserves unrelated plugins.
+
+### Windows packaging and smoke checklist
+
+Run from an x64 PowerShell on Windows (including `windows-latest`):
+
+```powershell
+pwsh -File scripts/package-windows.ps1
+# With an existing native/crossbuilt x64 exe at target/release/moya.exe:
+pwsh -File scripts/package-windows.ps1 -SkipBuild
+# Or select an existing crossbuilt executable without copying it:
+pwsh -File scripts/package-windows.ps1 -SkipBuild -ExecutablePath target/x86_64-pc-windows-msvc/release/moya.exe
+```
+
+For a macOS cross-build, install Rust through rustup, LLVM, and `cargo-xwin`:
+
+```sh
+brew install llvm
+cargo install cargo-xwin
+rustup target add x86_64-pc-windows-msvc
+env RUSTC="$(rustup which rustc)" RC_PATH="$(brew --prefix llvm)/bin/llvm-rc" \
+  ~/.cargo/bin/cargo-xwin xwin build --release --target x86_64-pc-windows-msvc \
+  -p moya-app -p moya-cli
+```
+
+Explicit `RUSTC` selects rustup's compiler and installed target standard library instead of Homebrew Rust, which may lack that target. `RC_PATH` selects LLVM's Windows resource compiler. Cross-built binaries land in `target/x86_64-pc-windows-msvc/release/`; transfer `moya.exe` to Windows and use `-SkipBuild -ExecutablePath` above. Packaging still runs natively on Windows; the ZIP does not ship the CLI. Shaders must stay compilable by FXC, wgpu's default DX12 compiler: no writes into a vector or local array at a runtime (non-unrollable) index; use `select` per component instead.
+
+The script builds only `moya-app` in release mode and reads `[workspace.package].version` from `Cargo.toml`. It writes `target/release-dist/Moya-<version>-windows-x64.zip`, containing `Moya.exe`, `Moya Photoshop Plugin.ccx`, `Install Moya.cmd`, `Install Moya.ps1`, and `README.txt` at the archive root. No CLI is required or shipped. The `.ccx` contains only `manifest.json`, `index.html`, `index.js`, and `icons/`, matching the macOS runtime package.
+
+The per-user installer copies the app to `%LOCALAPPDATA%\Programs\Moya\Moya.exe`, creates a Start Menu shortcut, and sets `HKCU\Software\Classes\.moya` to `Moya.Project`. Its open command is `"<absolute installed exe>" "%1"` under `HKCU\Software\Classes\Moya.Project\shell\open\command`; both executable and project paths are quoted. It does not change protected `UserChoice` defaults. Plugin installation uses `%CommonProgramFiles%\Adobe\Adobe Desktop Common\RemoteComponents\UPI\UnifiedPluginInstallerAgent\UnifiedPluginInstallerAgent.exe --install "<ccx>"` if present, otherwise opens the `.ccx` with Creative Cloud. A running `Photoshop` process skips plugin installation without undoing the app install. No elevation is requested. The `.cmd` invokes Windows PowerShell with a process-local execution-policy override.
+
+After packaging, this runnable structural check checks the release's exact top-level payload (run from the repository root):
+
+```powershell
+$version = ((Get-Content Cargo.toml -Raw) -split '\[workspace.package\]')[1] -split '\[workspace.dependencies\]' | Select-Object -First 1
+$version = [regex]::Match($version, 'version\s*=\s*"([^"]+)"').Groups[1].Value
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $PWD "target/release-dist/Moya-$version-windows-x64.zip"))
+try {
+    $expected = @('Moya.exe', 'Moya Photoshop Plugin.ccx', 'Install Moya.cmd', 'Install Moya.ps1', 'README.txt')
+    if (Compare-Object ($expected | Sort-Object) ($zip.Entries.FullName | Sort-Object)) {
+        throw 'Unexpected Windows archive contents'
+    }
+} finally { $zip.Dispose() }
+```
+
+**Not yet verified on a real Windows desktop:** packaging/CI success does not establish GPU, Explorer, Adobe installer, or Photoshop runtime correctness. Before accepting a release, record the Windows version, GPU/driver, Photoshop version, and results for all of these:
+
+- Extract the ZIP into a path with spaces. From PowerShell in that folder run `& '.\Install Moya.cmd' --dry-run`; confirm no install directory, shortcut, registry value, Adobe process, or plugin state changes. Repeat with Photoshop running and confirm the plugin-skip message. Direct PowerShell equivalent: `powershell -NoProfile -ExecutionPolicy Bypass -File ".\Install Moya.ps1" -DryRun`.
+- Quit Moya and Photoshop; install as a normal non-admin user. Confirm the installed path, Start Menu shortcut, and quoted HKCU open command. Confirm both Adobe UPI and `.ccx` fallback paths when available; if Photoshop was running during installation, quit it and rerun to install the plugin.
+- Launch from Start; open an image from a path with spaces, edit an effect/mask, export PNG/TIFF/EXR, and reopen the exports to inspect size/depth and visible output.
+- Save an embedded-source `.moya` in a path with spaces/non-ASCII characters. Close Moya and double-click it in Explorer; then double-click another project while Moya is running. Confirm the intended project opens and unsaved changes still offer Save/Discard/Cancel. If Windows has a prior user-selected default, select Moya through Default apps first.
+- In Photoshop, **Plugins › Moya › Edit in Moya**, edit and send back, then re-edit the returned group. Check layers/masks/settings and repeat at 8/16/32-bit. Test cancellation as well as completion, and both a stopped and already-running Moya.
+- Inspect `%APPDATA%\Moya` permissions. Windows accepts inherited user-profile ACLs instead of Unix mode `0600`; accept only a private profile accessible to the user, SYSTEM, and administrators, not other ordinary users. The token does not protect against processes running as the same user. Do not share `bridge.json`. No custom Windows ACL hardening is claimed.
+- Standard Windows profile paths are supported. The plugin uses `APPDATA`/`LOCALAPPDATA` when its UXP environment exposes them; otherwise it falls back to `os.homedir()/AppData/Roaming` and `/Local`. UXP's `os` API has no `getenv`, so redirected AppData may not be discoverable without exposed environment variables. The Settings executable-path override is available but does not override bridge discovery. Test redirected profiles separately rather than claiming support from standard-profile results.
+- Quit both apps and follow `README.txt` uninstall instructions: Creative Cloud plugin removal, install directory and shortcut deletion, removal of `HKCU\Software\Classes\Moya.Project` and the `.moya` key only if still owned by Moya, optional `%APPDATA%\Moya` removal. Confirm user projects/exports remain untouched and resolve any user-selected default through Windows Settings.
+
+### macOS release install checklist
+
+The packaging step only runs the installer's `--dry-run`; a real install from the downloaded ZIP must be checked by hand before a release counts as installable. Use a second Mac or a fresh macOS user account (no `~/Applications/Moya.app`, no Moya plugin, no `~/Library/Application Support/Moya`) with Photoshop 2024 or later and Creative Cloud signed in. Record the macOS, Photoshop and Creative Cloud versions with the results.
+
+- Download the ZIP from the GitHub release page **in a browser** (so it carries the quarantine flag; `curl` downloads don't). Compare `shasum -a 256` with the release notes.
+- Quit Photoshop. Unzip by double-clicking in Finder and double-click **Install Moya.command**. Expected: Gatekeeper blocks it because the files are ad-hoc signed; right-click › **Open** › **Open** runs it. Note exactly which prompts appear and what they say.
+- Confirm `Moya.app` landed in `/Applications` (or `~/Applications` when `/Applications` isn't writable) and that `xattr -l` on the installed app shows no `com.apple.quarantine`, while the downloaded folder keeps it.
+- Confirm Creative Cloud's plugin installer ran (or the `.ccx` opened in Creative Cloud) and that **Plugins › Moya** appears after starting Photoshop.
+- Launch Moya from Launchpad/Finder: it opens without a Gatekeeper prompt. Open an image, change a setting, export PNG, and save a `.moya` project.
+- Quit Moya, then double-click the `.moya` in Finder: Moya launches and opens it. With Moya running and unsaved changes, double-click another project: the in-app Save / Discard / Cancel dialog appears; Cancel keeps the current document.
+- In Photoshop: **Plugins › Moya › Edit in Moya**, accept the launch permission prompt, tweak, **Send to Photoshop**, then **Re-edit selected Moya group**. Repeat with Moya already running.
+- Run the installer again over the existing install (upgrade path): the app is replaced, the previous plugin version folder is removed, and `PS.json` gets a timestamped backup.
+- Remove: drag `Moya.app` to the Trash, remove the plugin through Creative Cloud (or Photoshop's **Plugins › Manage Plugins**), and optionally delete `~/Library/Application Support/Moya`. Confirm projects and exports are untouched.
+
+
+## macOS document opening
+
+The bundle exports `local.moya.project` for `.moya` and registers as its Editor/Owner; supported image types use Alternate rank. `macos_open` registers an `NSAppleEventManager` open-documents (`aevt`/`odoc`) handler before eframe starts, without replacing winit 0.30's application delegate. A retained handler forwards file URLs through a channel, including cold-launch events received before `App` exists; attaching egui's context wakes the UI on later events. The app polls the channel and uses `App::open`, preserving the unsaved-changes guard shared with argv and window drag/drop. No last document is restored at startup. `open path/to/project.moya` exercises the same LaunchServices route as Finder double-click and Dock drops.
 
 ## Photoshop bridge
 

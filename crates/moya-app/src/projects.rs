@@ -253,12 +253,14 @@ mod tests {
 
     #[test]
     fn embedded_source_preserves_depth_and_pixels() -> Result<()> {
-        let temporary = tempfile::Builder::new().suffix(".tiff").tempfile()?;
+        // A plain path in a temp dir: Windows refuses to rename over a still-open NamedTempFile.
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.tiff");
         let picture = Picture { width: 1, height: 1, depth: SampleDepth::F32,
             rgba: vec![2.0, 0.25, -0.5, 0.75], icc_profile: Some(b"opaque ICC".to_vec()) };
-        moya_io::save(temporary.path(), &picture, picture.depth)?;
+        moya_io::save(&source, &picture, picture.depth)?;
         let (_, loaded) = load_source(&SourceRef::Embedded {
-            file_name: "source.tiff".into(), bytes: std::fs::read(temporary.path())?,
+            file_name: "source.tiff".into(), bytes: std::fs::read(&source)?,
         })?;
         assert_eq!(loaded.depth, picture.depth);
         assert_eq!(loaded.rgba, picture.rgba);

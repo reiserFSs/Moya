@@ -1,7 +1,14 @@
 const { app, action, core, constants } = require("photoshop");
 const { storage, shell, entrypoints } = require("uxp");
 const fs = storage.localFileSystem;
-const home = require("os").homedir();
+const os = require("os");
+const home = os.homedir();
+const windows = os.platform().startsWith("win");
+// UXP may not expose process.env; redirected AppData then requires host environment access.
+const env = typeof process !== "undefined" && process.env ? process.env : {};
+const roamingData = env.APPDATA || `${home}/AppData/Roaming`;
+const localData = env.LOCALAPPDATA || `${home}/AppData/Local`;
+const discoveryPath = windows ? `${roamingData}/Moya/bridge.json` : `${home}/Library/Application Support/Moya/bridge.json`;
 const namespace = "https://local.moya/bridge/1.0/";
 let socket, connecting, session, busy = false;
 const statusBox = document.getElementById("statusBox");
@@ -21,9 +28,10 @@ document.getElementById("settingsToggle").addEventListener("click", () => {
   const open = settingsBody.classList.toggle("open");
   document.getElementById("chevron").textContent = open ? "▼" : "▶";
 });
-const fileAt = path => fs.getEntryWithUrl(`file:${path}`);
+const fileAt = path => fs.getEntryWithUrl(`file:${windows ? path.replace(/\\/g, "/").replace(/^([A-Za-z]:)/, "/$1") : path}`);
 async function resolveAppPath() {
   if (appPath.value) return appPath.value.replace(/^~(?=\/)/, home);
+  if (windows) return `${localData}/Programs/Moya/Moya.exe`.replace(/\//g, "\\");
   for (const path of ["/Applications/Moya.app", `${home}/Applications/Moya.app`]) {
     try { await fileAt(path); return path; } catch (_) { /* Try the next install location. */ }
   }
@@ -263,7 +271,7 @@ async function receive(message) {
   }
 }
 async function connectOnce() {
-  const info = JSON.parse(await (await fileAt(`${home}/Library/Application Support/Moya/bridge.json`)).read());
+  const info = JSON.parse(await (await fileAt(discoveryPath)).read());
   if (info.version !== 2 || info.port !== 47811 || !/^[a-fA-F0-9]{32}$/.test(info.token)) throw new Error("Invalid Moya bridge discovery file.");
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, "0")).join("");
   const proof = sha256(info.token + nonce);

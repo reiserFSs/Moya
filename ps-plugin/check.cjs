@@ -8,19 +8,26 @@ const controls = new Map();
 const availablePaths = new Set();
 const requestedPaths = [];
 let savedAppPath = null;
-const context = vm.createContext({
-  require: name => name === "photoshop" ? { app: {}, action: {}, core: {}, constants: {} }
-    : name === "uxp" ? { storage: { localFileSystem: { async getEntryWithUrl(url) {
-      requestedPaths.push(url);
-      if (!availablePaths.has(url)) throw new Error("Not found");
-      return { async read() { return JSON.stringify({ version: 2, port: 47811, token }); } };
-    } } }, entrypoints: { setup() {} } }
-    : { homedir: () => "/home/test" },
-  document: { getElementById: id => { if (!controls.has(id)) controls.set(id, { addEventListener() {} }); return controls.get(id); } },
-  localStorage: { getItem() { return savedAppPath; } }, console,
-  crypto: crypto.webcrypto, setTimeout, clearTimeout,
-});
-vm.runInContext(fs.readFileSync(`${__dirname}/index.js`, "utf8"), context);
+const launchedPaths = [];
+let onLaunch = () => {};
+function createContext(platform = "darwin", home = "/home/test", env) {
+  const context = vm.createContext({
+    require: name => name === "photoshop" ? { app: {}, action: {}, core: {}, constants: {} }
+      : name === "uxp" ? { storage: { localFileSystem: { async getEntryWithUrl(url) {
+        requestedPaths.push(url);
+        if (!availablePaths.has(url)) throw new Error("Not found");
+        return { async read() { return JSON.stringify({ version: 2, port: 47811, token }); } };
+      } } }, shell: { async openPath(path, reason) { launchedPaths.push({ path, reason }); onLaunch(); return ""; } }, entrypoints: { setup() {} } }
+      : { homedir: () => home, platform: () => platform },
+    document: { getElementById: id => { if (!controls.has(id)) controls.set(id, { addEventListener() {}, setAttribute() {} }); return controls.get(id); } },
+    localStorage: { getItem() { return savedAppPath; } }, console,
+    crypto: crypto.webcrypto, setTimeout, clearTimeout,
+    ...(env === undefined ? {} : { process: { env } }),
+  });
+  vm.runInContext(fs.readFileSync(`${__dirname}/index.js`, "utf8"), context);
+  return context;
+}
+const context = createContext();
 vm.runInContext(`
   const zip = new Uint8Array([80, 75, 3, 4, 0, 255, 128, 60, 38]);
   const project = encodeProject(zip.buffer);
@@ -163,6 +170,8 @@ for (const [text, digest] of [
 ]) assert.equal(vm.runInContext(`sha256(${JSON.stringify(text)})`, context), digest);
 const manifest = JSON.parse(fs.readFileSync(`${__dirname}/manifest.json`, "utf8"));
 assert.equal(manifest.id, "local.moya.bridge");
+assert.equal(manifest.version, "1.1.1");
+assert.deepEqual(manifest.requiredPermissions.launchProcess.extensions, ["", ".app", ".exe"]);
 assert.deepEqual(manifest.requiredPermissions.network.domains, ["ws://127.0.0.1:47811", "ws://localhost/"]);
 assert.equal(manifest.entrypoints.filter(entry => entry.type === "command").length, 2);
 async function checkAppPaths() {
@@ -189,11 +198,11 @@ async function checkAppPaths() {
   assert.equal(await resolvePath(), "/home/test/Custom/Moya.app");
   assert.deepEqual(requestedPaths.splice(0), []);
 }
-async function checkServerProof() {
-  availablePaths.add("file:/home/test/Library/Application Support/Moya/bridge.json");
+async function checkServerProof(target = context, discovery = "file:/home/test/Library/Application Support/Moya/bridge.json") {
+  availablePaths.add(discovery);
   let responseProof, lastSocket;
   const nonces = new Set();
-  context.WebSocket = class {
+  target.WebSocket = class {
     constructor() {
       this.readyState = 1;
       this.sent = [];
@@ -219,21 +228,53 @@ async function checkServerProof() {
     }
     close() { this.readyState = 3; }
   };
-  vm.runInContext("let receivedMessages = 0; receive = async () => { receivedMessages++; };", context);
+  vm.runInContext("let receivedMessages = 0; receive = async () => { receivedMessages++; };", target);
   for (responseProof of [undefined, "0".repeat(64)]) {
-    await assert.rejects(vm.runInContext('connectOnce().then(() => send({ type: "edit" }))', context), /Invalid Moya handshake/);
+    await assert.rejects(vm.runInContext('connectOnce().then(() => send({ type: "edit" }))', target), /Invalid Moya handshake/);
     assert.equal(lastSocket.readyState, 3);
     assert.deepEqual(lastSocket.sent.map(message => message.type), ["hello"]);
-    assert.equal(vm.runInContext("socket", context), undefined);
-    assert.equal(vm.runInContext("receivedMessages", context), 0);
+    assert.equal(vm.runInContext("socket", target), undefined);
+    assert.equal(vm.runInContext("receivedMessages", target), 0);
   }
   responseProof = "valid";
   for (let i = 0; i < 2; i++) {
-    await vm.runInContext('connectOnce().then(() => send({ type: "edit" }))', context);
+    await vm.runInContext('connectOnce().then(() => send({ type: "edit" }))', target);
     assert.deepEqual(lastSocket.sent.map(message => message.type), ["hello", "edit"]);
     lastSocket.close();
   }
 }
-checkGroupTargets().then(checkGroupPlacement).then(checkGroupDeletion).then(checkProjectCleanup).then(checkAppPaths).then(checkServerProof)
-  .then(() => console.log("Moya plugin v2 project XMP, placement planning, group targeting, manifest, app path, SHA-256 and server proof checks passed"))
+async function checkWindowsPaths() {
+  for (const [platform, env, roaming, local] of [
+    ["win32", { APPDATA: "D:\\Roaming Data", LOCALAPPDATA: "E:\\Local Data" }, "D:/Roaming Data", "E:\\Local Data"],
+    ["win10", undefined, "C:/Users/Test User/AppData/Roaming", "C:\\Users\\Test User\\AppData\\Local"],
+  ]) {
+    savedAppPath = null;
+    controls.clear();
+    availablePaths.clear();
+    requestedPaths.length = 0;
+    const target = createContext(platform, "C:\\Users\\Test User", env);
+    const executable = `${local}\\Programs\\Moya\\Moya.exe`;
+    assert.equal(await vm.runInContext("resolveAppPath()", target), executable);
+    assert.deepEqual(requestedPaths.splice(0), []);
+    const discovery = `file:/${roaming}/Moya/bridge.json`;
+    await checkServerProof(target, discovery);
+    assert.equal(requestedPaths.length, 4);
+    assert.ok(requestedPaths.splice(0).every(path => path === discovery));
+    onLaunch = () => availablePaths.add(discovery);
+    for (const override of ["", "F:\\Custom Moya\\Moya.exe"]) {
+      controls.get("appPath").value = override;
+      availablePaths.delete(discovery);
+      vm.runInContext("socket = null;", target);
+      await vm.runInContext("connect()", target);
+      assert.deepEqual(launchedPaths.splice(0), [{ path: override || executable, reason: "Launch Moya to edit this Photoshop document." }]);
+      assert.deepEqual(requestedPaths.splice(0), [discovery, discovery]);
+    }
+    savedAppPath = "F:\\Saved Moya\\Moya.exe";
+    vm.runInContext('appPath.value = localStorage.getItem("moyaAppPath") || ""', target);
+    assert.equal(await vm.runInContext("resolveAppPath()", target), savedAppPath);
+    assert.deepEqual(requestedPaths.splice(0), []);
+  }
+}
+checkGroupTargets().then(checkGroupPlacement).then(checkGroupDeletion).then(checkProjectCleanup).then(checkAppPaths).then(() => checkServerProof()).then(checkWindowsPaths)
+  .then(() => console.log("Moya plugin v2 project XMP, placement planning, group targeting, manifest, macOS/Windows paths and launch, SHA-256 and server proof checks passed"))
   .catch(error => { console.error(error); process.exitCode = 1; });

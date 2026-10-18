@@ -5,16 +5,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    fs::{self, OpenOptions},
+    io::{self, Write},
     net::{TcpListener, TcpStream},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use tungstenite::{Message, WebSocket};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 const PORT: u16 = 47811;
 
@@ -117,16 +118,19 @@ impl Bridge {
         // Bind before touching discovery: a second app must leave the owner alone.
         let listeners = bind_loopback(PORT)?;
         let mut random = [0u8; 16];
-        File::open("/dev/urandom")?.read_exact(&mut random)?;
+        getrandom::fill(&mut random).map_err(|error| anyhow::anyhow!("Generating bridge token: {error}"))?;
         let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let home = std::env::var_os("HOME").context("HOME is unavailable")?;
-        let directory = PathBuf::from(home).join("Library/Application Support/Moya");
-        fs::create_dir_all(&directory)?;
-        let discovery = directory.join("bridge.json");
+        let discovery = crate::platform_paths::bridge_discovery_path()?;
+        let directory = discovery.parent().context("Discovery path has no directory")?;
+        fs::create_dir_all(directory)?;
         let temporary = directory.join(format!(".bridge-{token}.json"));
         let publish = (|| -> Result<()> {
-            let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .open(&temporary)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            // Windows inherits the current user's private APPDATA directory ACL.
+            let mut file = options.open(&temporary)?;
             serde_json::to_writer(&mut file, &json!({
                 "version": 2, "port": PORT, "token": token, "pid": std::process::id(),
             }))?;
@@ -188,7 +192,7 @@ fn bind_loopback(port: u16) -> Result<Vec<TcpListener>> {
     match TcpListener::bind(("::1", port)) {
         Ok(listener) => listeners.push(listener),
         Err(error) if matches!(error.kind(), io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported)
-            || matches!(error.raw_os_error(), Some(47 | 97)) => {
+            || matches!(error.raw_os_error(), Some(47 | 97 | 10047)) => {
             eprintln!("IPv6 loopback unavailable; Photoshop bridge uses IPv4 only: {error}");
         }
         Err(error) => return Err(error).context("starting IPv6 Photoshop bridge"),
@@ -495,6 +499,7 @@ mod tests {
 
     #[test]
     fn authentication_and_edit_validation() {
+        let temporary = std::env::temp_dir();
         let hello = json!({"type":"hello", "version":2, "token":"secret", "client":"moya-bridge", "nonce":"0".repeat(64)});
         assert!(authenticated(&hello, "secret"));
         assert!(!authenticated(&hello, "wrong"));
@@ -505,7 +510,7 @@ mod tests {
         }
         let edit = json!({
             "type":"edit", "id":"00112233-4455-6677-8899-aabbccddeeff",
-            "source":"/tmp/source.tif", "projectPath":null, "returnMode":"layers",
+            "source":temporary.join("source.tif"), "projectPath":null, "returnMode":"layers",
             "document":{"name":"Photo", "id":1, "depth":16, "width":20, "height":10},
         });
         assert!(matches!(parse_event(edit.clone()), Ok(Event::Edit(_))));
@@ -526,7 +531,7 @@ mod tests {
             assert!(parse_event(valid).is_ok());
         }
         let mut reedit = edit;
-        reedit["projectPath"] = json!("/tmp/session.moya");
+        reedit["projectPath"] = json!(temporary.join("session.moya"));
         assert!(matches!(parse_event(reedit), Ok(Event::Edit(Edit { project_path: Some(_), .. }))));
         for kind in ["placed", "error"] {
             assert!(parse_event(json!({"type":kind, "id":"bad", "message":"failed"})).is_err());
@@ -535,19 +540,20 @@ mod tests {
 
     #[test]
     fn result_layers_round_trip_and_validation() {
+        let temporary = std::env::temp_dir();
         let mut result = ResultMessage {
             id: "00112233-4455-6677-8899-aabbccddeeff".into(),
             depth: 16,
             return_mode: ReturnMode::Layers,
             group_name: "Moya".into(),
             layers: vec![
-                ResultLayer { path: "/tmp/first.tif".into(), name: "Bottom".into(),
+                ResultLayer { path: temporary.join("first.tif"), name: "Bottom".into(),
                     blend: LayerBlend::Screen, opacity: 100.0, visible: true },
-                ResultLayer { path: "/tmp/second.tif".into(), name: "Top".into(),
+                ResultLayer { path: temporary.join("second.tif"), name: "Top".into(),
                     blend: LayerBlend::LinearDodge, opacity: 37.5, visible: false },
             ],
             composite: None,
-            project_path: "/tmp/session.moya".into(),
+            project_path: temporary.join("session.moya"),
         };
         result.validate().unwrap();
         let value = serde_json::to_value(&result).unwrap();
@@ -567,7 +573,7 @@ mod tests {
         result.layers.clear();
         result.return_mode = ReturnMode::Composite;
         assert!(result.validate().is_err());
-        result.composite = Some("/tmp/composite.tif".into());
+        result.composite = Some(temporary.join("composite.tif"));
         result.validate().unwrap();
         result.project_path = "relative.moya".into();
         assert!(result.validate().is_err());
