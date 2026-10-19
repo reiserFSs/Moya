@@ -84,7 +84,7 @@ The installer is per-user and never elevates (`PrivilegesRequired=lowest`). It i
 
 Upgrading over 0.3.0's script-based install: that install used the same directory and the same HKCU keys but has no uninstall entry, so the installer simply overwrites `Moya.exe` and reuses the keys.
 
-**Not yet verified on a real Windows desktop:** packaging/CI success does not establish GPU, Explorer, Adobe installer, or Photoshop runtime correctness. Before accepting a release, record the Windows version, GPU/driver, Photoshop version, and results for all of these:
+**Real-PC release checklist:** CI only exercises software rendering and a silent install without Photoshop; it does not establish GPU, Explorer, Adobe installer, or Photoshop runtime correctness. The 0.3.2 installer, plugin install and app were confirmed working on a real Windows PC by the maintainer (detailed per-item results were not recorded). For future releases, record the Windows version, GPU/driver, Photoshop version, and results for all of these:
 
 - Run the setup `.exe` as a normal non-admin user from a path with spaces (expect a SmartScreen warning: unsigned). Check the wizard pages (license, tasks, finish), installed path, Start Menu shortcut, optional desktop icon, quoted HKCU open command, and Settings > Apps entry. Test both Adobe UPI and `.ccx` fallback when available; with Photoshop running, confirm the plugin-skip message and that the app still installs.
 - Upgrade over a 0.3.0 script install and over an older setup with Moya running; confirm Moya is closed/replaced and the `.moya` association still works.

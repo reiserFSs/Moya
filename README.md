@@ -25,7 +25,7 @@ For manual installation, copy **Moya.app** to `/Applications` or `~/Applications
 
 ### Windows x64
 
-Download **Moya-&lt;version&gt;-windows-x64-setup.exe** from the same release page. It requires an x64 Windows PC with a working GPU driver; the optional plugin requires Photoshop 2024 or later and Creative Cloud. **Real Windows desktop/GPU and Photoshop behavior is not yet verified.**
+Download **Moya-&lt;version&gt;-windows-x64-setup.exe** from the same release page. It requires an x64 Windows PC with a working GPU driver; the optional plugin requires Photoshop 2024 or later and Creative Cloud.
 
 1. Quit Moya and Photoshop, then run the setup. The installer is unsigned, so Windows SmartScreen may say it "protected your PC": click **More info › Run anyway**, but only for a release you trust.
 2. No administrator rights are needed. It installs Moya to `%LOCALAPPDATA%\Programs\Moya`, adds a Start Menu shortcut (optional desktop icon) and registers `.moya` projects for your user.
