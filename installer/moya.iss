@@ -71,16 +71,17 @@ begin
   end;
   Ccx := ExpandConstant('{app}\Moya Photoshop Plugin.ccx');
   Upi := ExpandConstant('{commoncf}\Adobe\Adobe Desktop Common\RemoteComponents\UPI\UnifiedPluginInstallerAgent\UnifiedPluginInstallerAgent.exe');
-  if FileExists(Upi) then begin
-    if (not Exec(Upi, '--install "' + Ccx + '"', '', SW_HIDE, ewWaitUntilTerminated, Code)) or (Code <> 0) then
-      SuppressibleMsgBox('Adobe plugin installation failed; Moya itself is installed. ' +
-        'Double-click "Moya Photoshop Plugin.ccx" in the Moya install folder to retry.',
-        mbError, MB_OK, IDOK);
-  end else begin
-    ShellExec('open', Ccx, '', '', SW_SHOWNORMAL, ewNoWait, Code);
+  // Windows UPIA uses /install (macOS uses --install). If it isn't available or fails,
+  // open the .ccx so Creative Cloud installs it, like a double-click.
+  if FileExists(Upi) and Exec(Upi, '/install "' + Ccx + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
+    Exit;
+  if ShellExec('open', Ccx, '', '', SW_SHOWNORMAL, ewNoWait, Code) then
     SuppressibleMsgBox('Finish the plugin installation in Creative Cloud and approve any prompts.',
-      mbInformation, MB_OK, IDOK);
-  end;
+      mbInformation, MB_OK, IDOK)
+  else
+    SuppressibleMsgBox('The Photoshop plugin could not be installed automatically; Moya itself is installed. ' +
+      'Double-click "Moya Photoshop Plugin.ccx" in the Moya install folder (Creative Cloud must be installed).',
+      mbError, MB_OK, IDOK);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
