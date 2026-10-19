@@ -25,20 +25,18 @@ For manual installation, copy **Moya.app** to `/Applications` or `~/Applications
 
 ### Windows x64
 
-Windows builds are available as **Moya-&lt;version&gt;-windows-x64.zip** from the same release page. They require an x64 Windows PC with a working GPU driver; the optional plugin requires Photoshop 2024 or later and Creative Cloud. **Real Windows desktop/GPU and Photoshop behavior is not yet verified.**
+Download **Moya-&lt;version&gt;-windows-x64-setup.exe** from the same release page. It requires an x64 Windows PC with a working GPU driver; the optional plugin requires Photoshop 2024 or later and Creative Cloud. **Real Windows desktop/GPU and Photoshop behavior is not yet verified.**
 
-1. Extract the whole ZIP, then quit Moya and Photoshop.
-2. Double-click **Install Moya.cmd**. No administrator rights are required: it copies `Moya.exe` to `%LOCALAPPDATA%\Programs\Moya`, adds a Start Menu shortcut, and registers `.moya` projects for your user.
-3. Approve the plugin installation in Creative Cloud if prompted. If Photoshop was running, the app still installs but the plugin is skipped; quit Photoshop and rerun the installer.
-4. Launch **Moya** from Start. For the plugin, open **Plugins › Moya** in Photoshop. Only approve Windows security warnings for a release you trust. If another app is already the user-selected `.moya` default, choose Moya in **Settings › Apps › Default apps**.
-
-To preview without changing files, registry, shortcuts, or launching Adobe, run `"Install Moya.cmd" --dry-run` from Command Prompt in the extracted folder. The installer uses Adobe's Unified Plugin Installer when present, otherwise opens the `.ccx` with Creative Cloud. The archive contains the standalone app, not the CLI.
+1. Quit Moya and Photoshop, then run the setup. The installer is unsigned, so Windows SmartScreen may say it "protected your PC": click **More info › Run anyway**, but only for a release you trust.
+2. No administrator rights are needed. It installs Moya to `%LOCALAPPDATA%\Programs\Moya`, adds a Start Menu shortcut (optional desktop icon) and registers `.moya` projects for your user.
+3. Leave **Install Photoshop plugin** checked to install the plugin through Creative Cloud (approve any prompt). If Photoshop is running, only the app installs; quit Photoshop and double-click `Moya Photoshop Plugin.ccx` in the install folder.
+4. Launch **Moya** from Start; for the plugin, open **Plugins › Moya** in Photoshop. If another app is already the user-selected `.moya` default, choose Moya in **Settings › Apps › Default apps**. The installer contains the standalone app, not the CLI.
 
 Windows settings and bridge discovery/token use `%APPDATA%\Moya` with inherited user-profile ACLs, not Unix `0600` permissions. Accept this only if the directory is private to your account, SYSTEM, and administrators; other processes running as you are still trusted. Do not share `bridge.json` or grant other users access.
 
 Standard Windows profiles are supported. If Photoshop's UXP runtime does not expose environment variables, plugin discovery falls back to `AppData\Roaming` and `AppData\Local` under your home directory; redirected AppData locations may not be discovered. The plugin's **Settings** app-path override remains available, but does not relocate bridge discovery.
 
-**Uninstall:** quit Moya and Photoshop; remove the plugin in Creative Cloud; delete `%LOCALAPPDATA%\Programs\Moya` and `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Moya.lnk`. In Registry Editor remove `HKEY_CURRENT_USER\Software\Classes\Moya.Project`, and remove `HKEY_CURRENT_USER\Software\Classes\.moya` only if its default still equals `Moya.Project`. Optionally delete `%APPDATA%\Moya` for settings/presets; keep your saved projects and exports. Reset any separate user-selected default through Windows Settings, not by deleting protected `UserChoice` keys. The archive's `README.txt` repeats these instructions; see the [Windows smoke checklist](docs/DEVELOPMENT.md#windows-packaging-and-smoke-checklist) before treating the port as validated.
+**Uninstall:** use **Settings › Apps › Installed apps › Moya**. It removes the app, shortcut and `.moya` association, but keeps `%APPDATA%\Moya` (settings/presets; delete it yourself if wanted) and your projects and exports. Remove the plugin in Creative Cloud. See the [Windows smoke checklist](docs/DEVELOPMENT.md#windows-packaging-and-smoke-checklist) before treating the port as validated.
 
 
 ## Using Moya
@@ -66,7 +64,7 @@ Fit uses the Draft preview while the fitted image stays within Draft's pixel res
 The status chip next to the zoom percentage describes the rendered result:
 
 - **Preview** (grey): sharp source with Draft glows, or an approximate refined result below 100% zoom.
-- **Refining n/N** (amber): after 0.5 seconds without an edit, pan, or zoom, visible layer glows refine to HQ, at most one layer per frame; `n/N` counts ready/required layers.
+- **Refining n/N** (amber): after 0.5 seconds without an edit, pan, or zoom, visible layer glows refine to HQ in the background, one layer at a time, so painting and panning stay responsive; `n/N` counts ready/required layers. Editing cancels the layer in progress, and with plain glows a layer takes roughly a second (several for rays, glare and chromatic aberration) on a 92-megapixel photo.
 - **Exact** (green): at 100% zoom or above, every visible layer's HQ glow is ready. The native-resolution region uses export's depth and quantization, so the pixels are identical to the export, and is displayed with nearest-neighbor sampling.
 
 Edits restart refinement. Returning below the Draft-pixel magnification threshold, invalidating the result, or changing documents releases refined glows. Only a screen-sized region is composited for the zoomed viewport, not a full-size output image.

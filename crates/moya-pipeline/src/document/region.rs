@@ -19,7 +19,72 @@ struct RefineKey {
     host_is_float: bool,
     solo: bool,
 }
-pub(super) struct RefinedLayer { key: RefineKey, glow: Image }
+pub(super) struct RefinedLayer { key: Arc<RefineKey>, glow: Image }
+
+/// Identifies the inputs a refinement was captured from; `Document::refine_current` tells
+/// whether they still hold.
+#[derive(Clone)]
+pub struct RefineTicket { id: u64, key: Arc<RefineKey> }
+
+/// Everything one layer's HQ refinement needs, captured on the owning thread.
+/// `run` touches only its own lane, so it may execute on a worker thread.
+pub struct RefineJob {
+    ticket: RefineTicket,
+    source: Arc<Image>,
+    host_depth: Depth,
+    geometry: DocGeometry,
+    /// Preceding visible layers' refined glows, bottom to top (Below input only).
+    priors: Vec<(LayerSettings, Image)>,
+    mask: Option<Image>,
+    mask_generation: u64,
+    view: ViewFlags,
+}
+
+/// A finished HQ working-grid glow, valid only while its ticket is current.
+pub struct RefinedGlow { ticket: RefineTicket, glow: Image }
+
+impl RefineJob {
+    pub fn ticket(&self) -> &RefineTicket { &self.ticket }
+
+    /// Render the HQ glow on `lane`. Returns `None` if the lane's cancel flag fired (the lane
+    /// stays usable). All of the lane's work is submitted before captured inputs are released.
+    pub fn run(self, lane: &Arc<Gpu>) -> Option<RefinedGlow> {
+        let glow = self.render(lane);
+        if lane.cancelled() { lane.discard_pending(); } else { lane.flush(); }
+        // HQ intermediates are transient: retain only the working-grid glow.
+        lane.trim_idle(0);
+        let glow = glow.filter(|_| !lane.cancelled())?;
+        Some(RefinedGlow { ticket: self.ticket, glow })
+    }
+
+    fn render(&self, lane: &Arc<Gpu>) -> Option<Image> {
+        let g = lane;
+        let key = &*self.ticket.key;
+        let mut stages = LayerStages::shared(g.clone(), self.source.clone(), self.host_depth);
+        if key.input == LayerInput::Below {
+            let mut preparer = LayerStages::shared(g.clone(), self.source.clone(), self.host_depth);
+            preparer.prepare(&Params::default(), RenderMode::Hq);
+            let mut below = preparer.working.take().unwrap().source.clone();
+            let depth = blend_depth(&self.view);
+            for (settings, glow) in &self.priors {
+                let linear = (depth == Depth::Float).then(|| g.convert_depth(glow, Depth::Eight, Depth::Float));
+                below = g.blend(&below, linear.as_ref().unwrap_or(glow), blend_mode(settings, &self.view), settings.opacity, 1., depth);
+            }
+            let mut preparer = LayerStages::shared(g.clone(), Arc::new(below), self.host_depth);
+            preparer.geometry = self.geometry;
+            preparer.source_is_working = true;
+            preparer.prepare(&key.params, RenderMode::Hq);
+            stages.working = preparer.working.take();
+        }
+        if g.cancelled() { return None; }
+        // Aliased, not moved: the mask must outlive the lane's submission (see `run`).
+        stages.mask = self.mask.clone();
+        stages.mask_generation = self.mask_generation;
+        let effect_view = ViewFlags { xray: false, ..self.view };
+        let output = stages.render_selected_impl(&key.params, RenderMode::Hq, &effect_view, false, false, false, |_, _, _| {});
+        Some(output.working_glow.clone())
+    }
+}
 
 fn blend_mode(settings: &LayerSettings, view: &ViewFlags) -> B {
     match settings.blend {
@@ -56,19 +121,17 @@ impl Document {
     pub(super) fn invalidate_refine(&mut self, layers: &[LayerInputs<'_>], view: &ViewFlags) {
         let keys = keys(layers, view);
         let before = self.refined.len();
-        self.refined.retain(|id, cached| keys.iter().any(|(key_id, key)| key_id == id && key == &cached.key));
+        self.refined.retain(|id, cached| keys.iter().any(|(key_id, key)| key_id == id && *key == *cached.key));
         if before != self.refined.len() { self.gpu.trim_idle(0); }
     }
-
     pub fn refine_state(&self, layers: &[LayerInputs<'_>], view: &ViewFlags) -> RefineState {
         let keys = keys(layers, view);
         let total = keys.len();
-        let done = keys.iter().filter(|(id, key)| self.refined.get(id).is_some_and(|cached| &cached.key == key)).count();
+        let done = keys.iter().filter(|(id, key)| self.refined.get(id).is_some_and(|cached| *cached.key == *key)).count();
         if done == total { RefineState::Ready }
         else if done == 0 { RefineState::Idle }
         else { RefineState::Pending { done, total } }
     }
-
     /// Retained HQ glow payload only; excluded from the bounded Draft stage cache.
     pub fn refine_bytes(&self) -> u64 {
         self.refined.values().map(|cached| image_bytes(&cached.glow)).sum()
@@ -79,43 +142,52 @@ impl Document {
         self.gpu.trim_idle(0);
     }
 
-    /// Produce at most one HQ working-grid glow. No original-size effect image is allocated.
-    pub fn refine_step(&mut self, layers: &[LayerInputs<'_>], view: &ViewFlags) -> RefineState {
+    #[cfg(test)]
+    pub(super) fn refined_glow(&self, id: u64) -> Option<&Image> { self.refined.get(&id).map(|cached| &cached.glow) }
+
+    /// Capture the next missing visible layer's HQ refinement, or `None` when all are current.
+    /// The mask snapshot is taken (and the document's lane flushed) here, so the job can run
+    /// on another thread and lane without ever touching the document.
+    pub fn refine_job(&mut self, layers: &[LayerInputs<'_>], view: &ViewFlags) -> Option<RefineJob> {
         self.invalidate_refine(layers, view);
-        let Some((id, key)) = keys(layers, view).into_iter().find(|(id, _)| !self.refined.contains_key(id)) else {
-            return RefineState::Ready;
-        };
+        let (id, key) = keys(layers, view).into_iter().find(|(id, _)| !self.refined.contains_key(id))?;
         let input = layers.iter().find(|input| input.settings.id == id).unwrap();
-        let g = &self.gpu;
-        let mut stages = LayerStages::shared(g.clone(), self.source.clone(), self.host_depth);
-        if key.input == LayerInput::Below {
-            let mut preparer = LayerStages::shared(g.clone(), self.source.clone(), self.host_depth);
-            preparer.prepare(&Params::default(), RenderMode::Hq);
-            let mut below = preparer.working.take().unwrap().source.clone();
-            let depth = blend_depth(view);
-            for prior in layers.iter().take_while(|prior| prior.settings.id != id) {
+        let priors = if key.input == LayerInput::Below {
+            layers.iter().take_while(|prior| prior.settings.id != id).filter_map(|prior| {
                 let mut settings = prior.settings.clone(); settings.sanitize();
-                if !settings.visible { continue; }
-                let glow = &self.refined[&settings.id].glow;
-                let linear = (depth == Depth::Float).then(|| g.convert_depth(glow, Depth::Eight, Depth::Float));
-                below = g.blend(&below, linear.as_ref().unwrap_or(glow), blend_mode(&settings, view), settings.opacity, 1., depth);
-            }
-            let mut preparer = LayerStages::shared(g.clone(), Arc::new(below), self.host_depth);
-            preparer.geometry = self.geometry;
-            preparer.source_is_working = true;
-            preparer.prepare(&key.params, RenderMode::Hq);
-            stages.working = preparer.working.take();
-        }
-        stages.mask = input.mask.map(|mask| g.copy(mask));
-        stages.mask_generation = input.mask_generation;
-        let effect_view = ViewFlags { xray: false, ..*view };
-        let output = stages.render_selected_impl(&key.params, RenderMode::Hq, &effect_view, false, false, false, |_, _, _| {});
-        self.refined.insert(id, RefinedLayer { key, glow: output.working_glow.clone() });
-        drop(output);
-        drop(stages);
-        // HQ intermediates are transient: retain only the working-grid glow,
-        // not an idle-pool copy of the entire layer's peak allocation.
+                let glow = settings.visible.then(|| self.refined[&settings.id].glow.clone())?;
+                Some((settings, glow))
+            }).collect()
+        } else { Vec::new() };
+        let snapshots = LayerStages::shared(self.gpu.clone(), self.source.clone(), self.host_depth);
+        let mask = input.mask.map(|mask| snapshots.snapshot_mask(mask, RenderMode::Hq));
+        self.gpu.flush();
+        Some(RefineJob {
+            ticket: RefineTicket { id, key: Arc::new(key) }, source: self.source.clone(), host_depth: self.host_depth,
+            geometry: self.geometry, priors, mask, mask_generation: input.mask_generation, view: *view,
+        })
+    }
+
+    /// Whether `ticket`'s captured inputs still match the current layers and view.
+    pub fn refine_current(&self, ticket: &RefineTicket, layers: &[LayerInputs<'_>], view: &ViewFlags) -> bool {
+        keys(layers, view).iter().any(|(id, key)| *id == ticket.id && *key == *ticket.key)
+    }
+
+    /// Retain a finished glow if its inputs are still current; otherwise drop it.
+    pub fn accept_refine(&mut self, glow: RefinedGlow, layers: &[LayerInputs<'_>], view: &ViewFlags) -> bool {
+        let current = self.refine_current(&glow.ticket, layers, view);
+        if current { self.refined.insert(glow.ticket.id, RefinedLayer { key: glow.ticket.key, glow: glow.glow }); }
+        // The mask snapshot returns to this lane's pool when the job ends; keep only the glow.
         self.gpu.trim_idle(0);
+        current
+    }
+
+    /// Synchronous refinement of one layer on the document's own lane (tests, CLI).
+    pub fn refine_step(&mut self, layers: &[LayerInputs<'_>], view: &ViewFlags) -> RefineState {
+        if let Some(job) = self.refine_job(layers, view) {
+            let gpu = self.gpu.clone();
+            if let Some(glow) = job.run(&gpu) { self.accept_refine(glow, layers, view); }
+        }
         self.refine_state(layers, view)
     }
 

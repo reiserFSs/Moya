@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Build and checksum archives without creating a release
+        description: Build and checksum assets without creating a release
         type: boolean
         default: true
 
@@ -53,13 +53,11 @@ jobs:
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          ./scripts/package-windows.ps1
-          & "./target/release-dist/Moya-$env:MOYA_VERSION-windows-x64/Install Moya.ps1" -DryRun
+        run: ./scripts/package-windows.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
-          path: target/release-dist/Moya-${{ env.MOYA_VERSION }}-${{ matrix.platform }}.zip
+          path: target/release-dist/Moya-${{ env.MOYA_VERSION }}-${{ matrix.platform }}${{ runner.os == 'Windows' && '-setup.exe' || '.zip' }}
           if-no-files-found: error
 
   release:
@@ -76,9 +74,10 @@ jobs:
       - name: Compute SHA-256 release notes
         working-directory: dist
         run: |
-          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 \( -name '*.zip' -o -name '*-setup.exe' \) | wc -l)" -eq 2
+          ls *-macos-arm64.zip *-windows-x64-setup.exe
           printf '## SHA-256\n\n```text\n' > ../release-notes.md
-          sha256sum *.zip | tee -a ../release-notes.md
+          sha256sum *.zip *-setup.exe | tee -a ../release-notes.md
           printf '```\n' >> ../release-notes.md
           cat ../release-notes.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -91,4 +90,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/*.zip --verify-tag --title "Moya $RELEASE_TAG" --notes-file release-notes.md
+        run: gh release create "$RELEASE_TAG" dist/*.zip dist/*-setup.exe --verify-tag --title "Moya $RELEASE_TAG" --notes-file release-notes.md

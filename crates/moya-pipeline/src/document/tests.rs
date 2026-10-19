@@ -247,6 +247,29 @@ fn removing_layer_drops_its_stages_and_stale_below_grid() {
 }
 
 #[test]
+fn draft_mask_snapshot_is_working_sized_so_unchanged_renders_stay_cached() {
+    // A full-resolution snapshot of a large mask alone exceeded the cache budget, so every
+    // masked render (each brush preview, each slider edit) evicted everything and ran cold.
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let (w, h) = (8000, 100);
+    let mut document = Document::new(gpu.clone(), gpu.fill(w, h, [0.6, 0.5, 0.9, 1.]), Depth::Eight);
+    let settings = [layer(1)];
+    let mask = gpu.fill(w, h, [0.7, 0.7, 0.7, 1.]);
+    let masked = [LayerInputs { settings: &settings[0], mask: Some(&mask), mask_generation: 1 }];
+    document.render(&masked, &request());
+    let stages = &document.layers[&1].stages;
+    let snapshot = stages.mask.as_ref().unwrap();
+    assert_eq!((snapshot.width(), snapshot.height()), document.geometry.working_size(RenderMode::Draft));
+    // Budget below one full-resolution mask: the old snapshot alone forced a full eviction.
+    assert!(document.retained_bytes() < image_bytes(&mask), "working-size stages must fit where a full-size mask cannot");
+    document.budget = image_bytes(&mask) - 1;
+    document.render(&masked, &request());
+    let before = generations(&document.layers[&1].stages);
+    document.render(&masked, &request());
+    assert_eq!(generations(&document.layers[&1].stages), before, "an unchanged masked render must reuse its stages");
+}
+
+#[test]
 fn document_budget_counts_shared_grids_stages_and_masks_and_evicts_across_layers() {
     let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
     let mut document = Document::new(gpu.clone(), gpu.fill(3, 3, [0.25, 0.5, 0.8, 1.]), Depth::Eight);
@@ -545,4 +568,140 @@ fn refinement_is_incremental_invalidates_dependents_and_survives_draft() {
     assert_eq!(document.refine_state(&inputs(&settings), &req.view), RefineState::Idle);
     settings.iter_mut().for_each(|settings| settings.visible = false);
     assert_eq!(document.refine_state(&inputs(&settings), &req.view), RefineState::Ready);
+}
+
+fn chunked_lane(gpu: &Gpu) -> Arc<Gpu> {
+    let lane = Arc::new(gpu.lane());
+    arm(&lane);
+    lane
+}
+
+fn arm(lane: &Gpu) -> Arc<std::sync::atomic::AtomicBool> {
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    lane.set_chunking(Some(moya_gpu::Chunking {
+        max_pixels: 2000, target: std::time::Duration::from_secs(10), duty: 1., cancel: cancel.clone(),
+    }));
+    cancel
+}
+
+fn chunked_refine(document: &mut Document, lane: &Arc<Gpu>, layers: &[LayerInputs<'_>], view: &ViewFlags) {
+    while let Some(job) = document.refine_job(layers, view) {
+        let glow = job.run(lane).expect("not cancelled");
+        assert!(document.accept_refine(glow, layers, view));
+    }
+    assert_eq!(document.refine_state(layers, view), RefineState::Ready);
+}
+
+fn bits(gpu: &Gpu, image: &Image) -> Vec<u32> {
+    gpu.download_rgba32f(image).into_iter().map(f32::to_bits).collect()
+}
+
+fn noise(gpu: &Gpu, w: u32, h: u32, float: bool) -> Image {
+    let mut seed = 0x9e37_79b9_7f4a_7c15;
+    let pixels: Vec<f32> = (0..w * h * 4).map(|i| {
+        let v = (region_random(&mut seed) % 256) as f32 / 255.;
+        if float && i % 4 == 0 { v * 3. } else if i % 4 == 3 { 1. } else { v }
+    }).collect();
+    gpu.upload_rgba32f(w, h, &pixels)
+}
+
+#[test]
+fn chunked_refinement_is_bit_identical_to_synchronous() {
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let (w, h) = (37, 53);
+    for depth in [Depth::Eight, Depth::Sixteen, Depth::Float] {
+        let float = depth == Depth::Float;
+        let source = noise(&gpu, w, h, float);
+        let mask = noise(&gpu, w, h, false);
+        for stack in ["plain", "fx", "below", "masked"] {
+            let mut settings = vec![layer(1), layer(2)];
+            settings.iter_mut().for_each(|s| { s.params.hdr32 = float; s.params.threshold = 0.3; });
+            match stack {
+                "fx" => {
+                    let p = &mut settings[1].params;
+                    p.rays_on = true; p.glare_on = true; p.ca_on = true;
+                    p.rays_samples = 3.; p.glare_length = 0.1;
+                }
+                "below" => settings[1].input = LayerInput::Below,
+                _ => {}
+            }
+            let layers: Vec<_> = settings.iter().enumerate().map(|(i, settings)| LayerInputs {
+                settings, mask: (stack == "masked" && i == 1).then_some(&mask), mask_generation: 1,
+            }).collect();
+            let mut req = request();
+            req.mode = RenderMode::Hq;
+            req.view.host_is_float = float;
+            req.want_glow_composite = true;
+            let mut sync = Document::new(gpu.clone(), source.clone(), depth);
+            let mut chunked = Document::new(gpu.clone(), source.clone(), depth);
+            let lane = chunked_lane(&gpu);
+            finish_refine(&mut sync, &layers, &req.view);
+            chunked_refine(&mut chunked, &lane, &layers, &req.view);
+            for id in [1, 2] {
+                assert_eq!(bits(&gpu, chunked.refined_glow(id).unwrap()),
+                    bits(&gpu, sync.refined_glow(id).unwrap()), "{depth:?} {stack} glow {id}");
+            }
+            let region = ViewRegion { x: 0, y: 0, w, h };
+            for glow_only in [false, true] {
+                req.want_composite = !glow_only;
+                let (a, qa) = chunked.render_region(&layers, &req, region, w, h, depth);
+                let (b, qb) = sync.render_region(&layers, &req, region, w, h, depth);
+                assert_eq!((qa, qb), (RegionQuality::Exact, RegionQuality::Exact));
+                assert_eq!(bits(&gpu, &a), bits(&gpu, &b), "{depth:?} {stack} region glow_only={glow_only}");
+            }
+        }
+    }
+}
+
+#[test]
+fn cancelled_job_returns_none_and_lane_stays_usable() {
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let source = noise(&gpu, 37, 53, false);
+    let mut settings = [layer(1)];
+    settings[0].params.threshold = 0.3;
+    let layers = inputs(&settings);
+    let view = request().view;
+    let mut sync = Document::new(gpu.clone(), source.clone(), Depth::Eight);
+    finish_refine(&mut sync, &layers, &view);
+    let mut document = Document::new(gpu.clone(), source, Depth::Eight);
+    let lane = Arc::new(gpu.lane());
+    let cancel = arm(&lane);
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let job = document.refine_job(&layers, &view).unwrap();
+    assert!(job.run(&lane).is_none());
+    assert_eq!(document.refine_state(&layers, &view), RefineState::Idle);
+    arm(&lane);
+    chunked_refine(&mut document, &lane, &layers, &view);
+    assert_eq!(bits(&gpu, document.refined_glow(1).unwrap()), bits(&gpu, sync.refined_glow(1).unwrap()));
+}
+
+#[test]
+fn stale_refine_result_is_rejected() {
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let source = noise(&gpu, 37, 53, false);
+    let mut settings = [layer(1)];
+    let view = request().view;
+    let mut document = Document::new(gpu.clone(), source.clone(), Depth::Eight);
+    let lane = chunked_lane(&gpu);
+    let job = document.refine_job(&inputs(&settings), &view).unwrap();
+    let ticket = job.ticket().clone();
+    assert!(document.refine_current(&ticket, &inputs(&settings), &view));
+    let glow = job.run(&lane).unwrap();
+    settings[0].params.threshold += 0.2;
+    assert!(!document.refine_current(&ticket, &inputs(&settings), &view));
+    assert!(!document.accept_refine(glow, &inputs(&settings), &view));
+    assert_eq!(document.refine_state(&inputs(&settings), &view), RefineState::Idle);
+    assert!(document.refined_glow(1).is_none());
+
+    // A mask generation bump is stale too, and a still-current result is accepted.
+    let mask = noise(&gpu, 37, 53, false);
+    let masked = |generation| vec![LayerInputs { settings: &settings[0], mask: Some(&mask), mask_generation: generation }];
+    let job = document.refine_job(&masked(1), &view).unwrap();
+    let glow = job.run(&lane).unwrap();
+    assert!(!document.accept_refine(glow, &masked(2), &view));
+    assert_eq!(document.refine_state(&masked(1), &view), RefineState::Idle);
+    let job = document.refine_job(&masked(1), &view).unwrap();
+    let glow = job.run(&lane).unwrap();
+    assert!(document.accept_refine(glow, &masked(1), &view));
+    assert_eq!(document.refine_state(&masked(1), &view), RefineState::Ready);
 }

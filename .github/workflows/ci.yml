@@ -46,3 +46,44 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors) { throw ($errors | Out-String) }
           }
+      - name: Build installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -SkipBuild
+      - name: Silent install/uninstall smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem target/release-dist/Moya-*-windows-x64-setup.exe).FullName
+          "Installer size: {0:N1} MiB" -f ((Get-Item $setup).Length / 1MB)
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Moya'
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Moya.lnk'
+          $data = Join-Path $env:APPDATA 'Moya'
+          New-Item -ItemType Directory -Force $data | Out-Null
+          Set-Content (Join-Path $data 'keep.txt') 'user data'
+          function Run($exe, $argList) {
+            $p = Start-Process $exe -ArgumentList $argList -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "$exe exited $($p.ExitCode)" }
+          }
+          Run $setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', '/NORESTART', '/MERGETASKS="!plugin"', "/LOG=$env:RUNNER_TEMP\install.log")
+          foreach ($f in 'Moya.exe', 'Moya Photoshop Plugin.ccx', 'unins000.exe') {
+            if (-not (Test-Path (Join-Path $app $f))) { throw "missing $f" }
+          }
+          if (-not (Test-Path $lnk)) { throw 'missing Start Menu shortcut' }
+          $exe = Join-Path $app 'Moya.exe'
+          $cmd = (Get-ItemProperty 'HKCU:\Software\Classes\Moya.Project\shell\open\command').'(default)'
+          if ($cmd -ne "`"$exe`" `"%1`"") { throw "bad open command: $cmd" }
+          if ((Get-ItemProperty 'HKCU:\Software\Classes\.moya').'(default)' -ne 'Moya.Project') { throw 'bad .moya association' }
+          $unkey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{C3B1CCED-A737-4E2A-9674-1D865D79C8A4}_is1'
+          $un = Get-ItemProperty -LiteralPath $unkey -ErrorAction SilentlyContinue
+          if (-not $un) { throw 'missing uninstall entry' }
+          $un | Format-List DisplayName, DisplayVersion, UninstallString
+          Run (Join-Path $app 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+          for ($i = 0; (Test-Path $app) -and $i -lt 20; $i++) { Start-Sleep 1 }  # uninstaller deletes itself asynchronously
+          if (Test-Path $app) { throw 'install dir remains' }
+          if (Test-Path $lnk) { throw 'shortcut remains' }
+          if (Test-Path 'HKCU:\Software\Classes\Moya.Project') { throw 'Moya.Project key remains' }
+          if (Test-Path 'HKCU:\Software\Classes\.moya') { throw '.moya key remains' }
+          if (Test-Path -LiteralPath $unkey) { throw 'uninstall entry remains' }
+          if ((Get-Content (Join-Path $data 'keep.txt')) -ne 'user data') { throw 'user data touched' }

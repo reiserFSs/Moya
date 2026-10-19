@@ -12,7 +12,7 @@ use std::{collections::HashMap, sync::Arc};
 use moya_core::{CaChannels, CaType, DocGeometry, GlareBlend, GlareRays, Highlights, LayerBlend, LayerInput, LayerSettings, Params, RenderMode, SpectrumBlend, Transition};
 use moya_gpu::{BlendMode as B, Depth, Gpu, GradientStop, Image, RadialQuality};
 mod document;
-pub use document::{Document, DocumentOutput, LayerInputs, RenderRequest, ViewRegion, RegionQuality, RefineState};
+pub use document::{Document, DocumentOutput, LayerInputs, RenderRequest, ViewRegion, RegionQuality, RefineState, RefineJob, RefineTicket, RefinedGlow};
 
 struct RenderOutput {
     pub glow: Image,
@@ -115,6 +115,17 @@ impl LayerStages {
     }
     fn native(&self,image:Image,depth:Depth)->Image {
         self.gpu.quantize_owned(image,depth)
+    }
+
+    /// Snapshot a (mutable) brush mask at the size extraction samples it, using the exact
+    /// copy-or-resize extraction performs, so results are bit-identical while the retained
+    /// snapshot stays working-sized instead of full resolution.
+    fn snapshot_mask(&self, mask: &Image, mode: RenderMode) -> Image {
+        let (w,h)=self.geometry.working_size(mode);
+        if (mask.width(),mask.height())==(w,h) {self.gpu.copy(mask)} else {self.gpu.resize_bilinear(mask,w,h)}
+    }
+    fn mask_matches(&self, mode: RenderMode) -> bool {
+        self.mask.as_ref().is_none_or(|m| (m.width(),m.height())==self.geometry.working_size(mode))
     }
 
     fn prepare(&mut self, p: &Params, mode: RenderMode) {

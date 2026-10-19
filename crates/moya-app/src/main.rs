@@ -9,6 +9,7 @@ mod panels;
 mod workers;
 mod layers;
 mod projects;
+mod refine;
 mod bridge_session;
 mod platform_paths;
 #[cfg(target_os = "macos")]
@@ -92,6 +93,9 @@ struct App {
     selected: u64,
     solo_layer: Option<u64>,
     project: projects::State,
+    /// Last window title sent: egui requests a repaint for every viewport command,
+    /// so resending it each frame kept the app redrawing nonstop.
+    window_title: String,
     hover_params: Option<Params>,
     last_render_ms: Option<f32>,
     last_rendered: std::time::Instant,
@@ -100,6 +104,7 @@ struct App {
     history: history::History,
     last_folder: Option<PathBuf>,
     renderer: Option<Document>,
+    refiner: refine::Refiner,
     picture: Option<Picture>,
     source_preview: Option<Image>,
     path: Option<PathBuf>,
@@ -160,6 +165,7 @@ impl App {
         let last_folder = cc.storage
             .and_then(|s| s.get_string("moya.last_folder"))
             .map(PathBuf::from);
+        let refiner = refine::Refiner::new(gpu.clone(), cc.egui_ctx.clone());
         let mut app = Self {
             gpu,
             render_state,
@@ -168,6 +174,7 @@ impl App {
             selected,
             solo_layer: None,
             project: projects::State::default(),
+            window_title: String::new(),
             last_folder,
             hover_params: None,
             last_render_ms: None,
@@ -175,6 +182,7 @@ impl App {
             idle_trimmed: false,
             busy: false,
             renderer: None,
+            refiner,
             picture: None,
             source_preview: None,
             path: None,
@@ -332,6 +340,7 @@ impl App {
         let (w, h) = moya_core::DocGeometry { orig_w: pic.width, orig_h: pic.height }.working_size(RenderMode::Draft);
         let draft = self.gpu.resize_bicubic(&image, w, h);
         self.source_preview = Some(self.gpu.convert_depth(&draft, depth, Depth::Eight));
+        self.refiner.cancel();
         self.renderer = Some(Document::new(self.gpu.clone(), image, depth));
         for layer in &mut self.layers {
             layer.settings.params.hdr32 = depth == Depth::Float;
@@ -496,7 +505,11 @@ impl App {
     fn sync_mask(&mut self, ctx: &egui::Context) {
         self.history.observe(&mut self.layers, self.selected, ctx.input(|i| i.pointer.any_down()));
         for layer in &mut self.layers {
-            if !matches!(layer.mask.sync(ctx, &self.gpu), mask::MaskSync::Unchanged) {
+            // Rays, glare and CA make each mid-stroke preview slow enough to stall the brush:
+            // for those layers the glow updates when the brush rests and on release.
+            let p = &layer.settings.params;
+            let live = !(p.rays_on || p.glare_on || p.ca_on);
+            if !matches!(layer.mask.sync(ctx, &self.gpu, live), mask::MaskSync::Unchanged) {
                 self.dirty = true;
                 self.force = true;
             }
@@ -715,7 +728,11 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.canvas_ui(ui));
         self.history.observe(&mut self.layers, self.selected, ctx.input(|i| i.pointer.any_down()));
         self.sync_mask(&ctx);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.project_title()));
+        let title = self.project_title();
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
         if self.dirty && (self.auto_update || self.force) {
             self.render();
             ctx.request_repaint();

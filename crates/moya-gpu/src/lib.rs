@@ -20,6 +20,9 @@
 //! deferred until the next run, record, or flush so owned store rounding can fuse;
 //! elapsed time includes the intervening CPU gap. Flush the final operation to emit it.
 //! Stderr records: `MOYA_PROFILE_OPS op=<u32> w=<u32> h=<u32> ms=<decimal>`.
+//! `Gpu::lane` adds a second command lane (own encoder and texture pool, shared device and
+//! pipelines); `Gpu::set_chunking` makes a lane run row-tiled, duty-limited and cancellable
+//! (bit-identical to untiled). Cross-lane visibility requires the producer to flush.
 pub use wgpu;
 pub mod reference;
 mod masks;
@@ -30,8 +33,9 @@ pub use region::{Filter, Region, ViewMap};
 use parking_lot::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, OnceLock, Weak},
-    time::Instant,
+    sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock, Weak},
+    thread::ThreadId,
+    time::{Duration, Instant},
 };
 use wgpu::util::DeviceExt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +89,9 @@ struct TexturePool {
     live_count: u64,
     buffer_bytes: u64,
     peak_live_bytes: u64,
+    /// Lane pools recycle only on the thread that allocates from them (see `Gpu::lane`).
+    thread_bound: bool,
+    owner: Option<ThreadId>,
 }
 impl TexturePool {
     fn new(budget: u64) -> Self {
@@ -97,6 +104,8 @@ impl TexturePool {
             live_count: 0,
             buffer_bytes: 0,
             peak_live_bytes: 0,
+            thread_bound: false,
+            owner: None,
         }
     }
     fn grow_budget(&mut self, w: u32, h: u32) {
@@ -206,7 +215,9 @@ impl Drop for ImageLease {
             let mut pool = pool.lock();
             pool.live_bytes -= u64::from(self.texture.width()) * u64::from(self.texture.height()) * 16;
             pool.live_count -= 1;
-            pool.insert(self.texture.clone());
+            if !pool.thread_bound || pool.owner == Some(std::thread::current().id()) {
+                pool.insert(self.texture.clone());
+            }
         }
     }
 }
@@ -249,11 +260,43 @@ struct BlurReductions {
     bytes: u64,
     budget: u64,
 }
+/// Throttled, cancellable execution for a [`Gpu::lane`]; see [`Gpu::set_chunking`].
+#[derive(Clone)]
+pub struct Chunking {
+    /// Upper bound on output pixels per tile and per batch of small dispatches.
+    pub max_pixels: u64,
+    /// Target GPU time per submission; tiles and batches shrink to fit once per-op cost is measured.
+    pub target: Duration,
+    /// Maximum share of wall time this lane keeps the GPU busy (0..=1].
+    pub duty: f32,
+    /// Set to stop recording new work; the caller must discard the result.
+    pub cancel: Arc<AtomicBool>,
+}
+struct Chunker {
+    cfg: Chunking,
+    /// Measured nanoseconds per output pixel by operation; 0 = unmeasured.
+    rate: [f64; 36],
+    pixels: u64,
+    estimate_ns: f64,
+    /// Bit set of the operations in the batch so far.
+    ops: u64,
+}
+impl Chunker {
+    /// Measured cost per output pixel; until measured, a deliberately pessimistic guess so a
+    /// first tile errs small (observed range: 0.3 to 3.6 ns per pixel).
+    fn rate_of(&self, op: u32) -> f64 {
+        match self.rate[op as usize] {
+            measured if measured > 0. => measured,
+            _ => 2.,
+        }
+    }
+}
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pool: Arc<Pool>,
     pending: Mutex<Pending>,
+    chunker: Mutex<Option<Chunker>>,
     pipelines: [wgpu::ComputePipeline; 36],
     display: wgpu::ComputePipeline,
     gray_upload: OnceLock<wgpu::ComputePipeline>,
@@ -405,6 +448,7 @@ impl Gpu {
             queue,
             pool: Arc::new(Mutex::new(TexturePool::new(512 * 1024 * 1024))),
             pending: Mutex::new(Pending::default()),
+            chunker: Mutex::new(None),
             pipelines,
             display,
             gray_upload: OnceLock::new(),
@@ -413,6 +457,55 @@ impl Gpu {
             display_layout,
             dummy,
         }
+    }
+    /// A second command lane on the same device and queue: shared compiled pipelines,
+    /// layouts and queue, but its own pending encoder and its own texture pool.
+    ///
+    /// Work recorded on one lane is visible to another only once the producing lane has
+    /// flushed (queue submission order). The pool is private and recycles only on the thread
+    /// that allocates from it, so a texture dropped by another lane's thread (whose unsubmitted
+    /// commands may still read it) is freed rather than handed to this lane for overwriting.
+    pub fn lane(&self) -> Gpu {
+        let mut pool = TexturePool::new(512 * 1024 * 1024);
+        pool.thread_bound = true;
+        Gpu {
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            pool: Arc::new(Mutex::new(pool)),
+            pending: Mutex::new(Pending::default()),
+            chunker: Mutex::new(None),
+            pipelines: self.pipelines.clone(),
+            display: self.display.clone(),
+            gray_upload: self.gray_upload.clone(),
+            mask_source: self.mask_source.clone(),
+            layout: self.layout.clone(),
+            display_layout: self.display_layout.clone(),
+            dummy: self.dummy.clone(),
+        }
+    }
+    /// Enable (or with `None`, disable) chunked execution on this lane. Dispatches above
+    /// `max_pixels` run as row tiles (bit-identical to one dispatch: every output pixel is
+    /// independent); after each chunk the lane submits, waits for the GPU and sleeps so its
+    /// busy share stays at most `duty`. Learned per-operation costs survive replacement.
+    pub fn set_chunking(&self, chunking: Option<Chunking>) {
+        let mut chunker = self.chunker.lock();
+        let rate = chunker.as_ref().map_or([0.; 36], |c| c.rate);
+        *chunker = chunking.map(|cfg| Chunker { cfg, rate, pixels: 0, estimate_ns: 0., ops: 0 });
+    }
+    /// True once the active chunking's cancel flag is set; recording is then a no-op.
+    pub fn cancelled(&self) -> bool {
+        self.chunker.lock().as_ref().is_some_and(|c| c.cfg.cancel.load(Ordering::Relaxed))
+    }
+    /// Drop unsubmitted work (after cancellation); the lane stays usable.
+    pub fn discard_pending(&self) {
+        let mut pending = self.pending.lock();
+        pending.profile = None;
+        pending.encoder = None;
+        pending.epoch += 1;
+        pending.buffers.clear();
+        let transient: u64 = pending.transient_textures.drain(..).map(|(_, bytes)| bytes).sum();
+        self.pool.lock().buffer_bytes -= transient;
+        if let Some(chunker) = self.chunker.lock().as_mut() { chunker.pixels = 0; chunker.estimate_ns = 0.; chunker.ops = 0; }
     }
     pub fn device(&self) -> &wgpu::Device {
         &self.device
@@ -449,21 +542,21 @@ impl Gpu {
         self.complete_profile(&mut pending);
         self.submit_pending(&mut pending);
     }
-    fn submit_pending(&self, pending: &mut Pending) {
-        if let Some(encoder) = pending.encoder.take() {
-            self.queue.submit([encoder.finish()]);
-            pending.epoch += 1;
-            let buffers = std::mem::take(&mut pending.buffers);
-            let textures = std::mem::take(&mut pending.transient_textures);
-            let pool = Arc::downgrade(&self.pool);
-            self.queue.on_submitted_work_done(move || {
-                if let Some(pool) = pool.upgrade() {
-                    pool.lock().buffer_bytes -= textures.iter().map(|(_, bytes)| bytes).sum::<u64>();
-                }
-                drop(textures);
-            });
-            self.queue.on_submitted_work_done(move || drop(buffers));
-        }
+    fn submit_pending(&self, pending: &mut Pending) -> Option<wgpu::SubmissionIndex> {
+        let encoder = pending.encoder.take()?;
+        let index = self.queue.submit([encoder.finish()]);
+        pending.epoch += 1;
+        let buffers = std::mem::take(&mut pending.buffers);
+        let textures = std::mem::take(&mut pending.transient_textures);
+        let pool = Arc::downgrade(&self.pool);
+        self.queue.on_submitted_work_done(move || {
+            if let Some(pool) = pool.upgrade() {
+                pool.lock().buffer_bytes -= textures.iter().map(|(_, bytes)| bytes).sum::<u64>();
+            }
+            drop(textures);
+        });
+        self.queue.on_submitted_work_done(move || drop(buffers));
+        Some(index)
     }
     fn complete_profile(&self, pending: &mut Pending) {
         if let Some(Profile { start, op, w, h }) = pending.profile.take() {
@@ -500,6 +593,7 @@ impl Gpu {
     fn image(&self, w: u32, h: u32) -> Image {
         let texture = {
             let mut pool = self.pool.lock();
+            if pool.thread_bound { pool.owner.get_or_insert_with(|| std::thread::current().id()); }
             pool.grow_budget(w, h);
             pool.live_bytes += u64::from(w) * u64::from(h) * 16;
             pool.live_count += 1;
@@ -732,10 +826,98 @@ impl Gpu {
         self.run_into(op, inputs, &mut out, args, stops);
         out
     }
+    /// Relative per-pixel cost of one dispatch of `op` (kernel taps / samples / source area per
+    /// output pixel), so one measured rate per operation holds across radii, sample counts and scales.
+    fn op_units(op: u32, args: &[f32], source_px: u64, out_px: u64) -> f64 {
+        let arg = |i: usize| f64::from(args.get(i).copied().unwrap_or(0.));
+        match op {
+            3 => (source_px as f64 / out_px as f64).max(1.),
+            6 if arg(0) > 0. => 4.,
+            7 => 2. * arg(0) + 1.,
+            8 => arg(3).max(4.),
+            9 => arg(3).max(1.),
+            _ => 1.,
+        }
+    }
+    /// Rows of the next tile of a dispatch with `rows_left` rows to go: all of them unless this
+    /// lane is chunked. A chunk never exceeds its pixel/time budget: work that does not fit what
+    /// is left of the current batch flushes it first. Tiles are multiples of 16 rows so
+    /// neighbours never overlap. `None` if cancelled.
+    fn next_tile_rows(&self, op: u32, units: f64, w: u32, rows_left: u32) -> Option<u32> {
+        loop {
+            let mut guard = self.chunker.lock();
+            let Some(c) = guard.as_mut() else { return Some(rows_left) };
+            if c.cfg.cancel.load(Ordering::Relaxed) { return None; }
+            let (rate, target) = (c.rate_of(op) * units, c.cfg.target.as_nanos() as f64);
+            let room = ((target - c.estimate_ns) / rate).min((c.cfg.max_pixels - c.pixels.min(c.cfg.max_pixels)) as f64);
+            let fresh = (target / rate).min(c.cfg.max_pixels as f64);
+            let whole = f64::from(w) * f64::from(rows_left);
+            if whole <= room { return Some(rows_left); }
+            if c.pixels > 0 && (room < 16. * f64::from(w) || whole <= fresh) {
+                drop(guard);
+                if self.flush_chunk() { return None; }
+                continue;
+            }
+            let pixels = if c.pixels > 0 { room } else { fresh };
+            return Some((((pixels / f64::from(w)) as u32 / 16 * 16).max(16)).min(rows_left));
+        }
+    }
+    /// Count a recorded dispatch against the current chunk, flushing it once its budget is spent.
+    /// Returns true if cancelled.
+    fn chunk_account(&self, op: u32, units: f64, pixels: u64) -> bool {
+        let mut guard = self.chunker.lock();
+        let Some(c) = guard.as_mut() else { return false };
+        if c.cfg.cancel.load(Ordering::Relaxed) { return true; }
+        c.estimate_ns += pixels as f64 * units * c.rate_of(op);
+        c.pixels += pixels;
+        c.ops |= 1 << op;
+        if c.pixels < c.cfg.max_pixels && c.estimate_ns < c.cfg.target.as_nanos() as f64 { return false; }
+        drop(guard);
+        self.flush_chunk()
+    }
+    /// Submit the current chunk, wait for the GPU, correct the cost estimates of the operations in
+    /// it by the measured/estimated ratio, and sleep so this lane's GPU busy share stays at most
+    /// `duty`. Returns true if cancelled.
+    fn flush_chunk(&self) -> bool {
+        let mut guard = self.chunker.lock();
+        let Some(c) = guard.as_mut() else { return false };
+        c.pixels = 0;
+        let (ops, estimate) = (std::mem::take(&mut c.ops), std::mem::take(&mut c.estimate_ns));
+        let duty = c.cfg.duty.clamp(0.05, 1.);
+        drop(guard);
+        let started = Instant::now();
+        let index = {
+            let mut pending = self.pending.lock();
+            self.complete_profile(&mut pending);
+            self.submit_pending(&mut pending)
+        };
+        let Some(submission_index) = index else { return self.cancelled() };
+        self.device
+            .poll(wgpu::PollType::Wait { submission_index: Some(submission_index), timeout: None })
+            .expect("GPU chunk completion");
+        let busy = started.elapsed();
+        let mut guard = self.chunker.lock();
+        let Some(c) = guard.as_mut() else { return false };
+        if estimate > 0. {
+            let ratio = busy.as_nanos() as f64 / estimate;
+            for op in (0..64u32).filter(|op| ops >> op & 1 == 1) {
+                // Underestimates are corrected at once (a stall is costly), overestimates gradually.
+                c.rate[op as usize] = c.rate_of(op) * if ratio > 1. { ratio } else { 0.5 + 0.5 * ratio };
+            }
+        }
+        let cancelled = c.cfg.cancel.load(Ordering::Relaxed);
+        drop(guard);
+        if !cancelled && duty < 1. {
+            std::thread::sleep(busy.mul_f32((1. - duty) / duty).min(Duration::from_millis(100)));
+        }
+        cancelled
+    }
     fn run_into(&self, op: u32, inputs: &[&Image], out: &mut Image, args: &[f32], stops: &[[f32; 4]]) {
         let (w, h) = (out.width(), out.height());
+        out.producer = None;
+        if self.cancelled() { return; }
         static PROFILE_OPS: OnceLock<bool> = OnceLock::new();
-        let start = (*PROFILE_OPS.get_or_init(|| std::env::var_os("MOYA_PROFILE_OPS").is_some()))
+        let mut start = (*PROFILE_OPS.get_or_init(|| std::env::var_os("MOYA_PROFILE_OPS").is_some()))
             .then(|| {
                 self.flush();
                 self.device
@@ -745,11 +927,6 @@ impl Gpu {
             });
         let mut params = [0f32; 32];
         params[4..4 + args.len()].copy_from_slice(args);
-        let uniform = self.track_buffer(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&params),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            }));
         let storage = self.track_buffer(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(if stops.is_empty() { &[[0.; 4]] } else { stops }),
@@ -764,45 +941,58 @@ impl Gpu {
             })
             .collect();
         let dst = out.texture.create_view(&Default::default());
-        let mut entries: Vec<_> = views
-            .iter()
-            .enumerate()
-            .map(|(i, v)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: wgpu::BindingResource::TextureView(v),
-            })
-            .collect();
-        entries.extend([
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::TextureView(&dst),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: uniform.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: storage.as_entire_binding(),
-            },
-        ]);
-        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.layout,
-            entries: &entries,
-        });
-        let (generation, epoch) = self.record_buffers(start.map(|start| Profile { start, op, w, h }), &[uniform.clone(), storage], |e| {
-            let mut pass = e.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipelines[op as usize]);
-            pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
-        });
-        out.producer = Some(Producer {
-            uniform,
-            generation,
-            epoch,
-            rounded: false,
-        });
+        let source_px = inputs.first().map_or(0, |i| u64::from(i.width()) * u64::from(i.height()));
+        let units = Self::op_units(op, args, source_px, u64::from(w) * u64::from(h));
+        let mut y0 = 0;
+        while y0 < h {
+            let Some(rows) = self.next_tile_rows(op, units, w, h - y0) else { return };
+            // head.y: tile origin (see ops.wgsl).
+            params[1] = y0 as f32;
+            let uniform = self.track_buffer(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&params),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                }));
+            let mut entries: Vec<_> = views
+                .iter()
+                .enumerate()
+                .map(|(i, v)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: wgpu::BindingResource::TextureView(v),
+                })
+                .collect();
+            entries.extend([
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&dst),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: storage.as_entire_binding(),
+                },
+            ]);
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.layout,
+                entries: &entries,
+            });
+            let (generation, epoch) = self.record_buffers(start.take().map(|start| Profile { start, op, w, h }), &[uniform.clone(), storage.clone()], |e| {
+                let mut pass = e.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.pipelines[op as usize]);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(w.div_ceil(16), rows.div_ceil(16), 1);
+            });
+            y0 += rows;
+            // A chunked lane never fuses a later store round into a (possibly multi-tile) producer.
+            if y0 == h && self.chunker.lock().is_none() {
+                out.producer = Some(Producer { uniform, generation, epoch, rounded: false });
+            }
+            if self.chunk_account(op, units, u64::from(w) * u64::from(rows)) { return; }
+        }
     }
     fn unary(&self, op: u32, img: &Image, args: &[f32]) -> Image {
         self.run(op, &[img], img.width(), img.height(), args, &[])
@@ -1590,3 +1780,5 @@ mod tests {
 
 #[cfg(test)]
 mod motion_tests;
+#[cfg(test)]
+mod chunk_tests;

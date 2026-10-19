@@ -3,6 +3,7 @@ override operation: u32;
 @group(0) @binding(1) var b: texture_2d<f32>;
 @group(0) @binding(2) var mask: texture_2d<f32>;
 @group(0) @binding(3) var dst: texture_storage_2d<rgba32float, write>;
+// head.xy: tile origin added to every invocation id (chunked dispatch); head.w: owned store round.
 struct Params { head:vec4<f32>, p:array<vec4<f32>,7> }
 @group(0) @binding(4) var<uniform> u:Params;
 @group(0) @binding(5) var<storage,read> stops:array<vec4<f32>>;
@@ -76,7 +77,7 @@ fn satmap(s:f32,amount:f32)->f32{if(amount<=0.){return s*(1.+amount);}if(amount>
 fn hash(v:u32)->u32{var x=v;x=(x^(x>>16u))*0x7feb352du;x=(x^(x>>15u))*0x846ca68bu;return x^(x>>16u);}
 fn random(v:u32)->f32{return f32(hash(v)&0x00ffffffu)/16777216.;}
 @compute @workgroup_size(16,16)
-fn main(@builtin(global_invocation_id) id:vec3<u32>){let local_size=textureDimensions(dst);if(any(id.xy>=local_size)){return;}let region=arg(24)>0.;let size=select(local_size,vec2<u32>(u32(arg(24)),u32(arg(25))),region);let p=vec2<i32>(id.xy);let fp=vec2<f32>(id.xy)+select(vec2(0.),vec2(arg(26),arg(27)),region);let op=operation;let source=vec2<f32>(textureDimensions(a));var c=region_load(a,p);var out=c;
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){let local_size=textureDimensions(dst);let id=vec3<u32>(gid.xy+vec2<u32>(u32(u.head.x),u32(u.head.y)),gid.z);if(any(id.xy>=local_size)){return;}let region=arg(24)>0.;let size=select(local_size,vec2<u32>(u32(arg(24)),u32(arg(25))),region);let p=vec2<i32>(id.xy);let fp=vec2<f32>(id.xy)+select(vec2(0.),vec2(arg(26),arg(27)),region);let op=operation;let source=vec2<f32>(textureDimensions(a));var c=region_load(a,p);var out=c;
 switch op {
 case 0u:{}
 case 1u:{out=vec4(arg(0),arg(1),arg(2),arg(3));}

@@ -4,7 +4,7 @@
 
 use super::*;
 mod region;
-pub use region::{ViewRegion, RegionQuality, RefineState};
+pub use region::{ViewRegion, RegionQuality, RefineState, RefineJob, RefineTicket, RefinedGlow};
 
 pub struct LayerInputs<'a> {
     pub settings: &'a LayerSettings,
@@ -138,9 +138,9 @@ impl Document {
                 entry.stages.clear_stage_cache();
             }
             let has_mask=input.mask.is_some();
-            if entry.stages.mask_generation!=input.mask_generation || entry.has_mask!=has_mask {
+            if entry.stages.mask_generation!=input.mask_generation || entry.has_mask!=has_mask || !entry.stages.mask_matches(req.mode) {
                 // Brush textures are mutable; cached masks must remain snapshots.
-                entry.stages.mask=input.mask.map(|mask|g.copy(mask));
+                entry.stages.mask=input.mask.map(|mask|entry.stages.snapshot_mask(mask,req.mode));
                 entry.stages.mask_generation=input.mask_generation;
                 entry.has_mask=has_mask;
                 entry.stages.clear_stage_cache();

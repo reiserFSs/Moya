@@ -119,6 +119,7 @@ impl App {
         let host_depth = pic.depth;
         let magnified = self.canvas.zoom > source.width() as f32 / width as f32;
         if !magnified {
+            self.refiner.cancel();
             if self.canvas.magnified {
                 self.clear_viewport();
                 if let Some(document) = self.renderer.as_mut() { document.drop_refine(); }
@@ -160,12 +161,19 @@ impl App {
             mask: layer.mask.gpu_image(), mask_generation: layer.mask.generation(),
         }).collect();
         let document = self.renderer.as_mut()?;
+        if let Some(glow) = self.refiner.poll() {
+            document.accept_refine(glow, &inputs, &flags);
+        }
+        if self.refiner.ticket().is_some_and(|ticket| !document.refine_current(ticket, &inputs, &flags)) {
+            self.refiner.cancel();
+        }
         self.canvas.refine = document.refine_state(&inputs, &flags);
         let elapsed = self.canvas.last_interaction.elapsed();
         if !self.dirty && !self.busy && self.hover_params.is_none() && elapsed >= Duration::from_millis(500)
             && !matches!(self.canvas.refine, RefineState::Ready) {
-            self.canvas.refine = document.refine_step(&inputs, &flags);
-            ui.ctx().request_repaint();
+            if !self.refiner.busy() && !self.refiner.stopped() {
+                if let Some(job) = document.refine_job(&inputs, &flags) { self.refiner.start(job); }
+            }
         } else if elapsed < Duration::from_millis(500) {
             ui.ctx().request_repaint_after(Duration::from_millis(500) - elapsed);
         }
@@ -473,9 +481,15 @@ impl App {
                     // (label, tooltip, colour): grey Preview, amber Refining, green Exact.
                     let preview = Color32::from_gray(150);
                     let (label, explanation, color) = if self.canvas.magnified {
-                        match self.canvas.refine {
-                            RefineState::Pending { done, total } if self.canvas.last_interaction.elapsed() >= Duration::from_millis(500) =>
-                                (format!("Refining {done}/{total}"), "Computing export-quality glows, one layer per frame. Editing pauses refinement.", Color32::from_rgb(232, 166, 74)),
+                        let refining = match self.canvas.refine {
+                            RefineState::Pending { done, total } => Some((done, total)),
+                            RefineState::Idle if self.refiner.busy() =>
+                                Some((0, self.layers.iter().filter(|layer| layer.settings.visible).count())),
+                            _ => None,
+                        }.filter(|_| self.canvas.last_interaction.elapsed() >= Duration::from_millis(500));
+                        match refining {
+                            Some((done, total)) =>
+                                (format!("Refining {done}/{total}"), "Computing export-quality glows in the background, one layer at a time. Editing cancels the layer in progress.", Color32::from_rgb(232, 166, 74)),
                             _ if self.canvas.viewport.as_ref().is_some_and(|v| matches!(v.quality, RegionQuality::Exact)) =>
                                 ("Exact".into(), "Native image pixels, export-quality glows and the selected export depth: identical to the export. Nearest-neighbour display.", Color32::from_rgb(92, 196, 137)),
                             _ => ("Preview".into(), "Full-resolution source with Draft glows. After a short pause, glows refine to export quality; 100% or above shows exact export pixels.", preview),
