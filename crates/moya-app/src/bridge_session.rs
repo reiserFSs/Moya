@@ -156,7 +156,12 @@ impl App {
                 bridge::Event::Placed(id) => {
                     if self.session.as_ref().is_some_and(|session| session.id == id) {
                         if let Some((batch, _)) = self.sending.take() { batch.keep_output(); }
-                        self.status = "Placed in Photoshop".into();
+                        // The plugin closes its side after placing, so a second Send in this
+                        // session would be ignored and would collide with this send's result files.
+                        self.session = None;
+                        self.session_ready = false;
+                        self.send_pending = false;
+                        self.status = "Placed in Photoshop. To change it, select the Moya group and choose Re-edit in Photoshop.".into();
                         self.trim_idle();
                     }
                 }

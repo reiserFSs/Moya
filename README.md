@@ -34,6 +34,8 @@ Download **Moya-&lt;version&gt;-windows-x64-setup.exe** from the same release pa
 
 Windows settings and bridge discovery/token use `%APPDATA%\Moya` with inherited user-profile ACLs, not Unix `0600` permissions. Accept this only if the directory is private to your account, SYSTEM, and administrators; other processes running as you are still trusted. Do not share `bridge.json` or grant other users access.
 
+On a wide-gamut monitor, Moya's window can look more saturated than Photoshop (which converts to your monitor profile) unless Windows 11 **Auto color management** is enabled in **Settings › Display**; exported files are not affected.
+
 Standard Windows profiles are supported. If Photoshop's UXP runtime does not expose environment variables, plugin discovery falls back to `AppData\Roaming` and `AppData\Local` under your home directory; redirected AppData locations may not be discovered. The plugin's **Settings** app-path override remains available, but does not relocate bridge discovery.
 
 **Uninstall:** use **Settings › Apps › Installed apps › Moya**. It removes the app, shortcut and `.moya` association, but keeps `%APPDATA%\Moya` (settings/presets; delete it yourself if wanted) and your projects and exports. Remove the plugin in Creative Cloud. See the [Windows smoke checklist](docs/DEVELOPMENT.md#windows-packaging-and-smoke-checklist) before treating the port as validated.

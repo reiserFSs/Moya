@@ -32,8 +32,14 @@ pub struct DocumentOutput {
 
 #[derive(Clone, PartialEq)]
 struct Stamp { id: u64, generation: u64, opacity: u32, blend: LayerBlend }
+/// Everything that determines a Draft layer's finished glow. Blend and opacity are composite-time only.
+#[derive(Clone, PartialEq)]
+struct FinishedKey { params: Params, input_generation: u64, mask_generation: u64, has_mask: bool, working: WorkingKey, solo: bool, host_is_float: bool }
+/// The images the stack loop consumes, kept so an unchanged layer never touches its stage chain.
+struct Finished { key: FinishedKey, glow: Image, working_glow: Image, generation: u64 }
 struct LayerCache {
     stages: LayerStages,
+    finished: Option<Finished>,
     input: Option<Vec<Stamp>>,
     input_mode: Option<RenderMode>,
     input_generation: u64,
@@ -70,16 +76,22 @@ impl Document {
 
     /// Cold-stage benchmark/reset, retaining the shared prepared document grids.
     pub fn clear_stage_caches(&mut self) {
-        for layer in self.layers.values_mut() { layer.stages.clear_stage_cache(); }
+        for layer in self.layers.values_mut() { layer.stages.clear_stage_cache(); layer.finished=None; }
     }
 
     pub fn render(&mut self, layers: &[LayerInputs<'_>], request: &RenderRequest) -> DocumentOutput {
-        self.render_with_checkpoints(layers, request, |_, _, _| {})
+        self.render_inner(layers, request, |_, _, _| {}, true)
     }
 
     /// Checkpoints retain their historical names on single-layer documents.
+    /// Every layer runs its full stage chain so each checkpoint fires; finished results are not reused.
     pub fn render_with_checkpoints(&mut self, layers: &[LayerInputs<'_>], req: &RenderRequest,
-        mut checkpoint: impl FnMut(&str, &Image, Depth)) -> DocumentOutput {
+        checkpoint: impl FnMut(&str, &Image, Depth)) -> DocumentOutput {
+        self.render_inner(layers, req, checkpoint, false)
+    }
+
+    fn render_inner(&mut self, layers: &[LayerInputs<'_>], req: &RenderRequest,
+        mut checkpoint: impl FnMut(&str, &Image, Depth), cache_finished: bool) -> DocumentOutput {
         if req.mode == RenderMode::Hq { self.clear_caches(); }
         if req.mode == RenderMode::Draft { self.invalidate_refine(layers, &req.view); }
         self.layers.retain(|id, _| layers.iter().any(|l| l.settings.id == *id));
@@ -124,7 +136,7 @@ impl Document {
             let id=settings.id;
             let entry=self.layers.entry(id).or_insert_with(|| LayerCache {
                 stages:LayerStages::shared(g.clone(),self.source.clone(),self.host_depth),
-                input:None,input_mode:None,input_generation:0,has_mask:false,
+                finished:None,input:None,input_mode:None,input_generation:0,has_mask:false,
             });
             let signature=if settings.input==LayerInput::Below {Some(stamps.clone())} else {None};
             if entry.input!=signature || (signature.is_some() && entry.input_mode!=Some(req.mode)) {
@@ -138,51 +150,69 @@ impl Document {
                 entry.stages.clear_stage_cache();
             }
             let has_mask=input.mask.is_some();
-            if entry.stages.mask_generation!=input.mask_generation || entry.has_mask!=has_mask || !entry.stages.mask_matches(req.mode) {
-                // Brush textures are mutable; cached masks must remain snapshots.
-                entry.stages.mask=input.mask.map(|mask|entry.stages.snapshot_mask(mask,req.mode));
-                entry.stages.mask_generation=input.mask_generation;
-                entry.has_mask=has_mask;
-                entry.stages.clear_stage_cache();
-            }
             let key=WorkingKey{mode:req.mode,highlights:settings.params.highlights,host_depth:self.host_depth};
-            if let Some(grid)=self.grids.iter().find(|grid|grid.input==entry.input_generation && grid.working.key==key) {
-                entry.stages.working=Some(grid.working.clone());
-            } else {
-                entry.stages.working=None;
-                if settings.input==LayerInput::Below {
-                    if let Some(below)=&below_working {
-                        let mut preparer=LayerStages::shared(g.clone(),Arc::new(below.clone()),self.host_depth);
-                        preparer.geometry=DocGeometry{orig_w:self.geometry.orig_w,orig_h:self.geometry.orig_h};
-                        preparer.source_is_working=true;
-                        preparer.prepare(&settings.params,req.mode);
-                        entry.stages.working=preparer.working.take();
-                    } else {entry.stages.prepare(&settings.params,req.mode);}
-                } else {entry.stages.prepare(&settings.params,req.mode);}
-                self.generation+=1;
-                let working=Arc::get_mut(entry.stages.working.as_mut().unwrap()).expect("new working grid");
-                working.generation=self.generation;
-                if req.mode == RenderMode::Draft {
-                    self.grids.push(Grid{input:entry.input_generation,working:entry.stages.working.as_ref().unwrap().clone()});
-                }
-            }
             let want_xray=req.selected==Some(id) && (req.want_xray || (req.want_composite && req.view.xray));
-            if req.view.xray && want_xray && !req.want_layer_glows && !req.want_glow_composite {
-                entry.stages.ensure_extraction(&settings.params);
-                let heatmap=entry.stages.output_heatmap(&entry.stages.heatmap_cache.as_ref().unwrap().images[0],&settings.params,req.mode);
-                let composite=xray_base.as_ref().map(|base| {
-                    let base=g.convert_depth(base,self.host_depth,Depth::Eight);
-                    g.blend(&base,&heatmap,B::Normal,0.8,1.,Depth::Eight)
-                });
-                let xray=req.want_xray.then(||heatmap.as_ref().clone());
-                if req.mode == RenderMode::Hq { self.clear_caches(); } else { self.trim_cache(); }
-                return DocumentOutput{composite,glow_composite,layer_glows,xray};
-            }
             let fast_composite=req.want_composite && single && req.solo_layer.is_none_or(|solo|solo==id)
                 && settings.input==LayerInput::Original && settings.blend==LayerBlend::Auto && settings.opacity==1.
                 && !xray_view;
-            let view=ViewFlags{xray:false,solo:req.view.solo,host_is_float:req.view.host_is_float};
-            let output=entry.stages.render_selected(&settings.params,req.mode,&view,fast_composite,want_xray,&mut checkpoint);
+            // X-Ray and the fast composite consume stage-chain outputs the finished entry does not keep.
+            let cacheable=cache_finished && req.mode==RenderMode::Draft;
+            let finished_key=FinishedKey{params:settings.params.clone(),input_generation:entry.input_generation,
+                mask_generation:input.mask_generation,has_mask,working:key.clone(),solo:req.view.solo,host_is_float:req.view.host_is_float};
+            let hit=entry.finished.as_ref().filter(|f|cacheable && !want_xray && !fast_composite && f.key==finished_key).map(|f|{
+                // composite/xray are never read on this path (see the bypass conditions above).
+                RenderOutput{glow:f.glow.clone(),xray:f.glow.clone(),composite:f.glow.clone(),working_glow:f.working_glow.clone(),generation:f.generation}
+            });
+            let output=if let Some(hit)=hit {hit} else {
+                if entry.stages.mask_generation!=input.mask_generation || entry.has_mask!=has_mask || !entry.stages.mask_matches(req.mode) {
+                    // Brush textures are mutable; cached masks must remain snapshots.
+                    entry.stages.mask=input.mask.map(|mask|entry.stages.snapshot_mask(mask,req.mode));
+                    entry.stages.mask_generation=input.mask_generation;
+                    entry.has_mask=has_mask;
+                    entry.stages.clear_stage_cache();
+                }
+                if let Some(grid)=self.grids.iter().find(|grid|grid.input==entry.input_generation && grid.working.key==key) {
+                    entry.stages.working=Some(grid.working.clone());
+                } else {
+                    entry.stages.working=None;
+                    if settings.input==LayerInput::Below {
+                        if let Some(below)=&below_working {
+                            let mut preparer=LayerStages::shared(g.clone(),Arc::new(below.clone()),self.host_depth);
+                            preparer.geometry=DocGeometry{orig_w:self.geometry.orig_w,orig_h:self.geometry.orig_h};
+                            preparer.source_is_working=true;
+                            preparer.prepare(&settings.params,req.mode);
+                            entry.stages.working=preparer.working.take();
+                        } else {entry.stages.prepare(&settings.params,req.mode);}
+                    } else {entry.stages.prepare(&settings.params,req.mode);}
+                    self.generation+=1;
+                    let working=Arc::get_mut(entry.stages.working.as_mut().unwrap()).expect("new working grid");
+                    working.generation=self.generation;
+                    if req.mode == RenderMode::Draft {
+                        self.grids.push(Grid{input:entry.input_generation,working:entry.stages.working.as_ref().unwrap().clone()});
+                    }
+                }
+                if req.view.xray && want_xray && !req.want_layer_glows && !req.want_glow_composite {
+                    entry.stages.ensure_extraction(&settings.params);
+                    let heatmap=entry.stages.output_heatmap(&entry.stages.heatmap_cache.as_ref().unwrap().images[0],&settings.params,req.mode);
+                    let composite=xray_base.as_ref().map(|base| {
+                        let base=g.convert_depth(base,self.host_depth,Depth::Eight);
+                        g.blend(&base,&heatmap,B::Normal,0.8,1.,Depth::Eight)
+                    });
+                    let xray=req.want_xray.then(||heatmap.as_ref().clone());
+                    if req.mode == RenderMode::Hq { self.clear_caches(); } else { self.trim_cache(req.selected); }
+                    return DocumentOutput{composite,glow_composite,layer_glows,xray};
+                }
+                let view=ViewFlags{xray:false,solo:req.view.solo,host_is_float:req.view.host_is_float};
+                let mut output=entry.stages.render_selected(&settings.params,req.mode,&view,fast_composite,want_xray,&mut checkpoint);
+                if cacheable {
+                    // An existing equal entry keeps its generation so Below layers above stay valid.
+                    match &entry.finished {
+                        Some(f) if f.key==finished_key => output.generation=f.generation,
+                        _ => entry.finished=Some(Finished{key:finished_key,glow:output.glow.clone(),working_glow:output.working_glow.clone(),generation:output.generation}),
+                    }
+                }
+                output
+            };
             let output_generation=output.generation;
             let included=req.solo_layer.is_none_or(|solo|solo==id);
             let blend=match settings.blend {
@@ -221,7 +251,7 @@ impl Document {
             if want_xray {xray=Some(output.xray);}
             stamps.push(Stamp{id,generation:output_generation,opacity:settings.opacity.to_bits(),blend:settings.blend});
             // Render one layer at a time and reclaim cached descendants before the next HQ layer.
-            if req.mode == RenderMode::Hq { self.layers.remove(&id); } else { self.trim_cache(); }
+            if req.mode == RenderMode::Hq { self.layers.remove(&id); } else { self.trim_cache(req.selected); }
         }
         if req.want_composite && req.view.xray {
             if let Some(heatmap)=&xray {
@@ -239,7 +269,7 @@ impl Document {
             glow_composite=glow_composite.map(|image|g.convert_depth(&image,Depth::Float,Depth::Eight));
         }
         if !req.want_xray { xray=None; }
-        if req.mode == RenderMode::Hq { self.clear_caches(); } else { self.trim_cache(); }
+        if req.mode == RenderMode::Hq { self.clear_caches(); } else { self.trim_cache(req.selected); }
         DocumentOutput{composite,glow_composite,layer_glows,xray}
     }
 
@@ -255,17 +285,27 @@ impl Document {
             macro_rules! stages {($($field:ident),*)=>{$(if let Some(c)=&s.$field {for image in &c.images {account(image);}})*};}
             stages!(extraction_cache,heatmap_cache,exposure_cache,glow_cache,glare_cache,tone_cache,ca_cache,output_cache);
             if let Some(mask)=&s.mask {account(mask);}
+            if let Some(f)=&layer.finished {account(&f.glow);account(&f.working_glow);}
         }
         bytes
     }
 
-    fn trim_cache(&mut self) {
+    /// Eviction order: stage chains of unchanged (finished-cached) non-focus layers, then
+    /// descendants-first across the rest, then finished results. The focus layer is the one being edited.
+    fn trim_cache(&mut self, focus: Option<u64>) {
         // Drop unused Below grids as soon as their owning input changes or disappears.
         self.grids.retain(|grid|grid.input==0 || self.layers.values().any(|l|l.input_generation==grid.input));
+        if self.retained_bytes()<=self.budget {return;}
+        for (id,layer) in self.layers.iter_mut() {
+            if Some(*id)!=focus && layer.finished.is_some() { layer.stages.clear_stage_cache(); layer.stages.working=None; }
+        }
+        self.grids.retain(|grid|grid.input==0 || Arc::strong_count(&grid.working)>1);
         if self.retained_bytes()<=self.budget {return;}
         // Descendants first, across every layer: never strand a retained output behind evicted predecessors.
         macro_rules! evict {($($field:ident),*)=>{$(for layer in self.layers.values_mut() {layer.stages.$field=None;} if self.retained_bytes()<=self.budget {return;})*};}
         evict!(output_cache,ca_cache,tone_cache,glare_cache,glow_cache,exposure_cache,heatmap_cache,extraction_cache,working);
+        for layer in self.layers.values_mut() { layer.finished=None; }
+        if self.retained_bytes()<=self.budget {return;}
         self.grids.clear();
         if self.retained_bytes()>self.budget {
             for layer in self.layers.values_mut() {

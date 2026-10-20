@@ -279,6 +279,8 @@ fn document_budget_counts_shared_grids_stages_and_masks_and_evicts_across_layers
         settings, mask: Some(&mask), mask_generation: 1,
     }).collect();
     document.render(&masked, &request());
+    // This test pins the stage-level eviction order; finished-result eviction has its own test.
+    for layer in document.layers.values_mut() { layer.finished = None; }
 
     let image = image_bytes(&mask);
     let shared_grid = 3 * image;
@@ -292,7 +294,7 @@ fn document_budget_counts_shared_grids_stages_and_masks_and_evicts_across_layers
     document.budget = total - 1;
     assert!(per_layer.iter().all(|bytes| bytes + image < document.budget));
     let extraction: Vec<_> = settings.iter().map(|s| document.layers[&s.id].stages.extraction_cache.as_ref().unwrap().generation).collect();
-    document.trim_cache();
+    document.trim_cache(None);
     assert!(document.retained_bytes() <= document.budget);
     for (settings, generation) in settings.iter().zip(extraction) {
         let stages = &document.layers[&settings.id].stages;
@@ -301,7 +303,7 @@ fn document_budget_counts_shared_grids_stages_and_masks_and_evicts_across_layers
     }
 
     document.budget = shared_grid + masks;
-    document.trim_cache();
+    document.trim_cache(None);
     assert_eq!(document.retained_bytes(), document.budget);
     assert_eq!(document.grids.len(), 1);
     for entry in document.layers.values() {
@@ -319,7 +321,7 @@ fn document_budget_counts_shared_grids_stages_and_masks_and_evicts_across_layers
     }
 
     document.budget = 0;
-    document.trim_cache();
+    document.trim_cache(None);
     assert_eq!(document.retained_bytes(), 0);
     assert!(document.grids.is_empty());
     for entry in document.layers.values() {
@@ -704,4 +706,95 @@ fn stale_refine_result_is_rejected() {
     let glow = job.run(&lane).unwrap();
     assert!(document.accept_refine(glow, &masked(1), &view));
     assert_eq!(document.refine_state(&masked(1), &view), RefineState::Ready);
+}
+
+#[test]
+fn finished_cache_matches_cold_over_randomized_stacks_under_tight_budget() {
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let (w, h) = (17, 13);
+    let mut seed = 0x1357_9bdf_2468_ace1;
+    for host_depth in [Depth::Eight, Depth::Float] {
+        let source = || noise(&gpu, w, h, false);
+        let mut cached = Document::new(gpu.clone(), source(), host_depth);
+        // About two layers' worth of working images: eviction runs on almost every render.
+        cached.budget = 14 * image_bytes(&cached.source);
+        let mut settings = [layer(1), layer(2), layer(3), layer(4)];
+        settings[1].input = LayerInput::Below;
+        let mut masks: [Option<Image>; 4] = [None, None, None, None];
+        let mut mask_generation = [0u64; 4];
+        let mut evicted = 0;
+        for step in 0..160 {
+            let i = region_random(&mut seed) as usize % 4;
+            let value = (region_random(&mut seed) % 1000) as f32 / 1000.;
+            match region_random(&mut seed) % 12 {
+                0 => settings[i].params.threshold = 0.4 + value,
+                1 => settings[i].params.radius = 1. + value * 4.,
+                2 => settings[i].params.hue = -90. + value * 180.,
+                3 => { masks[i] = Some(gpu.fill(w, h, [value, value, value, 1.])); mask_generation[i] += 1; }
+                4 => { masks[i] = None; mask_generation[i] += 1; }
+                5 => settings[i].visible = !settings[i].visible,
+                6 => settings[i].opacity = 0.2 + value * 0.8,
+                7 => settings[i].blend = [LayerBlend::Auto, LayerBlend::Screen, LayerBlend::LinearDodge, LayerBlend::Lighten, LayerBlend::Normal][(value * 5.) as usize % 5],
+                8 => settings[i].input = if settings[i].input == LayerInput::Below { LayerInput::Original } else { LayerInput::Below },
+                9 => settings[i].params.highlights = if value > 0.5 { Highlights::Flatten } else { Highlights::Preserve },
+                10 => settings[i].params.unmult = !settings[i].params.unmult,
+                _ => settings[i].params.glare_on = !settings[i].params.glare_on,
+            }
+            let layer_inputs: Vec<_> = (0..4).map(|k| LayerInputs { settings: &settings[k], mask: masks[k].as_ref(), mask_generation: mask_generation[k] }).collect();
+            let mut req = request();
+            req.view = ViewFlags { xray: step % 6 == 0, solo: step % 5 == 0, host_is_float: host_depth == Depth::Float && step % 4 != 0 };
+            req.selected = Some(1 + region_random(&mut seed) as u64 % 4);
+            req.solo_layer = (step % 7 == 0).then(|| 1 + region_random(&mut seed) as u64 % 4);
+            req.want_glow_composite = step % 3 != 0;
+            req.want_layer_glows = step % 2 == 0;
+            req.want_xray = step % 4 == 0;
+            let mut cold = Document::new(gpu.clone(), source(), host_depth);
+            let expected = cold.render(&layer_inputs, &req);
+            for pass in 0..2 {
+                let actual = cached.render(&layer_inputs, &req);
+                evicted += cached.layers.values().any(|l| l.finished.is_some() && l.stages.extraction_cache.is_none()) as u32;
+                let pairs = [("composite", actual.composite.as_ref(), expected.composite.as_ref()),
+                    ("glow_composite", actual.glow_composite.as_ref(), expected.glow_composite.as_ref()),
+                    ("xray", actual.xray.as_ref(), expected.xray.as_ref())];
+                for (name, a, b) in pairs {
+                    assert_eq!(a.map(|a| bits(&gpu, a)), b.map(|b| bits(&gpu, b)), "{host_depth:?} step {step} pass {pass} {name}");
+                }
+                assert_eq!(actual.layer_glows.len(), expected.layer_glows.len());
+                for ((ia, a), (ib, b)) in actual.layer_glows.iter().zip(&expected.layer_glows) {
+                    assert_eq!(ia, ib);
+                    assert_eq!(bits(&gpu, a), bits(&gpu, b), "{host_depth:?} step {step} pass {pass} layer {ia} glow");
+                }
+                assert!(cached.retained_bytes() <= cached.budget, "budget holds after every render");
+            }
+        }
+        assert!(evicted > 0, "the budget must force stage eviction behind finished results");
+    }
+}
+
+#[test]
+fn unchanged_layers_reuse_finished_results_after_stage_eviction() {
+    let gpu = Arc::new(Gpu::new_blocking().expect("headless GPU"));
+    let mut document = Document::new(gpu.clone(), gpu.fill(8, 8, [0.6, 0.45, 0.8, 1.]), Depth::Eight);
+    let settings = [layer(1), layer(2), layer(3)];
+    let mask = gpu.fill(8, 8, [0.7; 4]);
+    let render = |document: &mut Document, generation: u64| {
+        let inputs: Vec<_> = settings.iter().map(|s| LayerInputs { settings: s, mask: (s.id == 3).then_some(&mask), mask_generation: if s.id == 3 { generation } else { 0 } }).collect();
+        let mut req = request();
+        req.selected = Some(3);
+        document.render(&inputs, &req)
+    };
+    render(&mut document, 1);
+    // Room for one layer's chain plus the others' finished images only.
+    document.budget = 12 * image_bytes(&document.source);
+    let finished: Vec<_> = (1..=2).map(|id| document.layers[&id].finished.as_ref().unwrap().generation).collect();
+    for generation in 2..6 {
+        render(&mut document, generation);
+        assert!(document.retained_bytes() <= document.budget);
+        for (id, expected) in (1..=2).zip(&finished) {
+            let entry = &document.layers[&id];
+            assert_eq!(entry.finished.as_ref().unwrap().generation, *expected, "layer {id} finished result survives");
+            assert!(entry.stages.extraction_cache.is_none(), "non-focus stage chain is evicted first");
+        }
+        assert!(document.layers[&3].stages.extraction_cache.is_some(), "focus chain keeps its early stages");
+    }
 }

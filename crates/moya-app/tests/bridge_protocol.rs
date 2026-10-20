@@ -214,7 +214,8 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
     assert_error(&mut socket, edit(error_id, &source, 8, "layers", Some(Path::new("relative.moya"))), None)?;
     assert_error(&mut socket, edit(error_id, &source, 12, "layers", None), None)?;
     assert_error(&mut socket, edit(error_id, &app.temp.join("missing.tiff"), 8, "layers", None), None)?;
-    assert_error(&mut socket, edit(error_id, &source, 8, "layers", Some(&app.temp.join("missing.moya"))), Some(error_id))?;
+    // The previous request already failed and closed its session, so nothing is left to cancel.
+    assert_error(&mut socket, edit(error_id, &source, 8, "layers", Some(&app.temp.join("missing.moya"))), None)?;
 
     // Distinct bottom-to-top metadata catches reordered, flattened or omitted hidden layers.
     let custom_path = app.temp.join("custom.moya");
@@ -228,7 +229,8 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
                     blend, opacity: (index + 1) as f32 * 0.25, visible: index != 1,
                     ..LayerSettings::default()
                 };
-                settings.params.threshold = 0.0;
+                // Lowest valid threshold (projects are sanitized to the slider range on load).
+                settings.params.threshold = 0.01;
                 moya_project::ProjectLayer { settings, mask: None }
             }).collect(),
         selected: Some(3),
@@ -242,16 +244,12 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
     }
     cases.push((8, SampleDepth::U8, "layers", Some(custom_path.clone())));
     cases.push((8, SampleDepth::U8, "composite", Some(custom_path)));
-    let mut previous_id = Some(error_id.to_owned());
+    // A placed (or failed) session is closed on both sides, so new edits never replace one.
     for (index, (bits, depth, return_mode, project)) in cases.into_iter().enumerate() {
         let id = format!("{:08x}-0000-4000-8000-{:012x}", pid, ((nonce + index as u128) & 0xffffffffffff) as u64);
         let source = app.temp.join(format!("source-{bits}.tiff"));
         send(&mut socket, edit(&id, &source, bits, return_mode, project.as_deref()))?;
-        if let Some(previous) = &previous_id {
-            let cancelled = receive(&mut socket).context("waiting for previous session replacement")?;
-            ensure!(cancelled["type"] == "cancelled" && cancelled["id"] == *previous,
-                "expected replacement cancellation for {previous}: {cancelled}");
-        }
+        // "opened" must be the first reply: no cancellation for the previous, already placed session.
         let opened = receive(&mut socket).with_context(|| format!("waiting for {bits}-bit opened"))?;
         ensure!(opened["type"] == "opened" && opened["id"] == id, "expected opened for {id}: {opened}");
         let result = receive(&mut socket).with_context(|| format!("waiting for {bits}-bit HQ Send result"))?;
@@ -268,7 +266,8 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
         let saved = moya_project::load(&project_path).context("reading exported project")?;
         ensure!(saved.source == moya_project::SourceRef::Path(source.clone()), "project must reference the source, not embed it");
         if project.is_some() {
-            ensure!(saved.layers == custom.layers && saved.selected == custom.selected, "re-edit did not preserve saved layer settings/order");
+            ensure!(saved.layers == custom.layers && saved.selected == custom.selected,
+                "re-edit did not preserve saved layer settings/order:\nsent {:?} {:?}\ngot  {:?} {:?}", custom.layers, custom.selected, saved.layers, saved.selected);
         } else {
             ensure!(saved.layers.len() == 1, "new session must contain exactly one default layer");
             let settings = &saved.layers[0].settings;
@@ -306,8 +305,26 @@ fn bridge_protocol_depth_roundtrips() -> Result<()> {
             ensure!(picture.rgba.chunks_exact(4).any(|pixel| pixel[..3].iter().any(|value| *value > 0.0)), "composite TIFF is empty");
         }
         send(&mut socket, json!({"type": "placed", "id": id}))?;
-        previous_id = Some(id);
+        // Like the plugin, delete placed results so later sessions on the same source can publish.
+        for path in layers.iter().filter_map(|layer| layer["path"].as_str()).chain(result["composite"].as_str()) {
+            fs::remove_file(path)?;
+        }
+        fs::remove_file(&project_path)?;
     }
+    // A new edit while an unplaced session is still open replaces it with a cancellation.
+    let source = app.temp.join("source-8.tiff");
+    let first = format!("{:08x}-0000-4000-8000-{:012x}", pid, ((nonce + 1000) & 0xffffffffffff) as u64);
+    let second = format!("{:08x}-0000-4000-8000-{:012x}", pid, ((nonce + 1001) & 0xffffffffffff) as u64);
+    send(&mut socket, edit(&first, &source, 8, "layers", None))?;
+    let opened = receive(&mut socket)?;
+    ensure!(opened["type"] == "opened" && opened["id"] == first, "expected opened for {first}: {opened}");
+    let result = receive(&mut socket)?;
+    ensure!(result["type"] == "result" && result["id"] == first, "expected result for {first}: {result}");
+    send(&mut socket, edit(&second, &source, 8, "layers", None))?;
+    let cancelled = receive(&mut socket)?;
+    ensure!(cancelled["type"] == "cancelled" && cancelled["id"] == first, "expected replacement cancellation for {first}: {cancelled}");
+    let opened = receive(&mut socket)?;
+    ensure!(opened["type"] == "opened" && opened["id"] == second, "expected opened for {second}: {opened}");
     let _ = socket.close(None);
     Ok(())
 }

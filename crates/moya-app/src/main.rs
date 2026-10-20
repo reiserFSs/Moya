@@ -14,6 +14,8 @@ mod bridge_session;
 mod platform_paths;
 #[cfg(target_os = "macos")]
 mod macos_open;
+#[cfg(target_os = "macos")]
+mod macos_color;
 
 use eframe::{
     egui,
@@ -527,7 +529,12 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Color-manage the window like other Mac apps (see macos_color).
+        #[cfg(target_os = "macos")]
+        macos_color::tag_srgb(frame);
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame;
         #[cfg(target_os = "macos")]
         while let Some(path) = self.open_documents.as_ref().and_then(|receiver| receiver.try_recv().ok()) {
             self.open(&path);
