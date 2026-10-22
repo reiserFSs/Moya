@@ -25,6 +25,7 @@ tungstenite = "0.26"
 sha2 = "0.10"
 parking_lot = "0.12"
 getrandom = "0.3"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [build-dependencies]
 winresource = "0.1"

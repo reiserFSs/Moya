@@ -12,6 +12,7 @@ mod projects;
 mod refine;
 mod bridge_session;
 mod platform_paths;
+mod update;
 #[cfg(target_os = "macos")]
 mod macos_open;
 #[cfg(target_os = "macos")]
@@ -117,6 +118,7 @@ struct App {
     dirty: bool,
     force: bool,
     status: String,
+    updates: update::Updates,
     panels: panels::PanelState,
     canvas: canvas::CanvasState,
     logo: egui::TextureHandle,
@@ -195,6 +197,7 @@ impl App {
             dirty: false,
             force: false,
             status,
+            updates: update::Updates::new(cc.storage, cc.egui_ctx.clone()),
             panels: panels::PanelState::new(loaded),
             canvas: canvas::CanvasState::default(),
             logo,
@@ -520,6 +523,7 @@ impl App {
 }
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.updates.save(storage);
         let params = &self.layers[self.selected_index()].settings.params;
         if let Ok(json) = serde_json::to_string(params) {
             storage.set_string("moya.params", json);
@@ -630,6 +634,10 @@ impl eframe::App for App {
                     self.layers[index].mask.enabled = false;
                     self.layers[index].mask.tool = mask::Tool::None;
                 }
+                ui.menu_button("Settings", |ui| {
+                    ui.checkbox(&mut self.updates.enabled, "Check for updates")
+                        .on_hover_text("On launch, contact GitHub at most once per day. Changes apply to the next launch.");
+                });
             });
             if let Some(session) = &self.session {
                 let name = session.document.name.clone();
@@ -696,6 +704,7 @@ impl eframe::App for App {
                     ui.separator();
                     ui.label(&self.status);
                 }
+                self.updates.note(ui);
             });
         });
         let collapsed_id = egui::Id::unique("moya.layers_collapsed");

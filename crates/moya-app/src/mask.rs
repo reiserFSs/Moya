@@ -4,7 +4,9 @@ use moya_gpu::{Gpu, Image, MaskSourceKind};
 use moya_io::Picture;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tool { None, Brush, Eraser }
+pub enum Tool { None, Brush, Eraser, Gradient }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientKind { Linear, Radial }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Combine { Replace, Add, Subtract, Intersect }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +39,7 @@ pub struct Mask {
     pub enabled: bool, pub tool: Tool, pub brush: BrushSettings, pub view: MaskView,
     pub overlay_opacity: f32, pub combine: Combine, pub lum_range: [f32; 2],
     pub feather: f32, pub grow: f32,
+    pub gradient: GradientKind,
     w: u32, h: u32, data: Vec<u16>, sum: u64, fingerprint: u64, dirty: Option<[u32; 4]>,
     image: Option<Image>, overlay: Option<TextureHandle>, thumb: Option<TextureHandle>, gpu_generation: u64,
     stroke: Option<Stroke>, past: VecDeque<HistoryEntry>, future: Vec<HistoryEntry>,
@@ -46,7 +49,7 @@ pub struct Mask {
 }
 impl Default for Mask {
     fn default() -> Self {
-        Self { enabled: false, tool: Tool::None, brush: BrushSettings { size: 30.0, hardness: 0.75, opacity: 1.0 }, view: MaskView::Overlay, overlay_opacity: 0.4, combine: Combine::Replace, lum_range: [0.0, 1.0], feather: 5.0, grow: 5.0,
+        Self { enabled: false, tool: Tool::None, gradient: GradientKind::Linear, brush: BrushSettings { size: 30.0, hardness: 0.75, opacity: 1.0 }, view: MaskView::Overlay, overlay_opacity: 0.4, combine: Combine::Replace, lum_range: [0.0, 1.0], feather: 5.0, grow: 5.0,
             w: 0, h: 0, data: Vec::new(), sum: 0, fingerprint: 0, dirty: None, image: None, overlay: None, thumb: None, gpu_generation: 0,
             stroke: None, past: VecDeque::new(), future: Vec::new(), history_bytes: 0, history_limit: 256 * 1024 * 1024, steps: 0, evicted: 0,
             committed: false, preview_pending: false, last_preview: Instant::now() - Duration::from_secs(1), last_dab: Instant::now(), appearance: (MaskView::Overlay, 0.4), was_enabled: false }
@@ -151,16 +154,31 @@ impl Mask {
     fn replace(&mut self, values: Vec<u16>) {
         self.end_stroke();
         assert_eq!(values.len(), self.data.len());
-        let count = values.iter().zip(&self.data).filter(|(after, before)| after != before).count();
+        let chunk = values.len().div_ceil(mask_workers(values.len())).max(1);
+        let (count, sum, fingerprint) = std::thread::scope(|scope| {
+            let jobs: Vec<_> = values.chunks(chunk).zip(self.data.chunks(chunk)).enumerate().map(|(part, (new, old))| {
+                scope.spawn(move || {
+                    let mut result = (0usize, 0u64, 0u64);
+                    for (i, (&after, &before)) in new.iter().zip(old).enumerate() {
+                        result.0 += usize::from(after != before);
+                        result.1 += u64::from(after);
+                        result.2 ^= pixel_hash(part * chunk + i, before) ^ pixel_hash(part * chunk + i, after);
+                    }
+                    result
+                })
+            }).collect();
+            jobs.into_iter().map(|job| job.join().unwrap()).fold((0, 0, 0), |a, b| (a.0+b.0, a.1+b.1, a.2^b.2))
+        });
         if count == 0 { return; }
-        let entry = if self.data.len() * std::mem::size_of::<u16>() < count * std::mem::size_of::<Change>() {
-            HistoryEntry::Snapshot(self.data.clone())
+        let old = std::mem::replace(&mut self.data, values);
+        let entry = if old.len() * std::mem::size_of::<u16>() < count * std::mem::size_of::<Change>() {
+            HistoryEntry::Snapshot(old)
         } else {
-            HistoryEntry::Diff(values.iter().zip(&self.data).enumerate().filter_map(|(index, (&after, &before))| {
+            HistoryEntry::Diff(self.data.iter().zip(old).enumerate().filter_map(|(index, (&after, before))| {
                 (before != after).then_some(Change { index: index as u32, before, after })
             }).collect())
         };
-        for (index, value) in values.into_iter().enumerate() { self.put(index, value); }
+        self.sum = sum; self.fingerprint ^= fingerprint; self.mark_all();
         self.commit(entry);
     }
     fn combine_values(&mut self, mut values: Vec<u16>) {
@@ -177,6 +195,35 @@ impl Mask {
             quantize(combine(old as f32/65535.0,value,self.combine))
         }).collect();
         self.replace(values);self.enabled=true;
+    }
+    pub fn apply_gradient(&mut self, start: [f32; 2], end: [f32; 2]) {
+        let dx = end[0] - start[0];
+        let dy = end[1] - start[1];
+        let length_squared = dx * dx + dy * dy;
+        if !length_squared.is_finite() || length_squared <= 0.0 || start.iter().any(|v| !v.is_finite()) { return; }
+        let kind = self.gradient;
+        let width = self.w as usize;
+        if width == 0 || self.h == 0 { return; }
+        let mut values = vec![0; self.data.len()];
+        let rows = (self.h as usize).div_ceil(mask_workers(values.len()));
+        std::thread::scope(|scope| {
+            for (part, chunk) in values.chunks_mut(rows * width).enumerate() {
+                scope.spawn(move || {
+                    for (row, pixels) in chunk.chunks_mut(width).enumerate() {
+                        let py = (part * rows + row) as f32 + 0.5 - start[1];
+                        for (x, value) in pixels.iter_mut().enumerate() {
+                            let px = x as f32 + 0.5 - start[0];
+                            let t = match kind {
+                                GradientKind::Linear => (px * dx + py * dy) / length_squared,
+                                GradientKind::Radial => ((px * px + py * py) / length_squared).sqrt(),
+                            }.clamp(0.0, 1.0);
+                            *value = quantize(1.0 - t * t * (3.0 - 2.0 * t));
+                        }
+                    }
+                });
+            }
+        });
+        self.combine_values(values);
     }
     pub fn build(&mut self, gpu: &Gpu, source: &Image, kind: MaskKind) {
         let kind = match kind {
@@ -400,9 +447,63 @@ fn morphology(data:&[u16],w:usize,h:usize,radius:usize,grow:bool)->Vec<u16> {
     pass(data,&mut tmp,w,h,1,w,radius,grow); pass(&tmp,&mut out,h,w,w,1,radius,grow); out
 }
 
+fn mask_workers(pixels: usize) -> usize {
+    if pixels < 1_000_000 { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get().min(8)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gradients_values_combine_and_history() {
+        let mut mask = Mask::default();
+        mask.reset(5, 5);
+        for kind in [GradientKind::Linear, GradientKind::Radial] {
+            mask.gradient = kind;
+            for end in [[4.5, 0.5], [0.5, 4.5], [4.5, 4.5]] {
+                mask.combine = Combine::Replace;
+                mask.apply_gradient([0.5, 0.5], end);
+                assert_eq!(mask.data[0], 65535);
+                let index = |p: [f32; 2]| p[1] as usize * 5 + p[0] as usize;
+                assert_eq!(mask.data[index(end)], 0);
+                let middle = [(end[0] + 0.5) / 2.0, (end[1] + 0.5) / 2.0];
+                assert_eq!(mask.data[index(middle)], 32768);
+            }
+        }
+        let before = mask.data.clone();
+        let steps = mask.past.len();
+        mask.apply_gradient([1.0, 1.0], [1.0, 1.0]);
+        assert_eq!(mask.data, before);
+        assert_eq!(mask.past.len(), steps);
+        for mode in [Combine::Replace, Combine::Add, Combine::Subtract, Combine::Intersect] {
+            mask.replace(vec![20000; 25]);
+            let before = mask.data.clone();
+            let steps = mask.steps;
+            mask.combine = mode;
+            mask.apply_gradient([0.5, 0.5], [4.5, 0.5]);
+            let expected = match mode {
+                Combine::Replace => 32768, Combine::Add => 52768,
+                Combine::Subtract => 0, Combine::Intersect => 20000,
+            };
+            assert_eq!(mask.data[2], expected);
+            assert_eq!(mask.steps, steps + 1);
+            assert!(mask.undo());
+            assert_eq!(mask.data, before);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual 92 MP latency measurement"]
+    fn gradient_92mp_latency() {
+        let mut mask = Mask::default();
+        mask.reset(11500, 8000);
+        for kind in [GradientKind::Linear, GradientKind::Radial] {
+            mask.gradient = kind;
+            let now = Instant::now();
+            mask.apply_gradient([1000.5, 1000.5], [10000.5, 7000.5]);
+            eprintln!("{kind:?} 92 MP generation + combine + history capture: {:?}", now.elapsed());
+        }
+    }
     /// Reference: the original per-pixel model (pixel -> value before stroke, max coverage).
     fn reference_stroke(data: &mut [u16], w: u32, h: u32, brush: (f32, f32, f32), points: &[([f32; 2], bool)]) -> Vec<(u32, u16, u16)> {
         let (size, hardness, opacity) = brush;

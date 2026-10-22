@@ -1,4 +1,4 @@
-use crate::{App, Preview, mask::{BrushSettings, MaskView, Tool}};
+use crate::{App, Preview, mask::{BrushSettings, GradientKind, MaskView, Tool}};
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use moya_gpu::wgpu;
 use moya_gpu::{Depth, Filter, Image, ViewMap};
@@ -21,6 +21,7 @@ pub(super) struct CanvasState {
     source_dirty: bool,
     stroke_active: bool,
     stroke_layer: Option<u64>,
+    gradient_drag: Option<([f32; 2], [f32; 2], u64)>,
     viewport: Option<Viewport>,
     viewport_key: Option<[u32; 13]>,
     last_interaction: Instant,
@@ -40,6 +41,7 @@ impl Default for CanvasState {
             source_dirty: true,
             stroke_active: false,
             stroke_layer: None,
+            gradient_drag: None,
             viewport: None,
             viewport_key: None,
             last_interaction: Instant::now(),
@@ -56,6 +58,7 @@ impl CanvasState {
         self.source_dirty = true;
         self.stroke_active = false;
         self.stroke_layer = None;
+        self.gradient_drag = None;
         self.invalidate();
     }
 
@@ -293,10 +296,10 @@ impl App {
         if keyboard {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) { self.layers[index].mask.tool = Tool::None; }
             if ui.input(|i| !i.modifiers.command && !i.modifiers.ctrl) {
-                if ui.input(|i| i.key_pressed(egui::Key::X)) && self.layers[index].mask.tool != Tool::None {
+                if ui.input(|i| i.key_pressed(egui::Key::X)) && matches!(self.layers[index].mask.tool, Tool::Brush | Tool::Eraser) {
                     self.layers[index].mask.tool = if self.layers[index].mask.tool == Tool::Brush { Tool::Eraser } else { Tool::Brush };
                 }
-                if self.layers[index].mask.tool != Tool::None {
+                if matches!(self.layers[index].mask.tool, Tool::Brush | Tool::Eraser) {
                     for (key, shifted, increase) in [
                         (egui::Key::OpenBracket, egui::Key::OpenCurlyBracket, false),
                         (egui::Key::CloseBracket, egui::Key::CloseCurlyBracket, true),
@@ -423,8 +426,43 @@ impl App {
             }
         }
         let primary_down = ui.input(|i| i.pointer.primary_down());
+        let gradient = self.layers[index].mask.tool == Tool::Gradient;
+        if self.canvas.gradient_drag.is_some_and(|(_, _, id)| id != self.selected) || !gradient {
+            self.canvas.gradient_drag = None;
+        }
+        if gradient && !dragging_handle {
+            let pointer = ui.input(|i| i.pointer.interact_pos());
+            if let Some(pos) = pointer {
+                let xy = [(pos.x - rect.left()) / rect.width() * pixels.x,
+                    (pos.y - rect.top()) / rect.height() * pixels.y];
+                if primary_down && response.is_pointer_button_down_on() && rect.contains(pos)
+                    && self.canvas.gradient_drag.is_none() {
+                    self.canvas.gradient_drag = Some((xy, xy, self.selected));
+                }
+                if let Some((_, end, _)) = &mut self.canvas.gradient_drag { *end = xy; }
+            }
+            if let Some((start, end, _)) = self.canvas.gradient_drag {
+                let screen = |p: [f32; 2]| rect.min + egui::vec2(p[0] / pixels.x * rect.width(), p[1] / pixels.y * rect.height());
+                let a = screen(start);
+                let b = screen(end);
+                for (width, color) in [(3.0, Color32::BLACK), (1.0, Color32::WHITE)] {
+                    let stroke = egui::Stroke::new(width, color);
+                    painter.line_segment([a, b], stroke);
+                    if self.layers[index].mask.gradient == GradientKind::Radial {
+                        painter.circle_stroke(a, a.distance(b), stroke);
+                    }
+                    painter.circle_stroke(a, 5.0, stroke);
+                    painter.circle_stroke(b, 5.0, stroke);
+                }
+                if !primary_down {
+                    self.layers[index].mask.apply_gradient(start, end);
+                    self.canvas.gradient_drag = None;
+                }
+            }
+            response.clone().on_hover_cursor(egui::CursorIcon::Crosshair);
+        }
         let erase = self.layers[index].mask.tool == Tool::Eraser || ui.input(|i| i.modifiers.alt);
-        if painting && !dragging_handle {
+        if painting && !gradient && !dragging_handle {
             let pointer = ui.input(|i| i.pointer.interact_pos());
             let start = !self.canvas.stroke_active && response.is_pointer_button_down_on()
                 && primary_down && pointer.is_some_and(|p| rect.contains(p));
@@ -447,12 +485,12 @@ impl App {
                 }
             }
         }
-        if self.canvas.stroke_active && (!primary_down || !painting) {
+        if self.canvas.stroke_active && (!primary_down || !painting || gradient) {
             self.layers[index].mask.end_stroke();
             self.canvas.stroke_active = false;
             self.canvas.stroke_layer = None;
         }
-        if painting {
+        if painting && !gradient {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()).filter(|p| area.contains(*p)) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                 let radius = self.layers[index].mask.brush.size * rect.width() / pixels.x;

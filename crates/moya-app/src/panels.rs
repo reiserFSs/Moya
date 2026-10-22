@@ -296,6 +296,7 @@ impl App {
                 egui::CollapsingHeader::new("Color").default_open(true).show(ui, |ui| {
                     let mut on = self.layers[index].settings.params.colorize;
                     if ui.checkbox(&mut on, "Colorize").on_hover_text("Tint the glow with one hue").changed() { self.layers[index].settings.params.set_colorize(on); }
+                    if self.layers[index].settings.params.colorize { glow_color_field(ui, &mut self.layers[index].settings.params); }
                     self.sliders(ui, &[11, 12]);
                 });
             }
@@ -370,11 +371,19 @@ impl App {
                     (Tool::None, "None", "Navigate without painting (Esc)"),
                     (Tool::Brush, "Brush", "Paint light into the mask; X swaps to Eraser"),
                     (Tool::Eraser, "Eraser", "Remove light from the mask; X swaps to Brush"),
+                    (Tool::Gradient, "Gradient", "Drag from white to black; uses the Combine mode below"),
                 ] {
                     if ui.selectable_value(&mut self.layers[index].mask.tool, tool, label).on_hover_text(tip).changed()
                         && tool != Tool::None { self.layers[index].mask.enabled = true; }
                 }
             });
+            if self.layers[index].mask.tool == Tool::Gradient {
+                choice(ui, "Gradient", &mut self.layers[index].mask.gradient, &[
+                    (crate::mask::GradientKind::Linear, "Linear"),
+                    (crate::mask::GradientKind::Radial, "Radial"),
+                ]);
+                ui.small("Drag on the image; Invert reverses the finished mask.");
+            }
             slider_row(ui, &mut self.layers[index].mask.brush.size, &SliderSpec { slot: 100, label: "Size", min: 1.0, max: 500.0, default: 30.0, step: 1.0, decimals: 0, tooltip: "Brush radius in image pixels; [ / ] changes size" });
             slider_row(ui, &mut self.layers[index].mask.brush.hardness, &SliderSpec { slot: 101, label: "Hardness", min: 0.0, max: 1.0, default: 0.75, step: 0.01, decimals: 2, tooltip: "Solid inner radius; Shift+[ / ] changes hardness by 10%" });
             slider_row(ui, &mut self.layers[index].mask.brush.opacity, &SliderSpec { slot: 102, label: "Opacity", min: 0.0, max: 1.0, default: 1.0, step: 0.01, decimals: 2, tooltip: "Maximum coverage per stroke; overlapping dabs do not build up" });
@@ -545,6 +554,69 @@ impl App {
             persist = true;
         }
         if persist { self.persist_presets(); }
+    }
+}
+
+/// Photoshop Colorize uses HSL, not HSV: the tint swatch has lightness 50%.
+fn tint_rgb(hue: f32, saturation: f32) -> [f32; 3] {
+    let h = hue.rem_euclid(360.0) / 60.0;
+    let c = saturation.clamp(0.0, 100.0) / 100.0;
+    let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+    let rgb = match h as u32 {
+        0 => [c, x, 0.0], 1 => [x, c, 0.0], 2 => [0.0, c, x],
+        3 => [0.0, x, c], 4 => [x, 0.0, c], _ => [c, 0.0, x],
+    };
+    rgb.map(|v| v + (1.0 - c) * 0.5)
+}
+
+fn tint_color(hue: f32, saturation: f32) -> Color32 {
+    let [r, g, b] = tint_rgb(hue, saturation).map(|v| (v * 255.0).round() as u8);
+    Color32::from_rgb(r, g, b)
+}
+
+/// Hue (x) / saturation (y) field shown inline while Colorize is on; kept in sync with the sliders.
+fn glow_color_field(ui: &mut egui::Ui, params: &mut Params) {
+    let size = egui::vec2(ui.available_width().max(1.0), 96.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let response = response.on_hover_text("Click or drag to pick the tint: hue left to right, saturation bottom to top");
+    let mut mesh = egui::Mesh::default();
+    for y in 0..=10 {
+        for x in 0..=36 {
+            let u = x as f32 / 36.0;
+            let v = y as f32 / 10.0;
+            mesh.colored_vertex(egui::pos2(rect.left() + u * rect.width(), rect.top() + v * rect.height()),
+                tint_color(u * 360.0, (1.0 - v) * 100.0));
+            if x < 36 && y < 10 {
+                let i = y * 37 + x;
+                mesh.add_triangle(i, i + 1, i + 37);
+                mesh.add_triangle(i + 1, i + 38, i + 37);
+            }
+        }
+    }
+    ui.painter().add(mesh);
+    if (response.clicked() || response.dragged()) && let Some(pos) = response.interact_pointer_pos() {
+        params.hue = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * 360.0;
+        params.saturation = (1.0 - (pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0) * 100.0;
+    }
+    let marker = egui::pos2(
+        rect.left() + params.hue.clamp(0.0, 360.0) / 360.0 * rect.width(),
+        rect.bottom() - params.saturation.clamp(0.0, 100.0) / 100.0 * rect.height());
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.circle_stroke(marker, 5.0, egui::Stroke::new(3.0, Color32::BLACK));
+    painter.circle_stroke(marker, 5.0, egui::Stroke::new(1.0, Color32::WHITE));
+}
+
+#[cfg(test)]
+mod tint_tests {
+    use super::*;
+
+    #[test]
+    fn hsl_tints_handle_primaries_gray_and_wrap() {
+        assert_eq!(tint_rgb(0.0, 100.0), [1.0, 0.0, 0.0]);
+        assert_eq!(tint_rgb(360.0, 100.0), tint_rgb(0.0, 100.0));
+        assert_eq!(tint_rgb(-60.0, 100.0), tint_rgb(300.0, 100.0));
+        assert_eq!(tint_rgb(120.0, 0.0), [0.5; 3]);
+        assert_eq!(tint_rgb(210.0, 100.0), [0.0, 0.5, 1.0]);
     }
 }
 

@@ -28,6 +28,16 @@ Project input renders the complete bottom-to-top layer stack, including masks an
 
 Project loading rejects unsupported versions, duplicate layer identities, unsafe ZIP names/symlinks, more than 4096 entries, more than 1 GiB of uncompressed archive content or decoded masks, and JSON larger than 4 MiB. Masks share the source decoder's 16384-pixel per-side ceiling. Unknown JSON fields are ignored for forward compatibility. The in-memory `from_bytes` API preserves source references without checking local file existence, for Photoshop's source-replacement round trip.
 
+## Glow color picker
+
+While Colorize is on, the Main tab's Color section shows an inline hue/saturation field: an alternative editor for the existing Hue (slot 11) and Saturation (slot 12) parameters. The horizontal axis is hue 0–360°, vertical axis saturation 0–100%; turning Colorize off hides it. Field colors use HSL at 50% lightness, matching Photoshop Colorize rather than HSV. Sliders remain authoritative and move the field's marker immediately.
+
+Picker drags use the same pointer-held history coalescing and live preview path as sliders; no project/preset fields or rendering changes are involved. `tint_tests::hsl_tints_handle_primaries_gray_and_wrap` checks the HSL swatch math (`cargo test -p moya-app --release`).
+
+## Update check
+
+`moya-app/src/update.rs` runs at most once per day (timestamp `moya.last_update_check` in eframe storage; opt-out `moya.check_updates`, toolbar **Settings → Check for updates**, effective next launch). A background thread GETs `https://api.github.com/repos/reiserFSs/Moya/releases/latest` with rustls-only `ureq`, a 5 s global timeout, no redirects and a 512 KiB body cap; all failures are silent. A strictly newer `vX.Y.Z` tag shows a status-bar note; clicking it opens a modal with the release title and notes (Markdown-lite: headings, bullets, paragraphs; inline markers stripped, links shown as text) and a link to the release tag page built from the validated version, never from the response's URLs. Offline unit tests cover version comparison, the throttle, response parsing and note rendering; to see the dialog live, temporarily compare against `"0.0.0"` instead of `CARGO_PKG_VERSION`.
+
 ## CI and releases
 
 GitHub Actions builds and tests the full workspace in release mode on Apple Silicon
@@ -141,6 +151,10 @@ cargo test -p moya-app --test bridge_protocol -- --ignored --test-threads=1
 Moya works in sRGB and draws sRGB values to the window. On macOS, wgpu leaves the window's `CAMetalLayer` without a color space for sRGB surfaces, and Core Animation then skips color matching, so on wide-gamut (Display P3) screens colors looked more saturated than in Photoshop or Preview even though the rendered/exported pixels were correct. `moya-app/src/macos_color.rs` tags the layer as sRGB every frame when the tag is missing (wgpu clears it whenever it reconfigures the surface, e.g. on resize); a pure-red sRGB image then shows the same display values as in Preview. Windows has no equivalent per-window tag: on a wide-gamut monitor Moya looks more saturated than color-managed Photoshop unless Windows 11 **Auto color management** is on; on sRGB monitors they match.
 
 ## Masks and preview
+
+### Gradient masks
+
+The Gradient tool records image-space endpoints using the brush's canvas transform, draws line/endpoint handles (plus a radial circle) during the drag, and commits only on release. Pixel-centre samples use clamped smoothstep falloff; a zero-length drag does nothing. Gradients reuse `combine_values` and the shared mask history, without new pipeline or preset fields. Large masks generate rows and reduce replacement statistics on up to eight scoped CPU workers; replacement moves the old pixel buffer into snapshot history rather than copying it. Measured release-build generation, combine, and history capture for 11500×8000: linear 31 ms, radial 36 ms (sequential baseline 483/471 ms). Run `cargo test -p moya-app --release gradient_92mp_latency -- --ignored --nocapture` to repeat.
 
 Painting updates only the changed rectangle on the GPU. The preview re-renders at most about every 63 ms during a stroke and immediately when it ends. For layers with rays, glare or chromatic aberration on, each mid-stroke preview is slow enough to stall the brush, so their glow re-renders only when the brush rests for 120 ms and when the stroke ends; the overlay still follows every dab. The pipeline snapshots each mask at the working size extraction samples it (same copy-or-resize as extraction, so results are bit-identical), keeping large-image masks inside the stage-cache budget. Mask edits remain full resolution and are stored on the CPU as u16 (0..65535); the overlay is capped at a 2048-pixel long side. A disabled or empty mask is never uploaded (the pipeline gets `None`); enabled masks upload through `Gpu::upload_gray_u16`. Luminosity/Transparency/Outlines masks are built on the GPU from the source texture (`Gpu::mask_from_source`, bit-identical to the former CPU builder), so the app drops the decoded CPU pixels right after upload and keeps only dimensions, depth and ICC. Undo stores each mask step as sparse 16-bit diffs or a compact 16-bit snapshot, whichever is smaller. History is bounded by exact bytes (256 MiB) and 200 steps, and the newest step is always kept even if it alone exceeds the budget. It shares one timeline with parameter edits.
 
