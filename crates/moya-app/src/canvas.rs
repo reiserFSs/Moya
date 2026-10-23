@@ -502,9 +502,16 @@ impl App {
                 painter.circle_filled(pos, 1.5, color);
             }
         }
-        let overlay = Rect::from_min_size(area.left_bottom() + Vec2::new(12.0, -44.0), Vec2::new(460.0, 32.0));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(overlay), |ui| {
-            egui::Frame::new().fill(Color32::from_black_alpha(220)).corner_radius(5.0).inner_margin(5.0).show(ui, |ui| {
+        let overlay = Rect::from_center_size(area.center_bottom() + Vec2::new(0.0, -30.0), Vec2::new(area.width().min(520.0), 40.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(overlay).layout(egui::Layout::top_down(egui::Align::Center)), |ui| {
+            let stroke = ui.visuals().widgets.inactive.bg_stroke;
+            egui::Frame::new().fill(ui.visuals().panel_fill).stroke(stroke).corner_radius(16.0).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+                // Plain text items; only active toggles get the accent tint.
+                let widgets = &mut ui.visuals_mut().widgets;
+                for widget in [&mut widgets.inactive, &mut widgets.hovered] {
+                    widget.weak_bg_fill = Color32::TRANSPARENT;
+                    widget.bg_stroke = egui::Stroke::NONE;
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Fit").on_hover_text("Fit image (F)").clicked() {
                         self.canvas.fit = true;
@@ -515,7 +522,16 @@ impl App {
                         self.canvas.zoom = 1.0;
                         self.canvas.pan = Vec2::ZERO;
                     }
-                    ui.label(format!("{:.0}%", self.canvas.zoom * 100.0));
+                    ui.weak(format!("{:.0}%", self.canvas.zoom * 100.0));
+                    ui.separator();
+                    ui.toggle_value(&mut self.canvas.split, "Split").on_hover_text("Compare original and result; hold Space for original");
+                    ui.toggle_value(&mut self.xray, "X-Ray").on_hover_text("Inspect thresholded light input");
+                    ui.toggle_value(&mut self.solo, "Hide source").on_hover_text("Show glow without the source image");
+                });
+            });
+        });
+        let chip = Rect::from_min_size(area.right_top() + Vec2::new(-150.0, 12.0), Vec2::new(138.0, 28.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(chip).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
                     // (label, tooltip, colour): grey Preview, amber Refining, green Exact.
                     let preview = Color32::from_gray(150);
                     let (label, explanation, color) = if self.canvas.magnified {
@@ -540,9 +556,6 @@ impl App {
                         .inner_margin(egui::Margin::symmetric(7, 1))
                         .show(ui, |ui| { ui.label(text); })
                         .response.on_hover_text(explanation);
-                    ui.toggle_value(&mut self.canvas.split, "Split").on_hover_text("Compare original and result; hold Space for original");
-                });
-            });
         });
     }
 }

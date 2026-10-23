@@ -13,6 +13,8 @@ mod refine;
 mod bridge_session;
 mod platform_paths;
 mod update;
+mod theme;
+mod thumbs;
 #[cfg(target_os = "macos")]
 mod macos_open;
 #[cfg(target_os = "macos")]
@@ -121,6 +123,7 @@ struct App {
     updates: update::Updates,
     panels: panels::PanelState,
     canvas: canvas::CanvasState,
+    thumbs: thumbs::Thumbs,
     logo: egui::TextureHandle,
     set_center: bool,
     glow_only: bool,
@@ -142,6 +145,7 @@ struct App {
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
+        theme::install(&cc.egui_ctx);
         let render_state = cc.wgpu_render_state.clone().expect("wgpu backend required");
         let gpu = Arc::new(Gpu::from_device(
             render_state.device.clone(),
@@ -200,6 +204,7 @@ impl App {
             updates: update::Updates::new(cc.storage, cc.egui_ctx.clone()),
             panels: panels::PanelState::new(loaded),
             canvas: canvas::CanvasState::default(),
+            thumbs: thumbs::Thumbs::default(),
             logo,
             set_center: false,
             glow_only: false,
@@ -599,92 +604,72 @@ impl eframe::App for App {
                     self.open_dialog();
                 }
                 self.project_controls(ui);
-                if ui
-                    .add_enabled(self.renderer.is_some() && self.saving.is_none(), egui::Button::new("Export HQ…"))
-                    .on_hover_text("Export the HQ composite or glow-only composite (Cmd/Ctrl+E)")
-                    .clicked()
-                {
-                    self.export();
-                }
-                if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
-                    .on_hover_text("Undo edit (Cmd/Ctrl+Z)").clicked() {
+                ui.separator();
+                let undo = ui.add_enabled(self.history.can_undo(), egui::Button::new(" ").min_size(egui::vec2(30.0, 26.0)));
+                paint_toolbar_icon(ui, &undo, 0);
+                if undo.on_hover_text("Undo (Cmd/Ctrl+Z)").clicked() {
                     self.restore_history(false);
                 }
-                if ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
-                    .on_hover_text("Redo edit (Cmd/Ctrl+Shift+Z)").clicked() {
+                let redo = ui.add_enabled(self.history.can_redo(), egui::Button::new(" ").min_size(egui::vec2(30.0, 26.0)));
+                paint_toolbar_icon(ui, &redo, 1);
+                if redo.on_hover_text("Redo (Cmd/Ctrl+Shift+Z)").clicked() {
                     self.restore_history(true);
                 }
-                ui.checkbox(&mut self.glow_only, "Glow only")
-                    .on_hover_text("Preview and export the visible layers' glow composite without the source");
-                egui::ComboBox::from_id_salt("save depth")
-                    .selected_text(["8 bit", "16 bit", "32 bit"][self.export_depth])
-                    .show_ui(ui, |ui| {
-                        for (i, label) in ["8 bit", "16 bit", "32 bit"].iter().enumerate() {
-                            ui.selectable_value(&mut self.export_depth, i, *label);
-                        }
-                    });
-                if ui.button("Reset").clicked() {
-                    self.status.clear();
-                    self.hover_params = None;
-                    let index = self.selected_index();
-                    self.layers[index].settings.params = Params::default();
-                    self.xray = false;
-                    self.solo = false;
-                    self.auto_update = true;
-                    self.layers[index].mask.enabled = false;
-                    self.layers[index].mask.tool = mask::Tool::None;
-                }
-                ui.menu_button("Settings", |ui| {
-                    ui.checkbox(&mut self.updates.enabled, "Check for updates")
-                        .on_hover_text("On launch, contact GitHub at most once per day. Changes apply to the next launch.");
-                });
-            });
-            if let Some(session) = &self.session {
-                let name = session.document.name.clone();
-                let document_id = session.document.id;
-                ui.horizontal(|ui| {
-                    ui.label(format!("Photoshop: {name}"))
-                        .on_hover_text(format!("Photoshop document {document_id}"));
+                let title = self.document_title();
+                let right_width = if self.session.is_some() { 390.0 } else { 170.0 };
+                ui.allocate_ui_with_layout(egui::vec2((ui.available_width() - right_width).max(0.0), 32.0),
+                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| { ui.weak(title); });
+                if let Some(session) = &self.session {
+                    let send_hint = format!("Send HQ result to {} (document {}; Cmd+Enter)", session.document.name, session.document.id);
                     if ui.add_enabled(self.session_ready && self.sending.is_none() && !self.send_pending,
-                        egui::Button::new("Send to Photoshop").fill(ui.visuals().selection.bg_fill))
-                        .on_hover_text("Send HQ result (Cmd+Enter)").clicked() {
+                        egui::Button::new(egui::RichText::new("Send to Photoshop").color(theme::ACCENT))
+                            .stroke(egui::Stroke::new(1.0, theme::ACCENT)))
+                        .on_hover_text(send_hint).clicked() {
                         self.queue_send();
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.small_button("Cancel").on_hover_text("Cancel Photoshop session").clicked() {
                         self.cancel_session();
                         self.status = "Photoshop session cancelled".into();
                     }
                     if self.send_pending || self.sending.is_some() { ui.spinner(); }
+                }
+                let export = ui.add(egui::Button::new(egui::RichText::new("Export  ▾").strong().color(ui.visuals().panel_fill))
+                    .fill(theme::ACCENT).min_size(egui::vec2(86.0, 24.0)))
+                    .on_hover_text("Export HQ image (Cmd/Ctrl+E)");
+                egui::Popup::menu(&export).show(|ui| {
+                    ui.small(egui::RichText::new("BIT DEPTH").color(ui.visuals().weak_text_color()));
+                    theme::segmented(ui, &mut self.export_depth, &[(0, "8 bit"), (1, "16 bit"), (2, "32 bit")]);
+                    ui.add_space(4.0);
+                    ui.small(egui::RichText::new("OUTPUT").color(ui.visuals().weak_text_color()));
+                    theme::segmented(ui, &mut self.glow_only, &[(false, "Composite"), (true, "Glow only")]);
+                    ui.separator();
+                    if ui.add_enabled(self.renderer.is_some() && self.saving.is_none(), egui::Button::new("Export…"))
+                        .on_hover_text("Export HQ image (Cmd/Ctrl+E)").clicked() {
+                        self.export();
+                        ui.close();
+                    }
                 });
-            }
-        });
-        egui::Panel::bottom("helpers").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let index = self.selected_index();
-                ui.checkbox(&mut self.auto_update, "Auto-update")
-                    .on_hover_text("Render draft preview whenever parameters change");
-                ui.checkbox(&mut self.xray, "X-Ray")
-                    .on_hover_text("Inspect thresholded light input");
-                ui.checkbox(&mut self.solo, "Hide source")
-                    .on_hover_text("Show glow without the source image");
-                ui.checkbox(&mut self.layers[index].settings.params.unmult, "Unmult")
-                    .on_hover_text("Unpremultiply the selected layer's glow over transparency");
-                ui.checkbox(&mut self.layers[index].settings.params.hdr32, "32 Bits")
-                    .on_hover_text("Keep unclamped floating-point glow processing");
-                let mut tonemap = self.layers[index].settings.params.tonemap;
-                if ui
-                    .checkbox(&mut tonemap, "Tonemap")
-                    .on_hover_text("Compress HDR glow using exponential tonemapping")
-                    .changed()
-                {
-                    self.layers[index].settings.params.set_tonemap(tonemap);
-                }
-                if ui.button("Update").clicked() {
-                    self.force = true;
-                    self.dirty = true;
-                }
+                let settings = ui.menu_button("   ", |ui| {
+                    ui.checkbox(&mut self.updates.enabled, "Check for updates")
+                        .on_hover_text("On launch, contact GitHub at most once per day. Changes apply to the next launch.");
+                    if ui.button("Reset selected layer").clicked() {
+                        self.status.clear();
+                        self.hover_params = None;
+                        let index = self.selected_index();
+                        self.layers[index].settings.params = Params::default();
+                        self.xray = false;
+                        self.solo = false;
+                        self.auto_update = true;
+                        self.layers[index].mask.enabled = false;
+                        self.layers[index].mask.tool = mask::Tool::None;
+                        ui.close();
+                    }
+                }).response.on_hover_text("Settings");
+                paint_toolbar_icon(ui, &settings, 2);
             });
-            ui.horizontal_wrapped(|ui| {
+        });
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.horizontal(|ui| {
                 if self.busy { ui.spinner(); }
                 if let (Some(path), Some(pic)) = (&self.path, &self.picture) {
                     ui.label(path.file_name().unwrap_or_default().to_string_lossy());
@@ -704,7 +689,15 @@ impl eframe::App for App {
                     ui.separator();
                     ui.label(&self.status);
                 }
-                self.updates.note(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.updates.note(ui);
+                    if !self.auto_update && self.dirty && ui.button("Update").clicked() {
+                        self.force = true;
+                        self.dirty = true;
+                    }
+                    theme::switch(ui, &mut self.auto_update).on_hover_text("Render draft preview whenever parameters change");
+                    ui.label("Live");
+                });
             });
         });
         let collapsed_id = egui::Id::unique("moya.layers_collapsed");
@@ -714,10 +707,12 @@ impl eframe::App for App {
                 .show(ui, |ui| self.layer_strip(ui)).inner
         } else {
             egui::Panel::right("layers").default_size(240.0).size_range(200.0..=360.0)
+                .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(12, 8)))
                 .show(ui, |ui| self.layer_controls(ui)).inner
         };
         if toggle { ctx.data_mut(|data| data.insert_persisted(collapsed_id, !collapsed)); }
         egui::Panel::left("controls")
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(14, 8)))
             .default_size(350.0)
             .size_range(310.0..=500.0)
             .show(ui, |ui| {
@@ -736,14 +731,21 @@ impl eframe::App for App {
             self.canvas.invalidate();
             self.status.clear();
         }
+        // The canvas view bar toggles X-Ray and Hide source, so compare view flags after it runs.
+        egui::CentralPanel::default().show(ui, |ui| self.canvas_ui(ui));
         if old_view != (self.xray, self.solo, self.solo_layer, self.selected, self.glow_only, self.export_depth) {
             self.dirty = true;
             self.canvas.invalidate();
             self.force = true;
         }
-        egui::CentralPanel::default().show(ui, |ui| self.canvas_ui(ui));
         self.history.observe(&mut self.layers, self.selected, ctx.input(|i| i.pointer.any_down()));
         self.sync_mask(&ctx);
+        // Thumbnails follow finished glows; skip while dragging so strokes and slider drags
+        // never pay for them (they catch up on release).
+        if !ctx.input(|i| i.pointer.any_down()) {
+            let ids: Vec<u64> = self.layers.iter().map(|layer| layer.settings.id).collect();
+            self.thumbs.sync(&self.gpu, &self.render_state, self.renderer.as_ref(), &ids);
+        }
         let title = self.project_title();
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -765,6 +767,28 @@ impl eframe::App for App {
                 ctx.request_repaint_after(std::time::Duration::from_secs(5) - elapsed);
             }
         }
+    }
+}
+
+fn paint_toolbar_icon(ui: &egui::Ui, response: &egui::Response, kind: u8) {
+    let center = response.rect.center();
+    let color = if response.enabled() { ui.visuals().text_color() } else { ui.visuals().weak_text_color().gamma_multiply(0.45) };
+    let stroke = egui::Stroke::new(1.5, color);
+    if kind == 2 {
+        ui.painter().circle_stroke(center, 5.0, stroke);
+        ui.painter().circle_stroke(center, 1.5, stroke);
+        for i in 0..8 {
+            let direction = egui::Vec2::angled(i as f32 * std::f32::consts::TAU / 8.0);
+            ui.painter().line_segment([center + direction * 5.0, center + direction * 8.0], stroke);
+        }
+    } else {
+        let direction = if kind == 0 { 1.0 } else { -1.0 };
+        let point = |x: f32, y: f32| center + egui::vec2(x * direction, y);
+        ui.painter().line_segment([point(-7.0, -3.0), point(2.0, -3.0)], stroke);
+        ui.painter().line_segment([point(2.0, -3.0), point(6.0, 1.0)], stroke);
+        ui.painter().line_segment([point(6.0, 1.0), point(6.0, 6.0)], stroke);
+        ui.painter().line_segment([point(-7.0, -3.0), point(-2.0, -8.0)], stroke);
+        ui.painter().line_segment([point(-7.0, -3.0), point(-2.0, 2.0)], stroke);
     }
 }
 

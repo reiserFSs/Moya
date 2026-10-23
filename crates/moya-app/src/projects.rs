@@ -72,6 +72,13 @@ impl App {
         title_for_path(self.project.path.as_deref().or(self.path.as_deref()), self.project_is_dirty())
     }
 
+    pub(crate) fn document_title(&self) -> String {
+        let title = self.project.path.as_deref().or(self.path.as_deref())
+            .and_then(|path| path.file_name()).map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        if self.project_is_dirty() { format!("{title} · edited") } else { title }
+    }
+
     pub(crate) fn save_project(&mut self, save_as: bool) -> bool {
         if self.picture.is_none() { return false; }
         for layer in &mut self.layers { layer.mask.end_stroke(); }
@@ -227,14 +234,20 @@ impl App {
 
     pub(crate) fn project_controls(&mut self, ui: &mut egui::Ui) {
         let enabled = self.picture.is_some() && self.loading.is_none();
-        if ui.add_enabled(enabled, egui::Button::new("Save project…")).on_hover_text("Save project (Cmd+S); Save As (Cmd+Shift+S)").clicked() {
+        if ui.add_enabled(enabled, egui::Button::new("Save")).on_hover_text("Save project (Cmd+S); Save As (Cmd+Shift+S)").clicked() {
             self.save_project(false);
         }
-        let embedded_only = matches!(&self.project.source, Some(SourceRef::Embedded { .. }));
-        ui.add_enabled_ui(enabled && !embedded_only, |ui| {
-            ui.checkbox(&mut self.project.embed_source, "Embed source")
-                .on_hover_text("Store the original image inside the .moya file so it can move with the project");
-        }).response.on_disabled_hover_text("This project's source is stored only inside the project");
+        ui.menu_button("▾", |ui| {
+            if ui.add_enabled(enabled, egui::Button::new("Save as…")).clicked() {
+                self.save_project(true);
+                ui.close();
+            }
+            let embedded_only = matches!(&self.project.source, Some(SourceRef::Embedded { .. }));
+            ui.add_enabled_ui(enabled && !embedded_only, |ui| {
+                ui.checkbox(&mut self.project.embed_source, "Embed source")
+                    .on_hover_text("Store the original image inside the .moya file so it can move with the project");
+            }).response.on_disabled_hover_text("This project's source is stored only inside the project");
+        });
     }
 }
 

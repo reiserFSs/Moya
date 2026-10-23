@@ -150,6 +150,10 @@ cargo test -p moya-app --test bridge_protocol -- --ignored --test-threads=1
 
 Moya works in sRGB and draws sRGB values to the window. On macOS, wgpu leaves the window's `CAMetalLayer` without a color space for sRGB surfaces, and Core Animation then skips color matching, so on wide-gamut (Display P3) screens colors looked more saturated than in Photoshop or Preview even though the rendered/exported pixels were correct. `moya-app/src/macos_color.rs` tags the layer as sRGB every frame when the tag is missing (wgpu clears it whenever it reconfigures the surface, e.g. on resize); a pure-red sRGB image then shows the same display values as in Preview. Windows has no equivalent per-window tag: on a wide-gamut monitor Moya looks more saturated than color-managed Photoshop unless Windows 11 **Auto color management** is on; on sRGB monitors they match.
 
+## Layer thumbnails
+
+`moya-app/src/thumbs.rs` shows each layer's retained Draft glow (`Document::layer_glow`, 8-bit working size) reduced with `Gpu::resize_bicubic` (antialiased half-size pyramid) into a 64-px-long-side RGBA8 texture registered with egui; there is no CPU readback. A thumbnail is rebuilt only when the glow's (generation, storage) pair changes, never while a pointer button is down (strokes and slider drags don't pay for it; it catches up on release), and its texture is freed when the layer disappears or the document (`Document::id`) changes. Layers without a cached glow keep their previous thumbnail. Measured in isolation (GPU idle first, release, M4 Pro): ~1 ms per rebuild batch for three layers on both a 1.6 MP and a 92 MP photo, since the source is the preview-sized glow; memory is 16 KiB per layer plus transient pyramid textures from the pool.
+
 ## Masks and preview
 
 ### Gradient masks

@@ -58,15 +58,28 @@ pub struct Document {
     generation: u64,
     budget: u64,
     refined: HashMap<u64, region::RefinedLayer>,
+    id: u64,
 }
 
 impl Document {
     pub fn new(gpu: Arc<Gpu>, source: Image, host_depth: Depth) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let geometry = DocGeometry { orig_w: source.width(), orig_h: source.height() };
-        Self { gpu, source: Arc::new(source), host_depth, geometry, layers: HashMap::new(), grids: Vec::new(), generation: 0, budget: CACHE_BYTES, refined: HashMap::new() }
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { gpu, source: Arc::new(source), host_depth, geometry, layers: HashMap::new(), grids: Vec::new(), generation: 0, budget: CACHE_BYTES, refined: HashMap::new(), id }
     }
 
+    /// Process-unique identity, so per-document derived data (e.g. UI thumbnails keyed by
+    /// generation) is never reused across documents whose generation counters restart.
+    pub fn id(&self) -> u64 { self.id }
+
     pub fn source(&self) -> &Image { &self.source }
+
+    /// A layer's retained Draft glow (8-bit, working size) and its generation, if cached.
+    /// The generation changes whenever the glow's content may have changed.
+    pub fn layer_glow(&self, id: u64) -> Option<(&Image, u64)> {
+        self.layers.get(&id)?.finished.as_ref().map(|f| (&f.glow, f.generation))
+    }
 
     pub fn clear_caches(&mut self) {
         self.layers.clear();
