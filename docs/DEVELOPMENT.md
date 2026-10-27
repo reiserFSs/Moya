@@ -146,6 +146,10 @@ The opt-in integration test starts the real app with `--bridge-test-auto-send`, 
 cargo test -p moya-app --test bridge_protocol -- --ignored --test-threads=1
 ```
 
+## Window chrome (macOS)
+
+The window uses a full-size content view with the title bar and title hidden, so the 44-pt toolbar (`TOOLBAR_HEIGHT` in `main.rs`) is the title bar: dragging its empty space starts a window drag and double-clicking toggles zoom. AppKit keeps the traffic-light buttons at their 28-pt title-bar position, so `moya-app/src/macos_titlebar.rs` resizes the title-bar container to the toolbar height and centers the buttons in it every frame (AppKit re-lays them out on resize; it only acts when the layout differs, and skips full screen, where the system owns them). Toolbar content starts after `BUTTONS_END`. The window title is still set, for Mission Control and the Window menu. Windows keeps its native title bar.
+
 ## Display color
 
 Moya works in sRGB and draws sRGB values to the window. On macOS, wgpu leaves the window's `CAMetalLayer` without a color space for sRGB surfaces, and Core Animation then skips color matching, so on wide-gamut (Display P3) screens colors looked more saturated than in Photoshop or Preview even though the rendered/exported pixels were correct. `moya-app/src/macos_color.rs` tags the layer as sRGB every frame when the tag is missing (wgpu clears it whenever it reconfigures the surface, e.g. on resize); a pure-red sRGB image then shows the same display values as in Preview. Windows has no equivalent per-window tag: on a wide-gamut monitor Moya looks more saturated than color-managed Photoshop unless Windows 11 **Auto color management** is on; on sRGB monitors they match.

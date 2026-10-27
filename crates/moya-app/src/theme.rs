@@ -36,8 +36,11 @@ pub fn install(ctx: &egui::Context) {
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(65, 66, 73));
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(65, 57, 51);
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.7));
+    // Pressed: accent-tinted fill with light text. A dark label here (for an accent fill) became
+    // invisible on frameless and outlined widgets such as tabs and the canvas bar.
     visuals.widgets.active.bg_fill = ACCENT;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(25, 26, 29));
+    visuals.widgets.active.weak_bg_fill = ACCENT.gamma_multiply(0.3);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_gray(240));
     for widget in [&mut visuals.widgets.noninteractive, &mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active, &mut visuals.widgets.open] {
         widget.corner_radius = egui::CornerRadius::same(6);
     }
@@ -45,10 +48,11 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
-pub fn switch(ui: &mut egui::Ui, value: &mut bool) -> Response {
+/// Compact on/off pill. `name` is what screen readers announce (the row or section label).
+pub fn switch(ui: &mut egui::Ui, value: &mut bool, name: &str) -> Response {
     let (rect, mut response) = ui.allocate_exact_size(egui::vec2(28.0, 16.0), egui::Sense::click());
     if response.clicked() { *value = !*value; response.mark_changed(); }
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *value, ""));
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *value, name));
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact(&response);
         let fill = if *value { ACCENT } else { ui.visuals().widgets.inactive.bg_fill };
@@ -61,12 +65,21 @@ pub fn switch(ui: &mut egui::Ui, value: &mut bool) -> Response {
 }
 
 pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> Response {
+    segmented_badged(ui, value, options, |_| false)
+}
+
+/// Segmented control whose items can carry a small accent dot (e.g. "something is on in this tab").
+pub fn segmented_badged<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)], badge: impl Fn(T) -> bool) -> Response {
     let result = egui::Frame::new().stroke(ui.visuals().widgets.inactive.bg_stroke).corner_radius(7).inner_margin(2).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let mut changed = false;
             for &(item, label) in options {
-                if ui.selectable_label(*value == item, label).clicked() && *value != item { *value = item; changed = true; }
+                let response = ui.selectable_label(*value == item, label);
+                if badge(item) {
+                    ui.painter().circle_filled(response.rect.right_top() + egui::vec2(-4.0, 4.0), 2.5, ACCENT);
+                }
+                if response.clicked() && *value != item { *value = item; changed = true; }
             }
             changed
         }).inner
@@ -80,12 +93,18 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options:
 /// sections with an on/off parameter, a switch on the right. Returns whether the section is
 /// expanded; callers decide whether a disabled section still shows its body.
 pub fn section(ui: &mut egui::Ui, title: &str, enabled: Option<&mut bool>, tooltip: &str) -> bool {
+    section_with(ui, title, enabled, tooltip, true, "")
+}
+
+/// [`section`] with an initial expansion state and an accent `note` after the title
+/// (e.g. "2 changed" on a collapsed section, so its edits aren't hidden).
+pub fn section_with(ui: &mut egui::Ui, title: &str, enabled: Option<&mut bool>, tooltip: &str, default_open: bool, note: &str) -> bool {
     ui.add_space(4.0);
     let line = ui.available_rect_before_wrap();
     ui.painter().hline(line.x_range(), line.top(), Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
     ui.add_space(4.0);
     let id = ui.make_persistent_id(("section", title));
-    let mut open = ui.data_mut(|data| data.get_temp::<bool>(id).unwrap_or(true));
+    let mut open = ui.data_mut(|data| data.get_temp::<bool>(id).unwrap_or(default_open));
     ui.horizontal(|ui| {
         let switch_width = if enabled.is_some() { 28.0 + ui.spacing().item_spacing.x } else { 0.0 };
         let (rect, response) = ui.allocate_exact_size(egui::vec2((ui.available_width() - switch_width).max(20.0), 18.0), egui::Sense::click());
@@ -94,10 +113,16 @@ pub fn section(ui: &mut egui::Ui, title: &str, enabled: Option<&mut bool>, toolt
         let points = if open { vec![c + egui::vec2(-4.0, -2.0), c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 3.0)] } else { vec![c + egui::vec2(-2.0, -4.0), c + egui::vec2(-2.0, 4.0), c + egui::vec2(3.0, 0.0)] };
         ui.painter().add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
         let galley = ui.painter().layout_no_wrap(title.to_uppercase(), egui::FontId::proportional(10.5), color);
+        let title_end = rect.left() + 16.0 + galley.size().x;
         ui.painter().galley(egui::pos2(rect.left() + 16.0, rect.center().y - galley.size().y / 2.0), galley, color);
+        if !note.is_empty() {
+            let note = ui.painter().layout_no_wrap(note.to_owned(), egui::FontId::proportional(10.5), ACCENT);
+            ui.painter().galley(egui::pos2(title_end + 8.0, rect.center().y - note.size().y / 2.0), note, ACCENT);
+        }
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, if open { format!("Collapse {title}") } else { format!("Expand {title}") }));
         let response = if tooltip.is_empty() { response } else { response.on_hover_text(tooltip) };
         if response.clicked() { open = !open; }
-        if let Some(enabled) = enabled { switch(ui, enabled).on_hover_text(tooltip); }
+        if let Some(enabled) = enabled { switch(ui, enabled, title).on_hover_text(tooltip); }
     });
     ui.data_mut(|data| data.insert_temp(id, open));
     open
@@ -106,10 +131,15 @@ pub fn section(ui: &mut egui::Ui, title: &str, enabled: Option<&mut bool>, toolt
 /// "Label ......... [switch]" row, the mockup's layout for on/off options.
 pub fn switch_row(ui: &mut egui::Ui, label: &str, value: &mut bool, tooltip: &str) -> Response {
     ui.horizontal(|ui| {
-        let label = ui.label(label);
-        let response = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| switch(ui, value)).inner;
-        if tooltip.is_empty() { response } else { label.on_hover_text(tooltip); response.on_hover_text(tooltip) }
+        let text = ui.label(label);
+        let response = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| switch(ui, value, label)).inner;
+        if tooltip.is_empty() { response } else { text.on_hover_text(tooltip); response.on_hover_text(tooltip) }
     }).inner
+}
+
+/// Gives a text-less (painted icon) button the name screen readers announce.
+pub fn name_button(response: &Response, name: &str) {
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, response.enabled(), name));
 }
 
 #[cfg(test)]

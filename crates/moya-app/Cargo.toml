@@ -32,6 +32,6 @@ winresource = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5.2"
-objc2-foundation = { version = "0.2.2", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "NSNotification", "NSURL"] }
+objc2-foundation = { version = "0.2.2", features = ["NSAppleEventDescriptor", "NSAppleEventManager", "NSGeometry", "NSNotification", "NSURL"] }
 objc2-app-kit = { version = "0.2.2", features = ["NSApplication"] }
 raw-window-handle = "0.6"

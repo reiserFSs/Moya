@@ -289,9 +289,9 @@ const fn slider(slot: usize, label: &'static str, min: f32, max: f32, default: f
 
 const SLIDERS: [SliderSpec; 31] = [
     slider(0, "Threshold", 0.01, 2., 0.15, 0.01, 2, "Choose which highlights emit glow."),
-    slider(1, "DR compression", 1., 254., 30., 1., 0, "Expand the extracted highlight range."),
+    slider(1, "DR compression", 1., 254., 30., 1., 0, "Brightens the extracted highlights before they glow: higher values make more of the image count as bright light."),
     slider(2, "Main opacity", 1., 100., 100., 1., 0, "Set overall glow strength."),
-    slider(3, "Core opacity", 1., 100., 100., 1., 0, "Set the strength of the tight glow layers."),
+    slider(3, "Core opacity", 1., 100., 100., 1., 0, "Strength of the small, tight glow right around each light; lower it for a softer, hazier look."),
     slider(4, "Radius", 1., 1000., 1000., 1., 0, "Set glow spread in preview pixels."),
     slider(5, "Exposure", -10., 10., 1., 0.01, 2, "Brighten or darken the glow."),
     slider(6, "Gamma", 0.01, 2.2, 1.3, 0.01, 2, "Shape the glow's tonal response."),
@@ -318,7 +318,7 @@ const SLIDERS: [SliderSpec; 31] = [
     slider(41, "Rays samples", 1., 100., 20., 1., 0, "Set how many ray samples accumulate."),
     slider(42, "Rays falloff", 0.01, 1., 0.5, 0.01, 2, "Fade successive ray samples."),
     slider(45, "Glare gamma", 0.01, 9., 1., 0.01, 2, "Shape glare brightness."),
-    slider(46, "Glow iterations", 1., 11., 11., 1., 0, "Set the number of additional glow layers."),
+    slider(46, "Glow iterations", 1., 11., 11., 1., 0, "How many glow sizes are stacked, from tight to wide; fewer give a tighter glow and a faster render."),
 ];
 
 #[cfg(test)]

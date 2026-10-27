@@ -33,7 +33,7 @@ impl PanelState {
         Self { tab: 0, presets, preset_name: "My Preset".into(), rename: None, delete: None, layer_rename: None, layer_drag: None, spectrum_mix: Default::default(), preset_load_warning, preset_backup_pending, confirm: None }
     }
 
-    pub(crate) fn mask_tab_open(&self) -> bool { self.tab == 3 }
+    pub(crate) fn mask_tab_open(&self) -> bool { self.tab == 2 }
 }
 
 impl App {
@@ -41,6 +41,20 @@ impl App {
         self.history.remove_layer(&mut self.layers, &mut self.selected, id);
         if self.solo_layer == Some(id) { self.solo_layer = None; }
         self.panels.layer_rename = None;
+    }
+
+    /// Restores a layer's effect settings to defaults and turns its mask off (painted mask
+    /// pixels are kept); also returns the preview to the plain live view. One undo step.
+    fn reset_layer(&mut self, id: u64) {
+        let Some(index) = self.layers.iter().position(|layer| layer.settings.id == id) else { return };
+        self.status.clear();
+        self.hover_params = None;
+        self.layers[index].settings.params = Params::default();
+        self.layers[index].mask.enabled = false;
+        self.layers[index].mask.tool = Tool::None;
+        self.xray = false;
+        self.solo = false;
+        self.auto_update = true;
     }
 
     /// Confirmation dialogs for destructive (but undoable) actions. Enter confirms, Esc cancels.
@@ -79,11 +93,14 @@ impl App {
     pub(crate) fn layer_strip(&mut self, ui: &mut egui::Ui) -> bool {
         let mut expand = false;
         ui.vertical_centered(|ui| {
-            if ui.small_button("‹").on_hover_text("Show the Layers panel").clicked() { expand = true; }
+            let expand_button = ui.small_button("‹").on_hover_text("Show the Layers panel");
+            crate::theme::name_button(&expand_button, "Show Layers panel");
+            if expand_button.clicked() { expand = true; }
             ui.add_space(4.0);
             for index in (0..self.layers.len()).rev() {
                 let id = self.layers[index].settings.id;
                 let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+                crate::theme::name_button(&response, &format!("Select {}", self.layers[index].settings.name));
                 let painter = ui.painter();
                 let visible = self.layers[index].settings.visible;
                 painter.rect_filled(rect, 4.0, if self.selected == id { ui.visuals().selection.bg_fill } else { ui.visuals().faint_bg_color });
@@ -112,8 +129,12 @@ impl App {
                 widgets.inactive.bg_stroke = egui::Stroke::NONE;
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let icon = egui::vec2(22.0, 22.0);
-                if ui.add(egui::Button::new("›").min_size(icon)).on_hover_text("Collapse the Layers panel").clicked() { collapse = true; }
-                if ui.add_enabled(self.layers.len() > 1, egui::Button::new("×").min_size(icon)).on_hover_text("Delete selected layer; edited layers ask for confirmation").clicked() {
+                let collapse_button = ui.add(egui::Button::new("›").min_size(icon)).on_hover_text("Collapse the Layers panel");
+                crate::theme::name_button(&collapse_button, "Collapse Layers panel");
+                if collapse_button.clicked() { collapse = true; }
+                let delete = ui.add_enabled(self.layers.len() > 1, egui::Button::new("×").min_size(icon)).on_hover_text("Delete selected layer; edited layers ask for confirmation");
+                crate::theme::name_button(&delete, "Delete layer");
+                if delete.clicked() {
                     let layer = &self.layers[index];
                     let id = layer.settings.id;
                     if !layer.mask.is_empty() || layer.settings.params != Params::default() {
@@ -124,6 +145,7 @@ impl App {
                     }
                 }
                 let duplicate = ui.add(egui::Button::new("").min_size(icon)).on_hover_text("Duplicate this layer, including its mask");
+                crate::theme::name_button(&duplicate, "Duplicate layer");
                 let square = egui::Rect::from_center_size(duplicate.rect.center(), egui::vec2(9.0, 9.0));
                 let stroke = egui::Stroke::new(1.0, ui.visuals().text_color());
                 ui.painter().rect_stroke(square.translate(egui::vec2(-2.0, -2.0)), 1.0, stroke, egui::StrokeKind::Inside);
@@ -134,7 +156,9 @@ impl App {
                     self.layers.insert(index + 1, layer);
                     self.selected = id;
                 }
-                if ui.add(egui::Button::new(egui::RichText::new("+").size(16.0)).min_size(icon)).on_hover_text("Add a new effect layer above the selected layer").clicked() {
+                let add = ui.add(egui::Button::new(egui::RichText::new("+").size(16.0)).min_size(icon)).on_hover_text("Add a new effect layer above the selected layer");
+                crate::theme::name_button(&add, "Add layer");
+                if add.clicked() {
                     let id = self.history.next_id();
                     let mut layer = Layer::new(id, format!("Layer {id}"));
                     if let Some(picture) = &self.picture {
@@ -173,6 +197,8 @@ impl App {
                         painter.add(egui::Shape::ellipse_stroke(eye_rect.center(), egui::vec2(8.0, 5.0), egui::Stroke::new(1.2, color)));
                         painter.circle_filled(eye_rect.center(), 2.5, color);
                         if !visible { painter.line_segment([eye_rect.left_bottom(), eye_rect.right_top()], egui::Stroke::new(1.2, color)); }
+                        let layer_name = self.layers[index].settings.name.clone();
+                        eye.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, visible, format!("Show {layer_name}")));
                         if eye.on_hover_text("Show or hide this layer").clicked() { self.layers[index].settings.visible = !visible; }
                         let content_rect = egui::Rect::from_min_max(rect.min, egui::pos2(eye_rect.left() - 3.0, rect.bottom()));
                         let thumb_rect = egui::Rect::from_min_size(rect.min + egui::vec2(7.0, 7.0), egui::vec2(32.0, 32.0));
@@ -203,6 +229,7 @@ impl App {
                         } else {
                             let row = ui.interact(content_rect, ui.make_persistent_id("layer_select"), egui::Sense::click_and_drag())
                                 .on_hover_text(format!("{}\n{hint}\nSelect layer; double-click to rename", self.layers[index].settings.name));
+                            crate::theme::name_button(&row, &format!("{}, {hint}", self.layers[index].settings.name));
                             paint_left(ui, name_rect, &self.layers[index].settings.name, 13.0, text_color);
                             if row.clicked() { self.selected = id; }
                             if row.drag_started() { self.panels.layer_drag = Some(id); self.selected = id; }
@@ -221,6 +248,11 @@ impl App {
                                 }
                                 if ui.add_enabled(index > 0, egui::Button::new("Down")).clicked() {
                                     reorder_layer(&mut self.layers, index, index - 1);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Reset settings").on_hover_text("Restore this layer's default settings and turn its mask off; undo with Cmd+Z").clicked() {
+                                    self.reset_layer(id);
                                     ui.close();
                                 }
                             });
@@ -257,12 +289,11 @@ impl App {
             ]);
             slider_row(ui, &mut self.layers[index].settings.opacity, &SliderSpec { slot: 200, label: "Opacity", min: 0.0, max: 1.0, default: 1.0, step: 0.01, decimals: 2, tooltip: "Layer glow opacity; does not change its saved effect settings" });
             ui.horizontal(|ui| {
-                ui.label("Input");
+                ui.label("Input").on_hover_text("Original: take light from the source image. Below: take light from the composite of the layers below this one.");
                 crate::theme::segmented(ui, &mut self.layers[index].settings.input, &[
                     (LayerInput::Original, "Original"), (LayerInput::Below, "Below"),
-                ]);
+                ]).on_hover_text("Original: take light from the source image. Below: take light from the composite of the layers below this one.");
             });
-            ui.weak("Below extracts light from the composite below this layer.");
         }
         collapse
     }
@@ -276,19 +307,36 @@ impl App {
                 ui.weak("Before saving, the existing file will be preserved as userPresets.json.bak-<timestamp>.");
             }
         }
-        crate::theme::segmented(ui, &mut self.panels.tab, &[(0, "Main"), (1, "Glare"), (2, "FX"), (3, "Mask"), (4, "Presets")]);
+        let params = &self.layers[index].settings.params;
+        let effects_on = params.glare_on || params.spectrum_mix > 0.0 || params.ca_on || params.rays_on;
+        let mask_on = self.layers[index].mask.enabled && !self.layers[index].mask.is_empty();
+        let mut reset = false;
+        ui.horizontal(|ui| {
+            crate::theme::segmented_badged(ui, &mut self.panels.tab, &[(0, "Main"), (1, "Effects"), (2, "Mask"), (3, "Presets")],
+                |tab| (tab == 1 && effects_on) || (tab == 2 && mask_on));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let widgets = &mut ui.visuals_mut().widgets;
+                widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                reset = ui.button(egui::RichText::new("Reset").color(ui.visuals().weak_text_color()))
+                    .on_hover_text("Restore the selected layer's default settings and turn its mask off; undo with Cmd+Z").clicked();
+            });
+        });
+        if reset { self.reset_layer(self.selected); }
         ui.add_space(2.0);
         match self.panels.tab {
             0 => {
                 if crate::theme::section(ui, "Input", None, "") {
-                    self.sliders(ui, &[0, 1]);
-                    choice(ui, "Transition", &mut self.layers[index].settings.params.transition, &[(Transition::Soft, "Soft"), (Transition::Precise, "Precise")]);
+                    self.sliders(ui, &[0]);
+                    choice_with(ui, "Transition", &mut self.layers[index].settings.params.transition, &[(Transition::Soft, "Soft"), (Transition::Precise, "Precise")],
+                        "Soft: light fades in gradually above the threshold. Precise: a hard cut, only pixels brighter than the threshold glow.");
                     let old = self.layers[index].settings.params.highlights;
-                    choice(ui, "Highlights", &mut self.layers[index].settings.params.highlights, &[(Highlights::Preserve, "Preserve"), (Highlights::Flatten, "Flatten")]);
+                    choice_with(ui, "Highlights", &mut self.layers[index].settings.params.highlights, &[(Highlights::Preserve, "Preserve"), (Highlights::Flatten, "Flatten")],
+                        "Flatten tames bright areas of the photo first (like Camera Raw's Highlights −100) so large bright surfaces glow less; it also sets threshold, exposure and DR compression to suit.");
                     let highlights = self.layers[index].settings.params.highlights;
                     if old != highlights { self.layers[index].settings.params.set_highlights(highlights); }
                 }
-                if crate::theme::section(ui, "Glow", None, "") { self.sliders(ui, &[2, 3, 4, 46, 5, 6, 32, 36]); }
+                if crate::theme::section(ui, "Glow", None, "") { self.sliders(ui, &[4, 5, 6, 2]); }
                 let mut on = self.layers[index].settings.params.colorize;
                 let open = crate::theme::section(ui, "Color", None, "");
                 if open {
@@ -298,17 +346,30 @@ impl App {
                 }
                 if crate::theme::section(ui, "Processing", None, "Options that change how the glow is computed") {
                     let params = &mut self.layers[index].settings.params;
-                    crate::theme::switch_row(ui, "32-bit processing", &mut params.hdr32, "Keep unclamped floating-point glow processing");
+                    crate::theme::switch_row(ui, "32-bit processing", &mut params.hdr32, "Compute the glow in 32-bit floating point, so very bright light isn't clipped before it spreads.");
                     let mut tonemap = params.tonemap;
-                    if crate::theme::switch_row(ui, "Tonemap", &mut tonemap, "Compress HDR glow using exponential tonemapping").changed() {
+                    if crate::theme::switch_row(ui, "Tonemap", &mut tonemap, "Rolls off very bright glow smoothly instead of clipping it (filmic exposure curve).").changed() {
                         params.set_tonemap(tonemap);
                     }
-                    crate::theme::switch_row(ui, "Unmult", &mut params.unmult, "Unpremultiply the selected layer's glow over transparency");
+                    crate::theme::switch_row(ui, "Unmult", &mut params.unmult, "Turns the glow's black background transparent (alpha follows brightness), for glow-only exports placed over other images.");
+                }
+                // Rarely needed shaping controls; collapsed by default, with a count of edited
+                // values on the header so changes made here never go unnoticed.
+                const ADVANCED: [usize; 5] = [1, 3, 46, 32, 36];
+                let changed = {
+                    let params = &mut self.layers[index].settings.params;
+                    let specs = params.slider_specs();
+                    ADVANCED.iter().filter(|&&slot| specs.iter().find(|spec| spec.slot == slot)
+                        .is_some_and(|spec| (*slider_value(params, slot) - spec.default).abs() > 0.00001)).count()
+                };
+                let note = if changed == 0 { String::new() } else { format!("{changed} changed") };
+                if crate::theme::section_with(ui, "Advanced", None, "DR compression, core opacity, iterations and aspect", false, &note) {
+                    self.sliders(ui, &ADVANCED);
                 }
             }
             1 => {
                 if section(ui, "Glare", &mut self.layers[index].settings.params.glare_on, "Add diffraction streaks around bright light") {
-                    crate::theme::switch_row(ui, "Protect core", &mut self.layers[index].settings.params.protect_core, "");
+                    crate::theme::switch_row(ui, "Protect core", &mut self.layers[index].settings.params.protect_core, "Darkens the glare where the glow is brightest, so the streaks don't wash out the light's core.");
                     choice(ui, "Rays", &mut self.layers[index].settings.params.glare_rays, &[(GlareRays::Two, "2"), (GlareRays::Four, "4"), (GlareRays::Six, "6")]);
                     choice(ui, "Blend", &mut self.layers[index].settings.params.glare_blend, &[(GlareBlend::ColorDodge, "Color Dodge"), (GlareBlend::LinearDodge, "Linear Dodge")]);
                     self.sliders(ui, &[7, 8, 9, 10, 31, 45]);
@@ -327,10 +388,8 @@ impl App {
                     choice(ui, "Blend", &mut self.layers[index].settings.params.spectrum_blend, &[(SpectrumBlend::Overlay, "Overlay"), (SpectrumBlend::SoftLight, "Soft Light"), (SpectrumBlend::Multiply, "Multiply")]);
                     self.sliders(ui, &[13, 14, 15, 16]);
                 }
-            }
-            2 => {
                 if section(ui, "Chromatic Aberration", &mut self.layers[index].settings.params.ca_on, "Separate the color channels") {
-                    crate::theme::switch_row(ui, "Mix over glow", &mut self.layers[index].settings.params.ca_mix, "");
+                    crate::theme::switch_row(ui, "Mix over glow", &mut self.layers[index].settings.params.ca_mix, "Lightens the shifted channels over the image instead of replacing them, so the original colors stay under the fringes.");
                     choice(ui, "Type", &mut self.layers[index].settings.params.ca_type, &[(CaType::Offset, "Offset"), (CaType::Center, "Center")]);
                     choice(ui, "Channels", &mut self.layers[index].settings.params.ca_channels, &[(CaChannels::Rgb, "RGB"), (CaChannels::Bgr, "BGR"), (CaChannels::MagentaGreen, "Magenta / Green"), (CaChannels::YellowBlue, "Yellow / Blue"), (CaChannels::RedCyan, "Red / Cyan")]);
                     self.sliders(ui, &[17, 28, 29, 35]);
@@ -340,7 +399,7 @@ impl App {
                     self.sliders(ui, &[38, 39, 40, 41, 42]);
                 }
             }
-            3 => self.mask_controls(ui),
+            2 => self.mask_controls(ui),
             _ => self.preset_controls(ui),
         }
     }
@@ -460,7 +519,7 @@ impl App {
                     Some(_) => if let Some(path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name("mask.png").save_file() {
                         match self.layers[index].mask.save_png(&path) {
                             Ok(()) => self.status = format!("Saved mask: {}", path.display()),
-                            Err(e) => self.status = format!("Mask save failed: {e:#}"),
+                            Err(e) => self.status = crate::failure("Mask save", &e),
                         }
                     },
                     None => {}
@@ -471,41 +530,51 @@ impl App {
 
     fn persist_presets(&mut self) {
         if let Err(e) = data::save_presets(&self.panels.presets, &mut self.panels.preset_backup_pending) {
-            self.status = format!("Preset save failed: {e:#}");
+            self.status = crate::failure("Preset save", &e);
         }
     }
 
     fn preset_controls(&mut self, ui: &mut egui::Ui) {
         let index = self.selected_index();
-        ui.label("Save current settings");
-        ui.add(egui::TextEdit::singleline(&mut self.panels.preset_name).hint_text("Preset name").desired_width(f32::INFINITY));
-        if ui.button("Save current preset").clicked() {
-            if self.panels.preset_name.trim().is_empty() { self.status = "Preset name cannot be empty".into(); }
-            else {
-                self.panels.presets.push(Preset { name: self.panels.preset_name.trim().into(), params: self.layers[index].settings.params.clone() });
-                self.persist_presets();
-            }
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Import…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("Moya / Oniric presets", &["json"]).pick_file() {
-                    let result = std::fs::read_to_string(path).map_err(anyhow::Error::from).and_then(|s| Ok(presets::parse_presets(&s)?));
-                    match result {
-                        Ok(p) => { self.panels.presets.extend(p); self.persist_presets(); }
-                        Err(e) => self.status = format!("Preset import failed: {e:#}"),
+        if crate::theme::section(ui, "Save", None, "Save the selected layer's current settings as a preset") {
+            ui.horizontal(|ui| {
+                let save_width = 64.0;
+                ui.add(egui::TextEdit::singleline(&mut self.panels.preset_name).hint_text("Preset name")
+                    .desired_width(ui.available_width() - save_width - ui.spacing().item_spacing.x));
+                if ui.add(egui::Button::new("Save").min_size(egui::vec2(save_width, 22.0)))
+                    .on_hover_text("Save the selected layer's current settings under this name").clicked() {
+                    if self.panels.preset_name.trim().is_empty() { self.status = "Preset name cannot be empty".into(); }
+                    else {
+                        self.panels.presets.push(Preset { name: self.panels.preset_name.trim().into(), params: self.layers[index].settings.params.clone() });
+                        self.persist_presets();
                     }
                 }
-            }
-            if ui.button("Export…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().set_file_name("Moya_Presets.json").save_file() {
-                    if let Err(e) = std::fs::write(path, presets::serialize_presets(&self.panels.presets)) { self.status = format!("Preset export failed: {e}"); }
+            });
+        }
+        let count = self.panels.presets.len();
+        let note = if count == 0 { String::new() } else { count.to_string() };
+        if !crate::theme::section_with(ui, "Library", None, "Your saved presets", true, &note) { return; }
+        match button_grid(ui, &[
+            ("Import…", "Add presets from a Moya_Presets.json or Oniric_Presets.json file"),
+            ("Export…", "Save all presets to a JSON file"),
+        ], 2) {
+            Some(0) => if let Some(path) = rfd::FileDialog::new().add_filter("Moya / Oniric presets", &["json"]).pick_file() {
+                let result = std::fs::read_to_string(path).map_err(anyhow::Error::from).and_then(|s| Ok(presets::parse_presets(&s)?));
+                match result {
+                    Ok(p) => { self.panels.presets.extend(p); self.persist_presets(); }
+                    Err(e) => self.status = crate::failure("Preset import", &e),
                 }
-            }
-        });
-        ui.separator();
-        ui.label("Hover to preview · Click to apply");
-        ui.weak("Right-click a preset to manage it");
-        if self.panels.presets.is_empty() { ui.weak("No presets yet. Save your current settings above."); }
+            },
+            Some(_) => if let Some(path) = rfd::FileDialog::new().set_file_name("Moya_Presets.json").save_file() {
+                if let Err(e) = std::fs::write(path, presets::serialize_presets(&self.panels.presets)) { self.status = crate::failure("Preset export", &e.into()); }
+            },
+            None => {}
+        }
+        if count == 0 {
+            ui.weak("No presets yet. Name your current settings above and press Save, or import an Oniric_Presets.json file.");
+        } else {
+            ui.weak("Hover to preview, click to apply, right-click to rename, duplicate or delete.");
+        }
         let mut persist = false;
         let mut duplicate = None;
         let mut remove = None;
@@ -641,8 +710,11 @@ fn apply_preset(layers: &mut [Layer], index: usize, preset: &Preset) {
     layers[index].settings.params = preset.params.clone();
 }
 
-fn section(ui: &mut egui::Ui, title: &str, on: &mut bool, tooltip: &str) -> bool {
-    crate::theme::section(ui, title, Some(on), tooltip) && *on
+/// Switchable section: shows its controls when on, and a one-line description when off.
+fn section(ui: &mut egui::Ui, title: &str, on: &mut bool, description: &str) -> bool {
+    let open = crate::theme::section(ui, title, Some(on), description);
+    if open && !*on { ui.weak(description); }
+    open && *on
 }
 
 fn short_label(label: &str) -> &str {
@@ -730,15 +802,21 @@ fn slider_row(ui: &mut egui::Ui, value: &mut f32, spec: &SliderSpec) {
 }
 
 fn choice<T: Copy + PartialEq>(ui: &mut egui::Ui, label: &str, value: &mut T, options: &[(T, &str)]) {
+    choice_with(ui, label, value, options, "");
+}
+
+fn choice_with<T: Copy + PartialEq>(ui: &mut egui::Ui, label: &str, value: &mut T, options: &[(T, &str)], tooltip: &str) {
     let selected = options.iter().find(|(v, _)| v == value).map_or("", |(_, s)| *s);
     ui.horizontal(|ui| {
-        ui.label(label);
+        let text = ui.label(label);
+        if !tooltip.is_empty() { text.on_hover_text(tooltip); }
         // Fit the dropdown into the space left after the label so narrow panels never overlap it.
         let width = (ui.available_width() - ui.spacing().item_spacing.x).clamp(60.0, 145.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            egui::ComboBox::from_id_salt(label).selected_text(selected).width(width).show_ui(ui, |ui| {
+            let combo = egui::ComboBox::from_id_salt(label).selected_text(selected).width(width).show_ui(ui, |ui| {
                 for &(v, name) in options { ui.selectable_value(value, v, name); }
             });
+            combo.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, format!("{label}: {selected}")));
         });
     });
 }

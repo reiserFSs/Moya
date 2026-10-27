@@ -46,7 +46,7 @@ impl App {
             }
             Err(error) => {
                 self.trim_idle();
-                self.status = format!("Send failed: {error:#}");
+                self.status = crate::failure("Send", &error);
                 self.bridge_reply(serde_json::json!({"type":"error","id":session.id,"message":self.status}));
             }
         }
@@ -188,7 +188,7 @@ impl App {
                 }
                 Err(error) => {
                     self.sending = None;
-                    self.status = format!("Send failed: {error:#}");
+                    self.status = crate::failure("Send", &error);
                     if let Some(session) = &self.session {
                         self.bridge_reply(serde_json::json!({"type":"error","id":session.id,"message":self.status}));
                     }

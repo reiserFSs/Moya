@@ -109,7 +109,7 @@ impl App {
                 self.status = format!("Saved project {}", path.display());
                 true
             }
-            Err(error) => { self.status = format!("Project save failed: {error:#}"); false }
+            Err(error) => { self.status = crate::failure("Project save", &error); false }
         }
     }
 
@@ -157,7 +157,7 @@ impl App {
         })();
         let (project, source_path, picture, layers, selected) = match result {
             Ok(loaded) => loaded,
-            Err(error) => { self.status = format!("Project open failed: {error:#}"); return false; }
+            Err(error) => { self.status = crate::failure("Project open", &error); return false; }
         };
         if !self.finish_open(&source_path, picture) { return false; }
         self.loading = None;
@@ -234,10 +234,16 @@ impl App {
 
     pub(crate) fn project_controls(&mut self, ui: &mut egui::Ui) {
         let enabled = self.picture.is_some() && self.loading.is_none();
-        if ui.add_enabled(enabled, egui::Button::new("Save")).on_hover_text("Save project (Cmd+S); Save As (Cmd+Shift+S)").clicked() {
+        // Split button: Save plus a full-height options arrow sitting flush against it.
+        let spacing = ui.spacing().item_spacing.x;
+        ui.spacing_mut().item_spacing.x = 1.0;
+        if ui.add_enabled(enabled, egui::Button::new("Save").min_size(egui::vec2(0.0, 24.0))).on_hover_text("Save project (Cmd+S); Save As (Cmd+Shift+S)").clicked() {
             self.save_project(false);
         }
-        ui.menu_button("▾", |ui| {
+        let arrow = ui.add(egui::Button::new("▾").min_size(egui::vec2(24.0, 24.0))).on_hover_text("Save as…, Embed source");
+        ui.spacing_mut().item_spacing.x = spacing;
+        crate::theme::name_button(&arrow, "Save options");
+        egui::Popup::menu(&arrow).show(|ui| {
             if ui.add_enabled(enabled, egui::Button::new("Save as…")).clicked() {
                 self.save_project(true);
                 ui.close();

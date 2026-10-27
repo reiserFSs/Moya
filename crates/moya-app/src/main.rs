@@ -1,5 +1,9 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+/// Height of the top toolbar, which also serves as the macOS title bar (traffic lights are
+/// centered in it).
+const TOOLBAR_HEIGHT: f32 = 44.0;
+
 mod bridge;
 mod canvas;
 mod data;
@@ -19,6 +23,8 @@ mod thumbs;
 mod macos_open;
 #[cfg(target_os = "macos")]
 mod macos_color;
+#[cfg(target_os = "macos")]
+mod macos_titlebar;
 
 use eframe::{
     egui,
@@ -58,6 +64,10 @@ fn main() -> eframe::Result {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1280.0, 850.0])
                 .with_app_id("Moya")
+                // macOS: draw the toolbar in the title bar area (traffic lights over our content).
+                .with_fullsize_content_view(true)
+                .with_titlebar_shown(false)
+                .with_title_shown(false)
                 .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/window-icon-256.png"))
                     .expect("embedded Moya window icon")),
             wgpu_options,
@@ -291,7 +301,7 @@ impl App {
                     }
                     self.status.clear();
                 }
-                Err(e) => self.status = format!("Mask load failed: {e:#}"),
+                Err(e) => self.status = crate::failure("Mask load", &e),
             }
             return;
         }
@@ -320,7 +330,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.status = format!("Open failed: {e:#}");
+                self.status = crate::failure("Open", &e);
                 if let Some(session) = self.session.take() {
                     self.bridge_reply(serde_json::json!({"type":"error","id":session.id,"message":self.status}));
                 }
@@ -467,7 +477,7 @@ impl App {
         };
         let pic = match self.render_hq(self.glow_only, false, depth) {
             Ok(pic) => pic,
-            Err(e) => { self.status = format!("Save failed: {e:#}"); return; }
+            Err(e) => { self.status = crate::failure("Save", &e); return; }
         };
         let (tx, rx) = mpsc::channel();
         self.saving = Some(rx);
@@ -542,6 +552,8 @@ impl eframe::App for App {
         // Color-manage the window like other Mac apps (see macos_color).
         #[cfg(target_os = "macos")]
         macos_color::tag_srgb(frame);
+        #[cfg(target_os = "macos")]
+        macos_titlebar::place_traffic_lights(frame, TOOLBAR_HEIGHT);
         #[cfg(not(target_os = "macos"))]
         let _ = frame;
         #[cfg(target_os = "macos")]
@@ -561,7 +573,7 @@ impl eframe::App for App {
                 self.trim_idle();
                 self.status = match result {
                     Ok(path) => format!("Saved {}", path.display()),
-                    Err(e) => format!("Save failed: {e:#}"),
+                    Err(e) => crate::failure("Save", &e),
                 };
             }
         }
@@ -596,43 +608,55 @@ impl eframe::App for App {
         }
         self.busy = self.send_pending || self.sending.is_some() || self.saving.is_some() || self.loading.is_some()
             || (self.renderer.is_some() && self.dirty && (self.auto_update || self.force));
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(32.0, 32.0)));
+        egui::Panel::top("toolbar")
+            .exact_size(TOOLBAR_HEIGHT)
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin { left: 12, right: 12, top: 0, bottom: 0 }))
+            .show(ui, |ui| {
+            // The toolbar is the window's title bar: its empty space moves the window and a
+            // double-click zooms it, as on a native title bar. Widgets added later sit on top.
+            let bar = ui.interact(ui.max_rect(), ui.scope_id().with("title bar"), egui::Sense::click_and_drag());
+            if bar.drag_started_by(egui::PointerButton::Primary) { ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag); }
+            if bar.double_clicked() {
+                let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            let window_center = ui.max_rect().center().x;
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                // Room for the macOS traffic-light buttons (hidden in full screen), plus a gap.
+                #[cfg(target_os = "macos")]
+                if !ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false)) { ui.add_space(macos_titlebar::BUTTONS_END + 10.0); }
+                ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(22.0, 22.0)));
                 ui.heading("MOYA");
+                ui.add_space(8.0);
                 if ui.button("Open…").on_hover_text("Open image or .moya project (Cmd/Ctrl+O)").clicked() {
                     self.open_dialog();
                 }
                 self.project_controls(ui);
+                ui.add_space(4.0);
                 ui.separator();
+                ui.add_space(4.0);
                 let undo = ui.add_enabled(self.history.can_undo(), egui::Button::new(" ").min_size(egui::vec2(30.0, 26.0)));
                 paint_toolbar_icon(ui, &undo, 0);
+                theme::name_button(&undo, "Undo");
                 if undo.on_hover_text("Undo (Cmd/Ctrl+Z)").clicked() {
                     self.restore_history(false);
                 }
                 let redo = ui.add_enabled(self.history.can_redo(), egui::Button::new(" ").min_size(egui::vec2(30.0, 26.0)));
                 paint_toolbar_icon(ui, &redo, 1);
+                theme::name_button(&redo, "Redo");
                 if redo.on_hover_text("Redo (Cmd/Ctrl+Shift+Z)").clicked() {
                     self.restore_history(true);
                 }
                 let title = self.document_title();
-                let right_width = if self.session.is_some() { 390.0 } else { 170.0 };
-                ui.allocate_ui_with_layout(egui::vec2((ui.available_width() - right_width).max(0.0), 32.0),
-                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| { ui.weak(title); });
-                if let Some(session) = &self.session {
-                    let send_hint = format!("Send HQ result to {} (document {}; Cmd+Enter)", session.document.name, session.document.id);
-                    if ui.add_enabled(self.session_ready && self.sending.is_none() && !self.send_pending,
-                        egui::Button::new(egui::RichText::new("Send to Photoshop").color(theme::ACCENT))
-                            .stroke(egui::Stroke::new(1.0, theme::ACCENT)))
-                        .on_hover_text(send_hint).clicked() {
-                        self.queue_send();
-                    }
-                    if ui.small_button("Cancel").on_hover_text("Cancel Photoshop session").clicked() {
-                        self.cancel_session();
-                        self.status = "Photoshop session cancelled".into();
-                    }
-                    if self.send_pending || self.sending.is_some() { ui.spinner(); }
-                }
+                let left_end = ui.cursor().left();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let settings = ui.menu_button("   ", |ui| {
+                    ui.checkbox(&mut self.updates.enabled, "Check for updates")
+                        .on_hover_text("On launch, contact GitHub at most once per day. Changes apply to the next launch.");
+                }).response.on_hover_text("Settings");
+                paint_toolbar_icon(ui, &settings, 2);
+                theme::name_button(&settings, "Settings");
                 let export = ui.add(egui::Button::new(egui::RichText::new("Export  ▾").strong().color(ui.visuals().panel_fill))
                     .fill(theme::ACCENT).min_size(egui::vec2(86.0, 24.0)))
                     .on_hover_text("Export HQ image (Cmd/Ctrl+E)");
@@ -649,23 +673,31 @@ impl eframe::App for App {
                         ui.close();
                     }
                 });
-                let settings = ui.menu_button("   ", |ui| {
-                    ui.checkbox(&mut self.updates.enabled, "Check for updates")
-                        .on_hover_text("On launch, contact GitHub at most once per day. Changes apply to the next launch.");
-                    if ui.button("Reset selected layer").clicked() {
-                        self.status.clear();
-                        self.hover_params = None;
-                        let index = self.selected_index();
-                        self.layers[index].settings.params = Params::default();
-                        self.xray = false;
-                        self.solo = false;
-                        self.auto_update = true;
-                        self.layers[index].mask.enabled = false;
-                        self.layers[index].mask.tool = mask::Tool::None;
-                        ui.close();
+                // Right-to-left: the session controls end up left of Export as Send, Cancel, spinner.
+                if let Some(send_hint) = self.session.as_ref().map(|session|
+                    format!("Send HQ result to {} (document {}; Cmd+Enter)", session.document.name, session.document.id)) {
+                    if self.send_pending || self.sending.is_some() { ui.spinner(); }
+                    let cancel = ui.small_button("Cancel").on_hover_text("Cancel Photoshop session").clicked();
+                    if ui.add_enabled(self.session_ready && self.sending.is_none() && !self.send_pending,
+                        egui::Button::new(egui::RichText::new("Send to Photoshop").color(theme::ACCENT))
+                            .stroke(egui::Stroke::new(1.0, theme::ACCENT)))
+                        .on_hover_text(send_hint).clicked() {
+                        self.queue_send();
                     }
-                }).response.on_hover_text("Settings");
-                paint_toolbar_icon(ui, &settings, 2);
+                    if cancel {
+                        self.cancel_session();
+                        self.status = "Photoshop session cancelled".into();
+                    }
+                }
+                // Document title: centered on the window like a native title, or within the free
+                // space between the two groups when that is too narrow.
+                let free = egui::Rect::from_x_y_ranges(left_end + 8.0..=ui.cursor().right() - 8.0, ui.max_rect().y_range());
+                let galley = ui.painter().layout_no_wrap(title, egui::TextStyle::Body.resolve(ui.style()), ui.visuals().weak_text_color());
+                let half = galley.size().x / 2.0;
+                let x = if window_center - half >= free.left() && window_center + half <= free.right() { window_center } else { free.center().x };
+                let pos = egui::pos2(x - half, free.center().y - galley.size().y / 2.0);
+                ui.painter().with_clip_rect(free).galley(pos, galley, ui.visuals().weak_text_color());
+                });
             });
         });
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -695,7 +727,7 @@ impl eframe::App for App {
                         self.force = true;
                         self.dirty = true;
                     }
-                    theme::switch(ui, &mut self.auto_update).on_hover_text("Render draft preview whenever parameters change");
+                    theme::switch(ui, &mut self.auto_update, "Live preview").on_hover_text("Render draft preview whenever parameters change");
                     ui.label("Live");
                 });
             });
@@ -770,6 +802,23 @@ impl eframe::App for App {
     }
 }
 
+/// Status-bar text for a failed action: what failed, why, and (for common file-system
+/// causes) what to do about it.
+pub(crate) fn failure(action: &str, error: &anyhow::Error) -> String {
+    use std::io::ErrorKind;
+    let hint = error.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>()).and_then(|io| match io.kind() {
+        ErrorKind::PermissionDenied => Some("Moya isn't allowed to access that location: check its permissions, or choose another folder."),
+        ErrorKind::NotFound => Some("The file or folder no longer exists: choose it again."),
+        ErrorKind::StorageFull => Some("The disk is full: free up space and try again."),
+        ErrorKind::ReadOnlyFilesystem => Some("That disk is read-only: choose another folder."),
+        _ => None,
+    });
+    match hint {
+        Some(hint) => format!("{action} failed: {error:#}. {hint}"),
+        None => format!("{action} failed: {error:#}"),
+    }
+}
+
 fn paint_toolbar_icon(ui: &egui::Ui, response: &egui::Response, kind: u8) {
     let center = response.rect.center();
     let color = if response.enabled() { ui.visuals().text_color() } else { ui.visuals().weak_text_color().gamma_multiply(0.45) };
@@ -795,6 +844,15 @@ fn paint_toolbar_icon(ui: &egui::Ui, response: &egui::Response, kind: u8) {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    #[test]
+    fn failure_names_io_cause_through_context_and_stays_plain_otherwise() {
+        let denied = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).context("saving /x.moya");
+        let message = failure("Project save", &denied);
+        assert!(message.starts_with("Project save failed: saving /x.moya"), "{message}");
+        assert!(message.contains("isn't allowed to access"), "{message}");
+        assert_eq!(failure("Open", &anyhow::anyhow!("unsupported format")), "Open failed: unsupported format");
+    }
 
     #[test]
     fn hidden_selected_layer_keeps_composite_fallback_in_xray() {
