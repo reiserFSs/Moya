@@ -185,7 +185,16 @@ fn remove_owned_discovery(path: &Path, token: &str) {
 }
 
 fn bind_loopback(port: u16) -> Result<Vec<TcpListener>> {
-    let ipv4 = TcpListener::bind(("127.0.0.1", port))
+    let explain = |error: io::Error| {
+        let reason = match error.kind() {
+            io::ErrorKind::AddrInUse => format!("port {port} is already used by another program"),
+            // Windows reports reserved ("excluded") ports as access denied (WSAEACCES).
+            io::ErrorKind::PermissionDenied => format!("port {port} is reserved or blocked on this computer (Windows: see `netsh interface ipv4 show excludedportrange protocol=tcp`)"),
+            _ => return anyhow::Error::from(error),
+        };
+        anyhow::Error::from(error).context(reason)
+    };
+    let ipv4 = TcpListener::bind(("127.0.0.1", port)).map_err(explain)
         .context("starting IPv4 Photoshop bridge")?;
     let port = ipv4.local_addr()?.port();
     let mut listeners = vec![ipv4];
@@ -195,7 +204,7 @@ fn bind_loopback(port: u16) -> Result<Vec<TcpListener>> {
             || matches!(error.raw_os_error(), Some(47 | 97 | 10047)) => {
             eprintln!("IPv6 loopback unavailable; Photoshop bridge uses IPv4 only: {error}");
         }
-        Err(error) => return Err(error).context("starting IPv6 Photoshop bridge"),
+        Err(error) => return Err(explain(error)).context("starting IPv6 Photoshop bridge"),
     }
     for listener in &listeners { listener.set_nonblocking(true)?; }
     Ok(listeners)

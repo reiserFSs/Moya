@@ -143,6 +143,9 @@ struct App {
     loading: Option<(u64, PathBuf, Option<u64>)>,
     saving: Option<mpsc::Receiver<anyhow::Result<PathBuf>>>,
     bridge: Option<bridge::Bridge>,
+    /// Why the Photoshop bridge could not start; shown permanently in the status bar, since the
+    /// transient status line is overwritten as soon as an image opens.
+    bridge_error: Option<String>,
     session: Option<bridge::Edit>,
     session_ready: bool,
     send_pending: bool,
@@ -224,6 +227,7 @@ impl App {
             loading: None,
             saving: None,
             bridge: None,
+            bridge_error: None,
             session: None,
             session_ready: false,
             send_pending: false,
@@ -236,7 +240,7 @@ impl App {
         };
         match bridge::Bridge::start(cc.egui_ctx.clone()) {
             Ok(bridge) => app.bridge = Some(bridge),
-            Err(error) => app.status = format!("Photoshop bridge unavailable: {error:#}"),
+            Err(error) => app.bridge_error = Some(format!("{error:#}")),
         }
         if let Some(path) = path {
             app.open(&path);
@@ -729,6 +733,11 @@ impl eframe::App for App {
                     }
                     theme::switch(ui, &mut self.auto_update, "Live preview").on_hover_text("Render draft preview whenever parameters change");
                     ui.label("Live");
+                    if let Some(error) = &self.bridge_error {
+                        ui.separator();
+                        ui.colored_label(ui.visuals().warn_fg_color, "Photoshop connection off")
+                            .on_hover_text(format!("Photoshop can't connect to Moya: {error}\nQuit other Moya windows or free the port, then restart Moya."));
+                    }
                 });
             });
         });

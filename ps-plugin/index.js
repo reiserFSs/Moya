@@ -271,7 +271,10 @@ async function receive(message) {
   }
 }
 async function connectOnce() {
-  const info = JSON.parse(await (await fileAt(discoveryPath)).read());
+  let entry;
+  try { entry = await fileAt(discoveryPath); }
+  catch (_) { throw Object.assign(new Error("Moya is not accepting Photoshop connections."), { noDiscovery: true }); }
+  const info = JSON.parse(await entry.read());
   if (info.version !== 2 || info.port !== 47811 || !/^[a-fA-F0-9]{32}$/.test(info.token)) throw new Error("Invalid Moya bridge discovery file.");
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, "0")).join("");
   const proof = sha256(info.token + nonce);
@@ -309,12 +312,17 @@ async function connect() {
     status("Launching Moya…", "busy");
     const launchError = await shell.openPath(await resolveAppPath(), "Launch Moya to edit this Photoshop document.");
     if (launchError) throw new Error(launchError);
-    const deadline = Date.now() + 15000;
+    // A cold first start (Windows Defender scanning a new exe, GPU setup) can take a while.
+    const deadline = Date.now() + 30000;
     let lastError;
     do {
       await delay(300);
       try { return await connectOnce(); } catch (error) { lastError = error; }
+      if (Date.now() > deadline - 25000) status("Waiting for Moya to open its Photoshop connection…", "busy");
     } while (Date.now() < deadline);
+    if (lastError && lastError.noDiscovery) {
+      throw new Error("Moya didn't open its Photoshop connection. If the Moya window is open, its status bar says why; otherwise start Moya yourself and try again.");
+    }
     throw lastError;
   })();
   try { return await connecting; } finally { connecting = null; }

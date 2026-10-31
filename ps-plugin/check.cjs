@@ -170,7 +170,7 @@ for (const [text, digest] of [
 ]) assert.equal(vm.runInContext(`sha256(${JSON.stringify(text)})`, context), digest);
 const manifest = JSON.parse(fs.readFileSync(`${__dirname}/manifest.json`, "utf8"));
 assert.equal(manifest.id, "local.moya.bridge");
-assert.equal(manifest.version, "1.1.1");
+assert.equal(manifest.version, "1.1.2");
 assert.deepEqual(manifest.requiredPermissions.launchProcess.extensions, ["", ".app", ".exe"]);
 assert.deepEqual(manifest.requiredPermissions.network.domains, ["ws://127.0.0.1:47811", "ws://localhost/"]);
 assert.equal(manifest.entrypoints.filter(entry => entry.type === "command").length, 2);
