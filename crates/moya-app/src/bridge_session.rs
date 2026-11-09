@@ -5,6 +5,7 @@ use moya_core::{LayerBlend, RenderMode};
 use moya_gpu::{Depth, Gpu, Image};
 use moya_io::SampleDepth;
 use moya_pipeline::{LayerInputs, RenderRequest, ViewFlags};
+use std::path::PathBuf;
 
 impl App {
     pub(super) fn bridge_reply(&self, value: serde_json::Value) {
@@ -53,6 +54,17 @@ impl App {
     }
 
     fn prepare_bridge_send(&mut self, session: &bridge::Edit) -> anyhow::Result<(workers::SendBatch, serde_json::Value)> {
+        // Render and convert under GPU error capture: running out of video memory must fail
+        // this send (reported to Photoshop, retryable), not close Moya. Writers start only after.
+        let gpu = self.gpu.clone();
+        let rendered = gpu.capture_errors(|| self.render_bridge_send(session));
+        let (images, message, project_path, project) = rendered.inspect_err(|_| self.drop_render_caches())??;
+        Ok((workers::SendBatch::new(self.egui_ctx.clone(), self.gpu.clone(), images, project_path, project), message))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn render_bridge_send(&mut self, session: &bridge::Edit)
+        -> anyhow::Result<(Vec<(PathBuf, workers::ExportImage)>, serde_json::Value, PathBuf, moya_project::Project)> {
         let depth = match session.document.depth {
             8 => SampleDepth::U8, 16 => SampleDepth::U16, _ => SampleDepth::F32,
         };
@@ -123,7 +135,7 @@ impl App {
         result.validate()?;
         let mut message = serde_json::to_value(result)?;
         message["type"] = serde_json::json!("result");
-        Ok((workers::SendBatch::new(self.egui_ctx.clone(), self.gpu.clone(), images, project_path, project), message))
+        Ok((images, message, project_path, project))
     }
 
     /// Opens a Photoshop edit; called once the unsaved-changes check has passed.

@@ -542,6 +542,30 @@ impl Gpu {
         self.complete_profile(&mut pending);
         self.submit_pending(&mut pending);
     }
+    /// Runs `work` with GPU errors (out of memory, validation, internal) captured instead of
+    /// reaching the device's uncaptured-error handler, which panics and closes the app. Pending
+    /// commands are submitted before the scopes close so their errors are included. On an error
+    /// the idle texture pool is emptied: a failed allocation must not be reused later, outside
+    /// any scope. Callers should also drop caches that may hold images from `work`.
+    /// Error scopes are per thread: only GPU calls made on this thread are covered.
+    pub fn capture_errors<T>(&self, work: impl FnOnce() -> T) -> anyhow::Result<T> {
+        let scopes = [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Validation, wgpu::ErrorFilter::Internal]
+            .map(|filter| self.device.push_error_scope(filter));
+        let value = work();
+        self.flush();
+        // Pop innermost first.
+        let [memory, validation, internal] = scopes;
+        let errors = [internal.pop(), validation.pop(), memory.pop()].map(pollster::block_on);
+        let Some(error) = errors.into_iter().flatten().next() else { return Ok(value) };
+        drop(value);
+        self.flush();
+        self.trim_idle(0);
+        Err(match error {
+            wgpu::Error::OutOfMemory { .. } => anyhow::anyhow!(
+                "the graphics card ran out of memory. Close other GPU-heavy apps, use fewer layers, or reduce the document size, then try again"),
+            other => anyhow::anyhow!("GPU error: {other}"),
+        })
+    }
     fn submit_pending(&self, pending: &mut Pending) -> Option<wgpu::SubmissionIndex> {
         let encoder = pending.encoder.take()?;
         let index = self.queue.submit([encoder.finish()]);

@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "windows"))]
 
 use anyhow::{Context, Result, bail, ensure};
 use moya_core::{LayerBlend, LayerSettings};
@@ -31,18 +31,21 @@ impl Drop for TestApp {
             let pid = child.id();
             if matches!(child.try_wait(), Ok(None)) {
                 // Target only this child; never quit another running Moya instance.
-                let script = format!("tell application \"System Events\"\nset targetProcess to first process whose unix id is {pid}\ntell targetProcess\nset frontmost to true\nkeystroke \"q\" using command down\nend tell\nend tell");
-                let mut quit = Command::new("/usr/bin/osascript").args(["-e", &script])
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok();
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                if let Some(quit) = &mut quit {
-                    if !matches!(quit.try_wait(), Ok(Some(_))) {
-                        let _ = quit.kill();
+                #[cfg(target_os = "macos")]
+                {
+                    let script = format!("tell application \"System Events\"\nset targetProcess to first process whose unix id is {pid}\ntell targetProcess\nset frontmost to true\nkeystroke \"q\" using command down\nend tell\nend tell");
+                    let mut quit = Command::new("/usr/bin/osascript").args(["-e", &script])
+                        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok();
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(50));
                     }
-                    let _ = quit.wait();
+                    if let Some(quit) = &mut quit {
+                        if !matches!(quit.try_wait(), Ok(Some(_))) {
+                            let _ = quit.kill();
+                        }
+                        let _ = quit.wait();
+                    }
                 }
                 if !matches!(child.try_wait(), Ok(Some(_))) {
                     let _ = child.kill();
@@ -138,9 +141,9 @@ fn assert_error(socket: &mut WebSocket<TcpStream>, request: Value, previous: Opt
 }
 
 /// Exercises the real GUI application's Open -> HQ render -> Send path.
-/// Requires an interactive macOS desktop and no existing Moya bridge server.
+/// Requires an interactive desktop (macOS or Windows) and no existing Moya bridge server.
 #[test]
-#[ignore = "launches the macOS GUI and uses the fixed Moya bridge port"]
+#[ignore = "launches the GUI app and uses the fixed Moya bridge port"]
 fn bridge_protocol_depth_roundtrips() -> Result<()> {
     let reservation = TcpListener::bind(ADDRESS).with_context(|| {
         format!("bridge acceptance test needs {ADDRESS} free; quit the existing Moya/server yourself (the test will not kill it)")

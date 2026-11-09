@@ -40,6 +40,7 @@ use std::{
 };
 
 fn main() -> eframe::Result {
+    install_crash_log();
     #[cfg(target_os = "macos")]
     let (open_handler, open_documents) = macos_open::install();
     let path = std::env::args_os().skip(1)
@@ -241,6 +242,13 @@ impl App {
         match bridge::Bridge::start(cc.egui_ctx.clone()) {
             Ok(bridge) => app.bridge = Some(bridge),
             Err(error) => app.bridge_error = Some(format!("{error:#}")),
+        }
+        // A crash log from the previous run: mention it once, then keep it as crash-previous.log.
+        if let Ok(log) = platform_paths::crash_log_path() && log.exists() {
+            let previous = log.with_file_name("crash-previous.log");
+            if std::fs::rename(&log, &previous).is_ok() {
+                app.status = format!("Moya closed unexpectedly last time; details are in {}", previous.display());
+            }
         }
         if let Some(path) = path {
             app.open(&path);
@@ -498,6 +506,20 @@ impl App {
     }
 
     fn render_hq(&mut self, glow: bool, opaque: bool, depth: SampleDepth) -> anyhow::Result<workers::ExportImage> {
+        let gpu = self.gpu.clone();
+        let rendered = gpu.capture_errors(|| self.render_hq_uncaptured(glow, opaque, depth));
+        self.dirty = true;
+        self.force = true;
+        rendered.inspect_err(|_| self.drop_render_caches())?
+    }
+
+    /// After a captured GPU error, cached images may refer to failed allocations; rebuild them.
+    pub(crate) fn drop_render_caches(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() { renderer.clear_caches(); }
+        self.canvas.invalidate();
+    }
+
+    fn render_hq_uncaptured(&mut self, glow: bool, opaque: bool, depth: SampleDepth) -> anyhow::Result<workers::ExportImage> {
         let flags = ViewFlags { xray: false, solo: false, host_is_float: self.flags().host_is_float };
         let inputs: Vec<_> = self.layers.iter().map(|layer| LayerInputs {
             settings: &layer.settings, mask: layer.mask.gpu_image(), mask_generation: layer.mask.generation(),
@@ -510,13 +532,10 @@ impl App {
         let from = if !glow && flags.host_is_float { Depth::Float } else { Depth::Eight };
         let to = match depth { SampleDepth::U8 => Depth::Eight, SampleDepth::U16 => Depth::Sixteen, SampleDepth::F32 => Depth::Float };
         let image = if from != to { self.gpu.convert_depth(&image, from, to) } else { image };
-        let pic = workers::ExportImage {
+        Ok(workers::ExportImage {
             image, depth, opaque,
             icc_profile: self.picture.as_ref().and_then(|p| p.icc_profile.clone()),
-        };
-        self.dirty = true;
-        self.force = true;
-        Ok(pic)
+        })
     }
 
     fn trim_idle(&self) {
@@ -809,6 +828,21 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+/// Records panics in `crash.log` (overwritten per crash) before the default hook runs. Windows
+/// release builds have no console, so without this a crash just closes the window.
+fn install_crash_log() {
+    let Ok(path) = platform_paths::crash_log_path() else { return };
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let report = format!("Moya {} crashed on thread '{}'\n{info}\n\nBacktrace:\n{}\n",
+            env!("CARGO_PKG_VERSION"), thread.name().unwrap_or("unnamed"), std::backtrace::Backtrace::force_capture());
+        if let Some(directory) = path.parent() { let _ = std::fs::create_dir_all(directory); }
+        let _ = std::fs::write(&path, report);
+        default(info);
+    }));
 }
 
 /// Status-bar text for a failed action: what failed, why, and (for common file-system

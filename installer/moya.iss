@@ -17,9 +17,9 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesAssociations=yes
-CloseApplications=yes
-CloseApplicationsFilter=Moya.exe
-RestartApplications=no
+; Restart Manager can't close Moya (winit ignores end-session messages); PrepareToInstall and
+; InitializeUninstall ask it to quit with WM_CLOSE instead.
+CloseApplications=no
 LicenseFile=..\LICENSE
 SetupIconFile=..\crates\moya-app\assets\Moya.ico
 UninstallDisplayIcon={app}\Moya.exe
@@ -48,45 +48,125 @@ Root: HKCU; Subkey: "Software\Classes\Moya.Project\DefaultIcon"; ValueType: stri
 Root: HKCU; Subkey: "Software\Classes\Moya.Project\shell\open\command"; ValueType: string; ValueData: """{app}\Moya.exe"" ""%1"""
 
 [Code]
-function PhotoshopRunning: Boolean;
+var
+  // Shown on the Finished page. Message boxes at this step can open behind Creative Cloud
+  // and make setup look stuck at the end of the progress bar.
+  PluginNote: String;
+
+function ProcessRunning(Image: String): Boolean;
 var
   Code: Integer;
 begin
   Result := Exec(ExpandConstant('{cmd}'),
-    '/C tasklist /FI "IMAGENAME eq Photoshop.exe" | find /I "Photoshop.exe"',
+    '/C tasklist /FI "IMAGENAME eq ' + Image + '" | find /I "' + Image + '"',
     '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
 end;
 
-// Plugin problems never fail the app install.
+function PhotoshopRunning: Boolean;
+begin
+  Result := ProcessRunning('Photoshop.exe');
+end;
+
+// Asks a running Moya to quit the way its close button does (taskkill without /F sends
+// WM_CLOSE), so it shows its own Save / Discard prompt for unsaved work. Windows' Restart
+// Manager cannot close it: winit ignores the end-session messages it sends, and replacing the
+// running Moya.exe then fails at the end of the install. Returns True once Moya has quit.
+function CloseMoya(TimeoutMs: Integer): Boolean;
+var
+  Code, Waited: Integer;
+begin
+  Result := not ProcessRunning('Moya.exe');
+  if Result then Exit;
+  Log('Asking the running Moya to quit');
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM Moya.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Waited := 0;
+  while ProcessRunning('Moya.exe') and (Waited < TimeoutMs) do begin
+    Sleep(250);
+    Waited := Waited + 250;
+  end;
+  Result := not ProcessRunning('Moya.exe');
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  if CloseMoya(15000) then
+    Result := ''
+  else
+    Result := 'Moya is still running, probably showing a Save / Discard prompt for unsaved changes. ' +
+      'Save or discard them in Moya and quit it, then click Back and Next to continue.';
+end;
+
+function InitializeUninstall: Boolean;
+begin
+  Result := CloseMoya(15000);
+  if not Result then
+    SuppressibleMsgBox('Moya is still running. Save or discard your changes in Moya, quit it, then uninstall again.',
+      mbError, MB_OK, IDOK);
+end;
+
+function PsQuote(S: String): String;
+begin
+  StringChangeEx(S, '''', '''''', True);
+  Result := '''' + S + '''';
+end;
+
+// Runs Adobe's plugin installer hidden, killed after TimeoutMs: it can wait on a prompt
+// nobody sees. Returns its exit code, 124 on timeout, -1 if it could not run.
+function RunUpia(Upi, Ccx: String; TimeoutMs: Integer): Integer;
+var
+  Script: String;
+  Code: Integer;
+begin
+  // The .ccx path has spaces, so UPIA needs it in double quotes; \" survives the outer
+  // -Command "..." quoting as a literal quote.
+  Script := '$p = Start-Process -FilePath ' + PsQuote(Upi) +
+    ' -ArgumentList ''/install'',' + PsQuote('\"' + Ccx + '\"') + ' -WindowStyle Hidden -PassThru; ' +
+    'if (-not $p.WaitForExit(' + IntToStr(TimeoutMs) + ')) { $p.Kill(); exit 124 }; exit $p.ExitCode';
+  if Exec('powershell.exe', '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Script + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    Result := Code
+  else
+    Result := -1;
+end;
+
+// Plugin problems never fail or block the app install.
 procedure InstallPlugin;
 var
   Ccx, Upi: String;
   Code: Integer;
 begin
   if PhotoshopRunning then begin
-    SuppressibleMsgBox('Photoshop is running, so the plugin was not installed. ' +
-      'Quit Photoshop and double-click "Moya Photoshop Plugin.ccx" in the Moya install folder.',
-      mbInformation, MB_OK, IDOK);
+    PluginNote := 'Photoshop was running, so the Photoshop plugin was not installed. ' +
+      'Quit Photoshop and double-click "Moya Photoshop Plugin.ccx" in the Moya install folder.';
     Exit;
   end;
   Ccx := ExpandConstant('{app}\Moya Photoshop Plugin.ccx');
   Upi := ExpandConstant('{commoncf}\Adobe\Adobe Desktop Common\RemoteComponents\UPI\UnifiedPluginInstallerAgent\UnifiedPluginInstallerAgent.exe');
-  // Windows UPIA uses /install (macOS uses --install). If it isn't available or fails,
-  // open the .ccx so Creative Cloud installs it, like a double-click.
-  if FileExists(Upi) and Exec(Upi, '/install "' + Ccx + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
-    Exit;
+  WizardForm.StatusLabel.Caption := 'Installing the Photoshop plugin...';
+  WizardForm.FilenameLabel.Caption := '';
+  // Windows UPIA uses /install (macOS uses --install). If it isn't available, fails or
+  // hangs, open the .ccx so Creative Cloud installs it, like a double-click.
+  if FileExists(Upi) then begin
+    Code := RunUpia(Upi, Ccx, 120000);
+    if Code = 0 then Exit;
+    Log('Plugin installer exit code: ' + IntToStr(Code));
+  end;
   if ShellExec('open', Ccx, '', '', SW_SHOWNORMAL, ewNoWait, Code) then
-    SuppressibleMsgBox('Finish the plugin installation in Creative Cloud and approve any prompts.',
-      mbInformation, MB_OK, IDOK)
+    PluginNote := 'To finish installing the Photoshop plugin, approve the prompts in Creative Cloud.'
   else
-    SuppressibleMsgBox('The Photoshop plugin could not be installed automatically; Moya itself is installed. ' +
-      'Double-click "Moya Photoshop Plugin.ccx" in the Moya install folder (Creative Cloud must be installed).',
-      mbError, MB_OK, IDOK);
+    PluginNote := 'The Photoshop plugin could not be installed automatically; Moya itself is installed. ' +
+      'Double-click "Moya Photoshop Plugin.ccx" in the Moya install folder (Creative Cloud must be installed).';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if (CurStep = ssPostInstall) and WizardIsTaskSelected('plugin') then InstallPlugin;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and (PluginNote <> '') then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + PluginNote;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

@@ -27,6 +27,26 @@ fn idle_trim_is_lru_and_clones_are_one_live_texture() {
 }
 
 #[test]
+fn captured_gpu_errors_fail_the_work_instead_of_panicking() {
+    let gpu = Gpu::new_blocking().unwrap();
+    let idle = gpu.fill(4, 4, [0.5; 4]);
+    drop(idle);
+    assert!(gpu.memory_stats().idle_count > 0);
+    // A texture beyond the device limit is a validation error; uncaptured, wgpu would panic.
+    let too_wide = gpu.device().limits().max_texture_dimension_2d + 1;
+    let result = gpu.capture_errors(|| gpu.device().create_texture(&wgpu::TextureDescriptor {
+        label: None, size: wgpu::Extent3d { width: too_wide, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+    }));
+    assert!(result.is_err_and(|error| error.to_string().starts_with("GPU error:")));
+    assert_eq!(gpu.memory_stats().idle_count, 0, "the idle pool is emptied after a GPU error");
+    // The device keeps working, and clean work passes through unchanged.
+    let value = gpu.capture_errors(|| gpu.download_rgba32f(&gpu.fill(1, 1, [0.25, 0.5, 0.75, 1.0]))).unwrap();
+    assert_eq!(value, vec![0.25, 0.5, 0.75, 1.0]);
+}
+
+#[test]
 fn rounding_owned_alias_does_not_mutate_shared_output() {
     let gpu = Gpu::new_blocking().unwrap();
     let original = gpu.fill(1, 1, [0.1234567, 0.2345678, 0.3456789, 1.0]);

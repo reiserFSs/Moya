@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
+        os: [macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +33,10 @@ jobs:
       - name: Test (Windows, WARP)
         if: runner.os == 'Windows'
         run: cargo test --workspace --release -- --nocapture --test-threads=1
+      # The real app through Open -> HQ render -> Send at 8/16/32-bit (ignored locally: GUI + fixed port).
+      - name: Photoshop round trip (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -p moya-app --release --test bridge_protocol -- --ignored --nocapture --test-threads=1
       - name: Check Photoshop plugin
         if: runner.os == 'macOS'
         run: node ps-plugin/check.cjs
@@ -87,3 +91,34 @@ jobs:
           if (Test-Path 'HKCU:\Software\Classes\.moya') { throw '.moya key remains' }
           if (Test-Path -LiteralPath $unkey) { throw 'uninstall entry remains' }
           if ((Get-Content (Join-Path $data 'keep.txt')) -ne 'user data') { throw 'user data touched' }
+      - name: Upgrade over a running Moya with a hanging plugin installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem target/release-dist/Moya-*-windows-x64-setup.exe).FullName
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Moya'
+          function Run($exe, $argList) {
+            $p = Start-Process $exe -ArgumentList $argList -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "$exe exited $($p.ExitCode)" }
+          }
+          Run $setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', '/NORESTART', '/MERGETASKS="!plugin"')
+          $moya = Start-Process (Join-Path $app 'Moya.exe') -PassThru
+          Start-Sleep 5
+          # Stand-in for Adobe's plugin installer that never exits: cmd.exe waits for console input.
+          $upiDir = Join-Path ${env:CommonProgramFiles} 'Adobe\Adobe Desktop Common\RemoteComponents\UPI\UnifiedPluginInstallerAgent'
+          New-Item -ItemType Directory -Force $upiDir | Out-Null
+          Copy-Item "$env:WINDIR\System32\cmd.exe" (Join-Path $upiDir 'UnifiedPluginInstallerAgent.exe')
+          $started = Get-Date
+          # Setup remembers the first install's tasks (plugin off), so select it explicitly.
+          Run $setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', '/NORESTART', '/MERGETASKS="plugin"', "/LOG=$env:RUNNER_TEMP\upgrade.log")
+          "Upgrade took {0:N0} s" -f ((Get-Date) - $started).TotalSeconds
+          if (-not $moya.HasExited) { throw 'running Moya was not closed by the upgrade' }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\upgrade.log" -Pattern 'Plugin installer exit code: 124' -Quiet)) {
+            Get-Content "$env:RUNNER_TEMP\upgrade.log" -Tail 40; throw 'hanging plugin installer was not timed out'
+          }
+          if (-not (Test-Path (Join-Path $app 'Moya.exe'))) { throw 'Moya.exe missing after upgrade' }
+          Get-Process UnifiedPluginInstallerAgent -ErrorAction SilentlyContinue | Stop-Process -Force
+          Remove-Item -Recurse -Force (Join-Path ${env:CommonProgramFiles} 'Adobe')
+          Run (Join-Path $app 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
