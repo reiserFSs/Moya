@@ -93,23 +93,35 @@ impl Document {
     }
 
     pub fn render(&mut self, layers: &[LayerInputs<'_>], request: &RenderRequest) -> DocumentOutput {
-        self.render_inner(layers, request, |_, _, _| {}, true)
+        self.render_inner(layers, request, |_, _, _| {}, true, None)
+    }
+
+    /// Like `render` with layer glows, but hands each layer's glow (hidden layers included, bottom to
+    /// top, as if visible but contributing nothing to the composite or Below inputs) to `sink` and
+    /// releases it, so only one full-size glow is produced at a time. `sink` returns false to stop
+    /// early. `request.want_layer_glows` is ignored; the output's `layer_glows` stays empty.
+    pub fn render_layer_glows(&mut self, layers: &[LayerInputs<'_>], request: &RenderRequest,
+        mut sink: impl FnMut(u64, Image) -> bool) -> DocumentOutput {
+        self.render_inner(layers, request, |_, _, _| {}, true, Some(&mut sink))
     }
 
     /// Checkpoints retain their historical names on single-layer documents.
     /// Every layer runs its full stage chain so each checkpoint fires; finished results are not reused.
     pub fn render_with_checkpoints(&mut self, layers: &[LayerInputs<'_>], req: &RenderRequest,
         checkpoint: impl FnMut(&str, &Image, Depth)) -> DocumentOutput {
-        self.render_inner(layers, req, checkpoint, false)
+        self.render_inner(layers, req, checkpoint, false, None)
     }
 
     fn render_inner(&mut self, layers: &[LayerInputs<'_>], req: &RenderRequest,
-        mut checkpoint: impl FnMut(&str, &Image, Depth), cache_finished: bool) -> DocumentOutput {
+        mut checkpoint: impl FnMut(&str, &Image, Depth), cache_finished: bool,
+        mut sink: Option<&mut dyn FnMut(u64, Image) -> bool>) -> DocumentOutput {
         if req.mode == RenderMode::Hq { self.clear_caches(); }
         if req.mode == RenderMode::Draft { self.invalidate_refine(layers, &req.view); }
         self.layers.retain(|id, _| layers.iter().any(|l| l.settings.id == *id));
+        let streaming=sink.is_some();
+        let want_glows=req.want_layer_glows || streaming;
         let single=layers.iter().filter(|l|l.settings.visible).count()==1;
-        let last_below=layers.iter().rposition(|l|l.settings.visible && l.settings.input==LayerInput::Below);
+        let last_below=layers.iter().rposition(|l|(l.settings.visible||streaming) && l.settings.input==LayerInput::Below);
         let xray_view=req.want_composite && req.view.xray
             && layers.iter().any(|l|l.settings.visible && req.selected==Some(l.settings.id));
         let (w,h) = if req.mode == RenderMode::Hq { (self.geometry.orig_w,self.geometry.orig_h) }
@@ -145,7 +157,8 @@ impl Document {
         let mut stamps = Vec::new();
         for (index,input) in layers.iter().enumerate() {
             let mut settings=input.settings.clone(); settings.sanitize();
-            if !settings.visible { continue; }
+            let visible=settings.visible;
+            if !visible && !streaming { continue; }
             let id=settings.id;
             let entry=self.layers.entry(id).or_insert_with(|| LayerCache {
                 stages:LayerStages::shared(g.clone(),self.source.clone(),self.host_depth),
@@ -204,7 +217,7 @@ impl Document {
                         self.grids.push(Grid{input:entry.input_generation,working:entry.stages.working.as_ref().unwrap().clone()});
                     }
                 }
-                if req.view.xray && want_xray && !req.want_layer_glows && !req.want_glow_composite {
+                if req.view.xray && want_xray && !want_glows && !req.want_glow_composite {
                     entry.stages.ensure_extraction(&settings.params);
                     let heatmap=entry.stages.output_heatmap(&entry.stages.heatmap_cache.as_ref().unwrap().images[0],&settings.params,req.mode);
                     let composite=xray_base.as_ref().map(|base| {
@@ -228,6 +241,8 @@ impl Document {
             };
             let output_generation=output.generation;
             let included=req.solo_layer.is_none_or(|solo|solo==id);
+            let blends_below=visible && last_below.is_some_and(|last|index<last);
+            let blends_out=visible && included && (req.want_composite || req.want_glow_composite);
             let blend=match settings.blend {
                 LayerBlend::Auto if req.view.host_is_float && !req.view.solo=>B::LinearDodge,
                 LayerBlend::Auto|LayerBlend::Screen=>B::Screen,
@@ -236,9 +251,9 @@ impl Document {
                 LayerBlend::Normal=>B::Normal,
             };
             let depth=if req.view.host_is_float && !req.view.solo {Depth::Float} else {Depth::Eight};
-            let linear_glow=(depth==Depth::Float).then(||g.convert_depth(&output.glow,Depth::Eight,Depth::Float));
+            let linear_glow=((blends_below||blends_out) && depth==Depth::Float).then(||g.convert_depth(&output.glow,Depth::Eight,Depth::Float));
             let glow=linear_glow.as_ref().unwrap_or(&output.glow);
-            if last_below.is_some_and(|last|index<last) {
+            if blends_below {
                 below=g.blend(&below,glow,blend,settings.opacity,1.,depth);
                 if let Some(base)=below_working.as_mut() {
                     let small=&output.working_glow;
@@ -246,7 +261,8 @@ impl Document {
                     *base=g.blend(base,linear.as_ref().unwrap_or(small),blend,settings.opacity,1.,depth);
                 }
             }
-            if included {
+            let mut keep_going=true;
+            if visible && included {
                 if req.want_composite && !xray_view {
                     composite=Some(if fast_composite { output.composite } else {
                         let base=composite.get_or_insert_with(|| {
@@ -259,12 +275,19 @@ impl Document {
                     let base=glow_composite.get_or_insert_with(||g.fill(w,h,[0.,0.,0.,1.]));
                     glow_composite=Some(g.blend(base,glow,blend,settings.opacity,1.,depth));
                 }
-                if req.want_layer_glows {layer_glows.push((id,output.glow));}
+            }
+            drop(linear_glow);
+            if included && want_glows {
+                match sink.as_mut() {
+                    Some(sink)=>keep_going=sink(id,output.glow),
+                    None=>layer_glows.push((id,output.glow)),
+                }
             }
             if want_xray {xray=Some(output.xray);}
-            stamps.push(Stamp{id,generation:output_generation,opacity:settings.opacity.to_bits(),blend:settings.blend});
+            if visible {stamps.push(Stamp{id,generation:output_generation,opacity:settings.opacity.to_bits(),blend:settings.blend});}
             // Render one layer at a time and reclaim cached descendants before the next HQ layer.
             if req.mode == RenderMode::Hq { self.layers.remove(&id); } else { self.trim_cache(req.selected); }
+            if !keep_going { break; }
         }
         if req.want_composite && req.view.xray {
             if let Some(heatmap)=&xray {

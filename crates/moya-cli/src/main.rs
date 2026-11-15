@@ -212,13 +212,6 @@ fn load_input(options: &Options) -> Result<(Picture, Vec<ProjectLayer>, Option<u
     }
 }
 
-fn mask_pixels(mask: &MaskData) -> Vec<f32> {
-    mask.data.iter().flat_map(|&value| {
-        let value = value as f32 / 65535.0;
-        [value, value, value, 1.0]
-    }).collect()
-}
-
 fn median(times: &mut [f64]) -> f64 {
     times.sort_unstable_by(f64::total_cmp);
     let middle = times.len() / 2;
@@ -272,7 +265,7 @@ fn run(options: Options) -> Result<()> {
         layer.mask.as_ref().filter(|mask| mask.enabled).map(|mask| {
             ensure!(mask.width <= limit && mask.height <= limit,
                 "mask {}×{} exceeds this GPU's {limit} px texture limit", mask.width, mask.height);
-            Ok(gpu.upload_rgba32f(mask.width, mask.height, &mask_pixels(mask)))
+            Ok(gpu.upload_mask_u16(mask.width, mask.height, &mask.data))
         }).transpose()
     }).collect::<Result<Vec<_>>>()?;
     let inputs: Vec<_> = layers.iter().zip(&masks).map(|(layer, mask)| LayerInputs {
@@ -443,7 +436,6 @@ mod tests {
             assert_eq!(loaded_layers, layers);
             assert_eq!(selected, Some(9));
         }
-        assert_eq!(mask_pixels(&mask), vec![0., 0., 0., 1., 1., 1., 1., 1.]);
         Ok(())
     }
 

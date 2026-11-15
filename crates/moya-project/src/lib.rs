@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub const VERSION: u32 = 1;
+/// Archive, entry and embedded-source limit.
 const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// Total decoded mask memory (u16 per pixel). Bounds what a small, highly compressed PNG set can
+/// make the loader allocate, while fitting real projects: ~45 masks on a 92 MP photo, or 16 at
+/// the 16384-px maximum. (A shared 1 GiB cap rejected 6 masks on a 90 MP photo.)
+const MAX_MASK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_JSON: u64 = 4 * 1024 * 1024;
 const MAX_SIDE: u32 = 16384;
@@ -57,13 +62,14 @@ fn validate(p: &Project) -> Result<()> {
             decoded += bytes;
         }
     }
-    ensure!(decoded <= MAX_BYTES, "decoded masks exceed project size limit");
+    ensure!(decoded <= MAX_MASK_BYTES, "layer masks need {} MiB, over the {} MiB project limit; remove masks from some layers",
+        decoded >> 20, MAX_MASK_BYTES >> 20);
     ensure!(p.selected.is_none_or(|id| ids.contains(&id)), "selected layer is missing");
     match &p.source {
         SourceRef::Path(path) => ensure!(!path.as_os_str().is_empty(), "source path is empty"),
         SourceRef::Embedded { file_name, bytes } => {
             ensure!(source_name(file_name), "invalid embedded source filename");
-            ensure!(!bytes.is_empty() && bytes.len() as u64 + decoded <= MAX_BYTES, "embedded source exceeds project size limit or is empty");
+            ensure!(!bytes.is_empty() && bytes.len() as u64 <= MAX_BYTES, "embedded source exceeds project size limit or is empty");
         }
     }
     Ok(())
@@ -162,7 +168,7 @@ fn read_archive<R: Read + Seek>(reader: R) -> Result<Project> {
         }
     };
     let mut layers = Vec::with_capacity(manifest.layers.len());
-    let mut decoded = match &source { SourceRef::Embedded { bytes, .. } => bytes.len() as u64, SourceRef::Path(_) => 0 };
+    let mut decoded = 0u64;
     for mut layer in manifest.layers {
         let mask = if let Some(name) = layer.mask {
             ensure!(name == format!("masks/{}.png", layer.settings.id), "invalid layer mask entry");
@@ -170,7 +176,7 @@ fn read_archive<R: Read + Seek>(reader: R) -> Result<Project> {
             let mut decoder = image::codecs::png::PngDecoder::new(Cursor::new(bytes))?;
             let (width, height) = decoder.dimensions();
             decoded = decoded.checked_add(mask_size(width, height)?).context("decoded mask size overflow")?;
-            ensure!(decoded <= MAX_BYTES, "decoded masks exceed project size limit");
+            ensure!(decoded <= MAX_MASK_BYTES, "layer masks need {} MiB, over the {} MiB project limit", decoded >> 20, MAX_MASK_BYTES >> 20);
             ensure!(decoder.color_type() == image::ColorType::L16, "project mask must be a 16-bit grayscale PNG");
             let mut limits = image::Limits::default();
             limits.max_image_width = Some(MAX_SIDE);

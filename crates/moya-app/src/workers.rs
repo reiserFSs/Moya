@@ -182,6 +182,12 @@ impl SendWriter {
             }
         }
     }
+    /// Block until the writer finishes (its image is released by then). `None` if already reported.
+    fn wait(&self) -> Option<anyhow::Result<()>> {
+        if self.completed.get() { return None; }
+        self.completed.set(true);
+        Some(self.results.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("output writer stopped"))))
+    }
     pub fn cancel(&self) {
         let mut state = self.state.lock();
         state.cancelled = true;
@@ -194,28 +200,35 @@ impl Drop for SendWriter {
     fn drop(&mut self) { self.cancel(); }
 }
 
-/// Own every TIFF and the project until the host acknowledges the whole result.
+/// Own every TIFF and the project until the host acknowledges the whole result. Images are
+/// pushed as they render; at most one earlier writer (and its image) is alive per push.
 pub struct SendBatch {
+    ctx: egui::Context,
+    gpu: Arc<Gpu>,
     writers: Vec<SendWriter>,
     remaining: Cell<usize>,
     completed: Cell<bool>,
 }
 impl SendBatch {
-    pub fn new(
-        ctx: egui::Context,
-        gpu: Arc<Gpu>,
-        images: Vec<(PathBuf, ExportImage)>,
-        project_path: PathBuf,
-        project: moya_project::Project,
-    ) -> Self {
-        let mut writers = Vec::with_capacity(images.len() + 1);
-        for (path, image) in images {
-            writers.push(SendWriter::new(ctx.clone(), gpu.clone(), path, image));
+    pub fn new(ctx: egui::Context, gpu: Arc<Gpu>) -> Self {
+        Self { ctx, gpu, writers: Vec::new(), remaining: Cell::new(0), completed: Cell::new(false) }
+    }
+    /// Wait for the previous writer, then start writing `image`; an earlier writer's failure is returned.
+    pub fn push(&mut self, path: PathBuf, image: ExportImage) -> anyhow::Result<()> {
+        if let Some(result) = self.writers.last().and_then(SendWriter::wait) {
+            result?;
+            self.remaining.set(self.remaining.get() - 1);
         }
-        writers.push(SendWriter::with_writer(ctx, project_path, move |staging| {
+        self.writers.push(SendWriter::new(self.ctx.clone(), self.gpu.clone(), path, image));
+        self.remaining.set(self.remaining.get() + 1);
+        Ok(())
+    }
+    /// Start the project writer; call after all images are pushed.
+    pub fn finish(&mut self, project_path: PathBuf, project: moya_project::Project) {
+        self.writers.push(SendWriter::with_writer(self.ctx.clone(), project_path, move |staging| {
             moya_project::save(staging, &project)
         }));
-        Self { remaining: Cell::new(writers.len()), writers, completed: Cell::new(false) }
+        self.remaining.set(self.remaining.get() + 1);
     }
     pub fn poll(&self) -> Option<anyhow::Result<()>> {
         if self.completed.get() { return None; }
@@ -442,7 +455,10 @@ mod tests {
             done_tx.send(()).unwrap();
         });
         writers.push(SendWriter { state, results, completed: Cell::new(false) });
-        let batch = SendBatch { remaining: Cell::new(writers.len()), writers, completed: Cell::new(false) };
+        let batch = SendBatch {
+            ctx: egui::Context::default(), gpu: Arc::new(Gpu::new_blocking().expect("GPU is mandatory for numerical tests")),
+            remaining: Cell::new(writers.len()), writers, completed: Cell::new(false),
+        };
         let timeout = std::time::Duration::from_secs(5);
         let staging = started_rx.recv_timeout(timeout).unwrap();
         assert!(batch.poll().is_none());

@@ -81,7 +81,7 @@ pub struct GpuMemoryStats {
 /// Idle RGBA32F textures retain at most 64 times the largest requested texture,
 /// with a 512 MiB floor and 2 GiB ceiling; live images are never evicted.
 struct TexturePool {
-    by_size: HashMap<(u32, u32), VecDeque<(u64, wgpu::Texture)>>,
+    by_size: HashMap<(u32, u32, wgpu::TextureFormat), VecDeque<(u64, wgpu::Texture)>>,
     bytes: u64,
     budget: u64,
     clock: u64,
@@ -113,8 +113,8 @@ impl TexturePool {
         self.budget = self.budget.max(working_set.clamp(512 * 1024 * 1024, 2 * 1024 * 1024 * 1024));
     }
     fn insert(&mut self, texture: wgpu::Texture) {
-        let size = (texture.width(), texture.height());
-        let bytes = u64::from(size.0) * u64::from(size.1) * 16;
+        let size = (texture.width(), texture.height(), texture.format());
+        let bytes = texture_bytes(size);
         if bytes > self.budget {
             return;
         }
@@ -126,10 +126,10 @@ impl TexturePool {
             .push_back((self.clock, texture));
         self.bytes += bytes;
     }
-    fn take(&mut self, size: (u32, u32)) -> Option<wgpu::Texture> {
+    fn take(&mut self, size: (u32, u32, wgpu::TextureFormat)) -> Option<wgpu::Texture> {
         let textures = self.by_size.get_mut(&size)?;
         let (_, texture) = textures.pop_back()?;
-        self.bytes -= u64::from(size.0) * u64::from(size.1) * 16;
+        self.bytes -= texture_bytes(size);
         if textures.is_empty() {
             self.by_size.remove(&size);
         }
@@ -142,10 +142,14 @@ impl TexturePool {
                 .min_by_key(|(_, textures)| textures.front().unwrap().0).unwrap().0;
             let textures = self.by_size.get_mut(&oldest).unwrap();
             textures.pop_front();
-            self.bytes -= u64::from(oldest.0) * u64::from(oldest.1) * 16;
+            self.bytes -= texture_bytes(oldest);
             if textures.is_empty() { self.by_size.remove(&oldest); }
         }
     }
+}
+/// Logical bytes of one texture: Rgba32Float is 16 B/px, single-channel mask formats 2 or 4.
+fn texture_bytes((w, h, format): (u32, u32, wgpu::TextureFormat)) -> u64 {
+    u64::from(w) * u64::from(h) * u64::from(format.block_copy_size(None).expect("color format"))
 }
 type Pool = Mutex<TexturePool>;
 #[derive(Clone)]
@@ -213,7 +217,7 @@ impl Drop for ImageLease {
     fn drop(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
             let mut pool = pool.lock();
-            pool.live_bytes -= u64::from(self.texture.width()) * u64::from(self.texture.height()) * 16;
+            pool.live_bytes -= texture_bytes((self.texture.width(), self.texture.height(), self.texture.format()));
             pool.live_count -= 1;
             if !pool.thread_bound || pool.owner == Some(std::thread::current().id()) {
                 pool.insert(self.texture.clone());
@@ -291,6 +295,14 @@ impl Chunker {
         }
     }
 }
+fn describe(error: &wgpu::Error) -> anyhow::Error {
+    match error {
+        wgpu::Error::OutOfMemory { .. } => anyhow::anyhow!(
+            "the graphics card ran out of memory. Close other GPU-heavy apps, use fewer layers, or reduce the document size, then try again"),
+        other => anyhow::anyhow!("GPU error: {other}"),
+    }
+}
+
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -304,6 +316,12 @@ pub struct Gpu {
     layout: wgpu::BindGroupLayout,
     display_layout: wgpu::BindGroupLayout,
     dummy: wgpu::Texture,
+    /// Resident mask storage: R16Unorm (2 B/px) when the device reads every u16 code back as
+    /// exactly `code / 65535.0` (checked at creation), else R32Float (4 B/px).
+    mask_format: wgpu::TextureFormat,
+    /// First GPU error raised outside `capture_errors` since the last `take_uncaptured_error`
+    /// (out of memory wins over its follow-on validation errors). Shared by lanes.
+    uncaptured: Arc<Mutex<Option<(bool, String)>>>,
 }
 fn depth(d: Depth) -> f32 {
     match d {
@@ -323,6 +341,11 @@ pub fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
     }
 }
 
+/// Optional features Moya uses when the adapter has them: R16Unorm mask textures (2 B/px).
+pub fn device_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+}
+
 impl Gpu {
     pub fn new_blocking() -> anyhow::Result<Self> {
         pollster::block_on(async {
@@ -338,6 +361,7 @@ impl Gpu {
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("Moya compute"),
                     required_limits: device_limits(&adapter),
+                    required_features: device_features(&adapter),
                     ..Default::default()
                 })
                 .await?;
@@ -443,7 +467,17 @@ impl Gpu {
             });
         let display = make_pipeline(&device, &display_pipeline_layout, &display_module, &[]);
         let dummy = Self::texture_new(&device, 1, 1);
-        Self {
+        // wgpu's default handler panics, which closes the app on e.g. running out of video memory.
+        let uncaptured: Arc<Mutex<Option<(bool, String)>>> = Arc::default();
+        let sink = uncaptured.clone();
+        device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            let memory = matches!(error, wgpu::Error::OutOfMemory { .. });
+            let message = describe(&error).to_string();
+            eprintln!("Moya GPU error: {error}");
+            let mut slot = sink.lock();
+            if slot.as_ref().is_none_or(|(had_memory, _)| memory && !had_memory) { *slot = Some((memory, message)); }
+        }));
+        let mut gpu = Self {
             device,
             queue,
             pool: Arc::new(Mutex::new(TexturePool::new(512 * 1024 * 1024))),
@@ -456,7 +490,16 @@ impl Gpu {
             layout,
             display_layout,
             dummy,
+            mask_format: wgpu::TextureFormat::R32Float,
+            uncaptured,
+        };
+        if gpu.device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            gpu.mask_format = wgpu::TextureFormat::R16Unorm;
+            if !gpu.mask_format_is_exact() { gpu.mask_format = wgpu::TextureFormat::R32Float; }
+            gpu.trim_idle(0);
+            gpu.reset_peak();
         }
+        gpu
     }
     /// A second command lane on the same device and queue: shared compiled pipelines,
     /// layouts and queue, but its own pending encoder and its own texture pool.
@@ -481,6 +524,8 @@ impl Gpu {
             layout: self.layout.clone(),
             display_layout: self.display_layout.clone(),
             dummy: self.dummy.clone(),
+            mask_format: self.mask_format,
+            uncaptured: self.uncaptured.clone(),
         }
     }
     /// Enable (or with `None`, disable) chunked execution on this lane. Dispatches above
@@ -555,16 +600,20 @@ impl Gpu {
         self.flush();
         // Pop innermost first.
         let [memory, validation, internal] = scopes;
-        let errors = [internal.pop(), validation.pop(), memory.pop()].map(pollster::block_on);
-        let Some(error) = errors.into_iter().flatten().next() else { return Ok(value) };
+        let [internal, validation, memory] = [internal.pop(), validation.pop(), memory.pop()].map(pollster::block_on);
+        // A failed allocation makes every later use of that texture "invalid": report the cause.
+        let Some(error) = memory.or(validation).or(internal) else { return Ok(value) };
         drop(value);
         self.flush();
         self.trim_idle(0);
-        Err(match error {
-            wgpu::Error::OutOfMemory { .. } => anyhow::anyhow!(
-                "the graphics card ran out of memory. Close other GPU-heavy apps, use fewer layers, or reduce the document size, then try again"),
-            other => anyhow::anyhow!("GPU error: {other}"),
-        })
+        Err(describe(&error))
+    }
+    /// Takes the GPU error recorded outside `capture_errors` (see `uncaptured`), if any. Images
+    /// created since may be invalid: callers should drop their caches and re-render.
+    pub fn take_uncaptured_error(&self) -> Option<String> {
+        let taken = self.uncaptured.lock().take().map(|(_, message)| message);
+        if taken.is_some() { self.trim_idle(0); }
+        taken
     }
     fn submit_pending(&self, pending: &mut Pending) -> Option<wgpu::SubmissionIndex> {
         let encoder = pending.encoder.take()?;
@@ -595,7 +644,12 @@ impl Gpu {
         }
     }
     fn texture_new(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
+        Self::texture_in(device, wgpu::TextureFormat::Rgba32Float, w, h)
+    }
+    fn texture_in(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> wgpu::Texture {
         assert!(w > 0 && h > 0, "images must be nonempty");
+        // Mask formats are never written by compute (R16Unorm cannot be a storage texture).
+        let storage = if format == wgpu::TextureFormat::Rgba32Float { wgpu::TextureUsages::STORAGE_BINDING } else { wgpu::TextureUsages::empty() };
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Moya float image"),
             size: wgpu::Extent3d {
@@ -606,24 +660,31 @@ impl Gpu {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
+                | storage
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
     }
     fn image(&self, w: u32, h: u32) -> Image {
+        self.image_in(wgpu::TextureFormat::Rgba32Float, w, h)
+    }
+    /// Single-channel `mask_format` image: values are read as `texture_2d<f32>` `.r` (g/b are 0).
+    fn mask_image(&self, w: u32, h: u32) -> Image {
+        self.image_in(self.mask_format, w, h)
+    }
+    fn image_in(&self, format: wgpu::TextureFormat, w: u32, h: u32) -> Image {
         let texture = {
             let mut pool = self.pool.lock();
             if pool.thread_bound { pool.owner.get_or_insert_with(|| std::thread::current().id()); }
             pool.grow_budget(w, h);
-            pool.live_bytes += u64::from(w) * u64::from(h) * 16;
+            pool.live_bytes += texture_bytes((w, h, format));
             pool.live_count += 1;
             pool.peak_live_bytes = pool.peak_live_bytes.max(pool.live_bytes + pool.buffer_bytes);
-            pool.take((w, h))
-        }.unwrap_or_else(|| Self::texture_new(&self.device, w, h));
+            pool.take((w, h, format))
+        }.unwrap_or_else(|| Self::texture_in(&self.device, format, w, h));
         Image {
             lease: Arc::new(ImageLease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) }),
             texture,
@@ -675,9 +736,9 @@ impl Gpu {
         assert!(pitch > 0 && pitch <= cap, "one transfer row exceeds buffer limit");
         (cap / pitch).min(u64::from(u32::MAX)) as u32
     }
-    fn upload_bands(&self, target: wgpu::TexelCopyTextureInfo<'_>, size: wgpu::Extent3d, bytes_per_pixel: u32, data: &[f32], cap: u64) {
+    fn upload_bands<T: bytemuck::Pod>(&self, target: wgpu::TexelCopyTextureInfo<'_>, size: wgpu::Extent3d, bytes_per_pixel: u32, data: &[T], cap: u64) {
         let rows = Self::transfer_rows(size.width, bytes_per_pixel, cap.min(self.device.limits().max_buffer_size));
-        let row_floats = size.width as usize * bytes_per_pixel as usize / 4;
+        let row_floats = size.width as usize * bytes_per_pixel as usize / size_of::<T>();
         for y in (0..size.height).step_by(rows as usize) {
             let height = rows.min(size.height - y);
             let mut target = target.clone();
@@ -1549,6 +1610,26 @@ impl Gpu {
 mod tests {
     use super::{Depth, Gpu};
 
+    /// The no-feature fallback (R32Float, 4 B/px) must behave exactly like R16Unorm / RGBA masks.
+    #[test]
+    fn r32_mask_fallback_matches_rgba_masks() {
+        let mut gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
+        gpu.mask_format = wgpu::TextureFormat::R32Float;
+        let (w, h) = (37u32, 23u32);
+        let codes: Vec<u16> = (0..w * h).map(|i| (i * 2909 + 7) as u16).collect();
+        let mask = gpu.upload_mask_u16(w, h, &codes);
+        assert_eq!(gpu.memory_stats().live_bytes, u64::from(w * h) * 4);
+        assert_eq!(gpu.download_gray_u16(&mask), codes);
+        let old = gpu.upload_gray_u16(w, h, &codes);
+        let red = |m: &super::Image| gpu.download_rgba32f(&gpu.extract_channel(&gpu.resize_bilinear(m, 20, 9), 0));
+        assert_eq!(red(&mask), red(&old));
+        let zero = gpu.mask_zeros(w, h);
+        gpu.write_mask_region(&zero, 5, 3, 4, 2, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let got = gpu.download_gray_u16(&zero);
+        assert_eq!(got.iter().filter(|&&v| v != 0).count(), 8);
+        assert_eq!(got[(3 * w + 5) as usize..(3 * w + 9) as usize], [1, 2, 3, 4]);
+    }
+
     #[test]
     fn texture_pool_bounds_idle_bytes_and_reuses_newest() {
         let gpu = Gpu::new_blocking().expect("GPU is mandatory for numerical tests");
@@ -1559,9 +1640,9 @@ mod tests {
                 pool.bytes,
                 pool.by_size
                     .iter()
-                    .map(|(&(w, h), textures)| {
+                    .map(|(&key @ (_, _, _), textures)| {
                         assert!(!textures.is_empty());
-                        u64::from(w) * u64::from(h) * 16 * textures.len() as u64
+                        super::texture_bytes(key) * textures.len() as u64
                     })
                     .sum::<u64>()
             );
@@ -1573,7 +1654,8 @@ mod tests {
             pool.insert(texture.clone());
             check(&pool);
         }
-        assert_eq!(pool.take((1, 1)).unwrap(), newest);
+        const F: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+        assert_eq!(pool.take((1, 1, F)).unwrap(), newest);
         check(&pool);
         pool.insert(newest.clone());
         check(&pool);
@@ -1583,25 +1665,25 @@ mod tests {
         pool.insert(Gpu::texture_new(gpu.device(), 3, 1));
         check(&pool);
         assert_eq!(pool.bytes, 128);
-        assert!(pool.take((2, 1)).is_none());
+        assert!(pool.take((2, 1, F)).is_none());
         check(&pool);
-        assert_eq!(pool.take((1, 1)).unwrap(), newest);
+        assert_eq!(pool.take((1, 1, F)).unwrap(), newest);
         check(&pool);
-        assert!(!pool.by_size.contains_key(&(1, 1)));
+        assert!(!pool.by_size.contains_key(&(1, 1, F)));
         for _ in 0..32 {
             pool.insert(newest.clone());
             check(&pool);
-            assert_eq!(pool.take((1, 1)).unwrap(), newest);
+            assert_eq!(pool.take((1, 1, F)).unwrap(), newest);
             check(&pool);
         }
         let before = pool.bytes;
         pool.insert(Gpu::texture_new(gpu.device(), 9, 1));
         check(&pool);
         assert_eq!(pool.bytes, before);
-        assert!(!pool.by_size.contains_key(&(9, 1)));
-        assert!(pool.take((4, 1)).is_some());
+        assert!(!pool.by_size.contains_key(&(9, 1, F)));
+        assert!(pool.take((4, 1, F)).is_some());
         check(&pool);
-        assert!(pool.take((3, 1)).is_some());
+        assert!(pool.take((3, 1, F)).is_some());
         check(&pool);
         assert_eq!(pool.bytes, 0);
         assert!(pool.by_size.is_empty());

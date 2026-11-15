@@ -377,17 +377,18 @@ impl Mask {
             let zero_outside = rect != full && self.needs_gpu_upload(pixels_changed) && self.sum == (y0..y1)
                 .map(|y| self.data[(y*self.w+x0) as usize..(y*self.w+x1) as usize].iter().map(|&v| u64::from(v)).sum::<u64>()).sum::<u64>();
             if zero_outside {
-                self.image = Some(gpu.fill(self.w, self.h, [0.0, 0.0, 0.0, 1.0]));
+                self.image = Some(gpu.mask_zeros(self.w, self.h));
             } else { rect = full; }
         }
         let [x0,y0,x1,y1]=rect;
         if self.needs_gpu_upload(pixels_changed) {
-            if self.image.is_none() || rect == full {
-                self.image=Some(gpu.upload_gray_u16(self.w,self.h,&self.data));
-            } else if let Some(image)=&self.image {
-                let mut rgba=Vec::with_capacity(((x1-x0)*(y1-y0)*4) as usize);
-                for y in y0..y1 { for x in x0..x1 { let v=self.data[(y*self.w+x) as usize] as f32/65535.0; rgba.extend_from_slice(&[v,v,v,1.0]); }}
-                gpu.write_region(image,x0,y0,x1-x0,y1-y0,&rgba);
+            if let Some(image)=&self.image {
+                // In place, also for the full rect: a second full-resolution texture would briefly double the mask.
+                let mut codes=Vec::with_capacity(((x1-x0)*(y1-y0)) as usize);
+                for y in y0..y1 { codes.extend_from_slice(&self.data[(y*self.w+x0) as usize..(y*self.w+x1) as usize]); }
+                gpu.write_mask_region(image,x0,y0,x1-x0,y1-y0,&codes);
+            } else {
+                self.image=Some(gpu.upload_mask_u16(self.w,self.h,&self.data));
             }
             self.gpu_generation = self.gpu_generation.wrapping_add(1);
         }

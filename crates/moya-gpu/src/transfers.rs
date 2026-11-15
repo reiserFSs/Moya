@@ -4,6 +4,8 @@ impl Gpu {
     /// Stream tightly packed RGBA32F rows through one reusable staging buffer.
     /// The requested band is capped at 256 rows and the device buffer limit.
     pub fn download_rows(&self, img: &Image, band_rows: u32, mut f: impl FnMut(u32, u32, &[f32]) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let converted;
+        let img = if img.texture.format() == wgpu::TextureFormat::Rgba32Float { img } else { converted = self.copy(img); &converted };
         anyhow::ensure!(band_rows > 0, "readback bands must be nonempty");
         let rows = band_rows.min(256).min(Self::transfer_rows(img.width(), 16, self.device.limits().max_buffer_size)).min(img.height());
         let pitch = (img.width() * 16).div_ceil(256) * 256;
@@ -20,6 +22,8 @@ impl Gpu {
 
     /// Pull a row range into caller-owned storage, using at most 256 staging rows.
     pub fn download_row_range(&self, img: &Image, y0: u32, rows: u32, out: &mut [f32]) -> anyhow::Result<()> {
+        let converted;
+        let img = if img.texture.format() == wgpu::TextureFormat::Rgba32Float { img } else { converted = self.copy(img); &converted };
         anyhow::ensure!(y0 <= img.height() && rows <= img.height() - y0, "invalid readback row range");
         anyhow::ensure!(out.len() == img.width() as usize * rows as usize * 4, "invalid readback destination length");
         if rows == 0 { return Ok(()); }
@@ -62,6 +66,72 @@ impl Gpu {
         drop(bytes);
         buffer.unmap();
         Ok(())
+    }
+
+    /// Resident mask storage: one channel (`mask_format`: R16Unorm 2 B/px or R32Float 4 B/px)
+    /// holding exactly `code as f32 / 65535.0` in `.r`. Shaders read it as `texture_2d<f32>`
+    /// (g/b read 0, a reads 1), so consumers must use only the red channel. Never a storage target.
+    pub fn upload_mask_u16(&self, w: u32, h: u32, gray: &[u16]) -> Image {
+        assert_eq!(gray.len(), w as usize * h as usize);
+        self.flush();
+        let image = self.mask_image(w, h);
+        self.write_mask_rows(&image, 0, 0, w, h, gray);
+        image
+    }
+
+    /// An all-zero mask image (see `upload_mask_u16`), written in bounded bands of zeros.
+    pub fn mask_zeros(&self, w: u32, h: u32) -> Image {
+        self.flush();
+        let image = self.mask_image(w, h);
+        let rows = 256.min(h);
+        let zeros = vec![0u16; w as usize * rows as usize];
+        for y in (0..h).step_by(rows as usize) {
+            let height = rows.min(h - y);
+            self.write_mask_rows(&image, 0, y, w, height, &zeros[..w as usize * height as usize]);
+        }
+        image
+    }
+
+    /// Overwrite a nonempty rectangle of a mask image with tightly packed u16 codes.
+    /// Pending operations are submitted first so existing consumers see the old pixels.
+    pub fn write_mask_region(&self, img: &Image, x: u32, y: u32, w: u32, h: u32, gray: &[u16]) {
+        assert!(w > 0 && h > 0, "regions must be nonempty");
+        assert!(x <= img.width() && w <= img.width() - x);
+        assert!(y <= img.height() && h <= img.height() - y);
+        assert_eq!(gray.len(), w as usize * h as usize);
+        self.flush();
+        self.write_mask_rows(img, x, y, w, h, gray);
+    }
+
+    fn write_mask_rows(&self, img: &Image, x: u32, y: u32, w: u32, h: u32, gray: &[u16]) {
+        let cap = self.device.limits().max_buffer_size;
+        let mut target = img.texture.as_image_copy();
+        target.origin = wgpu::Origin3d { x, y, z: 0 };
+        if img.texture.format() == wgpu::TextureFormat::R16Unorm {
+            return self.upload_bands(target, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, 2, gray, cap);
+        }
+        // R32Float: expand at most 256 rows at a time.
+        let rows = 256.min(h).min(Self::transfer_rows(w, 4, cap));
+        let mut band = vec![0.0f32; w as usize * rows as usize];
+        for r in (0..h).step_by(rows as usize) {
+            let height = rows.min(h - r);
+            let band = &mut band[..w as usize * height as usize];
+            for (p, &value) in band.iter_mut().zip(&gray[r as usize * w as usize..(r + height) as usize * w as usize]) {
+                *p = value as f32 / 65535.0;
+            }
+            let mut target = target.clone();
+            target.origin.y += r;
+            self.upload_bands(target, wgpu::Extent3d { width: w, height, depth_or_array_layers: 1 }, 4, band, cap);
+        }
+    }
+
+    /// True when `mask_format` (set to R16Unorm by the caller) reads all 65536 codes back as
+    /// exactly `code as f32 / 65535.0`.
+    pub(crate) fn mask_format_is_exact(&self) -> bool {
+        let codes: Vec<u16> = (0..=u16::MAX).collect();
+        let image = self.upload_mask_u16(256, 256, &codes);
+        let rgba = self.download_rgba32f(&image);
+        rgba.chunks_exact(4).zip(&codes).all(|(p, &c)| p[0].to_bits() == (c as f32 / 65535.0).to_bits())
     }
 
     /// Upload 16-bit mask codes as exactly `code as f32 / 65535.0` grayscale.

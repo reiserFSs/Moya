@@ -55,6 +55,7 @@ fn main() -> eframe::Result {
         setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
             label: Some("Moya device"),
             required_limits: moya_gpu::device_limits(adapter),
+            required_features: moya_gpu::device_features(adapter),
             ..Default::default()
         });
     }
@@ -585,6 +586,13 @@ impl eframe::App for App {
         }
         self.poll_bridge();
         self.poll_loading();
+        // A GPU error outside Send/Export (e.g. out of video memory while previewing) must not
+        // close the app: report it and drop images that may be invalid. No automatic re-render,
+        // which would retry every frame while memory stays exhausted; the next edit renders.
+        if let Some(message) = self.gpu.take_uncaptured_error() {
+            self.drop_render_caches();
+            self.status = message;
+        }
         if let Some(rx) = &self.saving {
             let result = match rx.try_recv() {
                 Ok(result) => Some(result),

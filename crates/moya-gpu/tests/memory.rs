@@ -47,6 +47,23 @@ fn captured_gpu_errors_fail_the_work_instead_of_panicking() {
 }
 
 #[test]
+fn uncaptured_gpu_errors_are_recorded_instead_of_panicking() {
+    let gpu = Gpu::new_blocking().unwrap();
+    // Same invalid texture outside `capture_errors`: wgpu's default handler would panic here.
+    let too_wide = gpu.device().limits().max_texture_dimension_2d + 1;
+    let _ = gpu.device().create_texture(&wgpu::TextureDescriptor {
+        label: None, size: wgpu::Extent3d { width: too_wide, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+    });
+    assert!(gpu.take_uncaptured_error().is_some_and(|message| message.starts_with("GPU error:")));
+    assert_eq!(gpu.take_uncaptured_error(), None, "taking clears the error");
+    // A lane shares the device handler, and the device keeps working.
+    assert_eq!(gpu.lane().take_uncaptured_error(), None);
+    assert_eq!(gpu.download_rgba32f(&gpu.fill(1, 1, [0.25, 0.5, 0.75, 1.0])), vec![0.25, 0.5, 0.75, 1.0]);
+}
+
+#[test]
 fn rounding_owned_alias_does_not_mutate_shared_output() {
     let gpu = Gpu::new_blocking().unwrap();
     let original = gpu.fill(1, 1, [0.1234567, 0.2345678, 0.3456789, 1.0]);
